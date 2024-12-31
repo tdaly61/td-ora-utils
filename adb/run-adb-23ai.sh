@@ -38,6 +38,19 @@ check_and_add_hostname() {
     fi
 }
 
+# Function to set up user and groups
+user_setup() {
+    echo "Setting up user and groups..."
+    sudo groupadd -g 54321 oinstall
+    sudo groupadd -g 54322 dba
+    sudo groupadd -g 54323 oper
+    sudo groupadd -g 54324 backupdba
+    sudo groupadd -g 54325 dgdba
+    sudo groupadd -g 54326 kmdba
+    sudo groupadd -g 54330 racdba
+    sudo useradd -u 54321 -g oinstall -G dba,oper,backupdba,dgdba,kmdba,racdba oracle
+}
+
 # Function to check if a Docker container with the given name exists
 check_existing_container() {
     if [ "$(docker ps -aq -f name=$CONTAINER_NAME)" ]; then
@@ -53,6 +66,17 @@ check_existing_container() {
 usage() {
     echo "Usage: $0 -u <user>"
     exit 1
+}
+
+# Function to determine the volume path and change ownership
+change_volume_ownership() {
+    VOL_PATH=$(docker volume inspect "$VOL_NAME" --format '{{ .Mountpoint }}')
+    if [ -z "$VOL_PATH" ]; then
+        echo "Failed to determine the volume path for $VOL_NAME. Exiting."
+        exit 1
+    fi
+    echo "Changing ownership of volume path $VOL_PATH to user oracle and group oinstall."
+    sudo chown -R oracle:oinstall "$VOL_PATH"
 }
 
 # Function to create a Docker volume
@@ -75,7 +99,8 @@ create_docker_volume() {
         esac
     else
         # create a local volume
-        su - $USER -c "docker volume create $VOL_NAME"
+        docker volume create $VOL_NAME
+        change_volume_ownership
     fi
 }
 
@@ -83,22 +108,21 @@ create_docker_volume() {
 # this script will run the ADB container with the required ports exposed
 # now run ADB with the volume mounted as /u01/data
 function run_adb() {
-    echo "USER is $USER"
-
     echo "Running ADB using the container image container-registry.oracle.com/database/adb-free:latest-23ai" 
-    su - $USER -c "docker run -d \
+    docker run -d \
     -p 1521:1522 \
     -p 1522:1522 \
     -p 8443:8443 \
     -p 27017:27017 \
     -e WORKLOAD_TYPE='ATP' \
-    -e WALLET_PASSWORD='$DEFAUT_PASSWORD' \
-    -e ADMIN_PASSWORD='$DEFAUT_PASSWORD' \
-    --hostname '$HOSTNAME' \
+    -e WALLET_PASSWORD=$DEFAUT_PASSWORD \
+    -e ADMIN_PASSWORD=$DEFAUT_PASSWORD \
+    --hostname $HOSTNAME \
     --cap-add SYS_ADMIN \
     --device /dev/fuse \
-    --name '$CONTAINER_NAME' \
-     $DOCKER_IMAGE "
+    --volume $VOL_NAME:/u01/data \
+    --name $CONTAINER_NAME \
+     $DOCKER_IMAGE 
 
     # --volume '$VOL_NAME':/u01/data \
     # note to override the entrypint for debugging replace the last 2 lines of the docker run with the 2 following lines 
@@ -121,11 +145,8 @@ CONTAINER_NAME="adb-free"
 DOCKER_IMAGE="container-registry.oracle.com/database/adb-free:latest-23ai"
 
 # Parse arguments
-while getopts "u:h" opt; do
+while getopts "h" opt; do
     case ${opt} in
-        u )
-            USER=$OPTARG
-            ;;
         h )
             usage
             ;;
@@ -145,12 +166,13 @@ check_root_user
 check_os
 check_docker_installed
 check_and_add_hostname
+user_setup
 check_existing_container
 create_docker_volume
 run_adb
 
 echo "to see status of deployment use .." 
 echo "docker logs -f $CONTAINER_NAME "
-echo "" 
+echo " " 
 echo "Access APEX and SQlDeveloper Web use .." 
-echo "https://$HOSTNAME:8443/ords/_/landing
+echo "https://$HOSTNAME:8443/ords/_/landing"
