@@ -14,6 +14,18 @@ check_docker_installed() {
     fi
 }
 
+# Function to set the global variable OS_USER by calling the id command
+set_os_user() {
+    OS_USER=$(id -un)
+    if [ -z "$OS_USER" ]; then
+        echo "Failed to determine the OS user. Exiting."
+        exit 1
+    fi
+    echo "OS user is set to $OS_USER."
+}
+
+
+
 # Function to check if the script is being run as root
 check_root_user() {
     if [ "$EUID" -ne 0 ]; then
@@ -41,14 +53,22 @@ check_and_add_hostname() {
 # Function to set up user and groups
 user_setup() {
     echo "Setting up user and groups..."
-    sudo groupadd -g 54321 oinstall
-    sudo groupadd -g 54322 dba
-    sudo groupadd -g 54323 oper
-    sudo groupadd -g 54324 backupdba
-    sudo groupadd -g 54325 dgdba
-    sudo groupadd -g 54326 kmdba
-    sudo groupadd -g 54330 racdba
-    sudo useradd -u 54321 -g oinstall -G dba,oper,backupdba,dgdba,kmdba,racdba oracle
+
+    # Check and add groups if they do not exist
+    for group in oinstall dba oper backupdba dgdba kmdba racdba; do
+        if ! getent group $group > /dev/null; then
+            sudo groupadd -g $(id -g $group 2>/dev/null || echo "5432${group: -1}") $group
+        else
+            echo "Group $group already exists. Skipping."
+        fi
+    done
+
+    # Check and add user if it does not exist
+    if ! id -u oracle > /dev/null 2>&1; then
+        sudo useradd -u 54321 -g oinstall -G dba,oper,backupdba,dgdba,kmdba,racdba oracle
+    else
+        echo "User oracle already exists. Skipping."
+    fi
 }
 
 # Function to check if a Docker container with the given name exists
@@ -108,27 +128,88 @@ create_docker_volume() {
 # this script will run the ADB container with the required ports exposed
 # now run ADB with the volume mounted as /u01/data
 function run_adb() {
-    echo "Running ADB using the container image container-registry.oracle.com/database/adb-free:latest-23ai" 
-    docker run -d \
+    echo "Running ADB using the container image $DOCKER_IMAGE" 
+    su $OS_USER -c "docker run -d \
     -p 1521:1522 \
     -p 1522:1522 \
     -p 8443:8443 \
     -p 27017:27017 \
     -e WORKLOAD_TYPE='ATP' \
-    -e WALLET_PASSWORD=$DEFAUT_PASSWORD \
-    -e ADMIN_PASSWORD=$DEFAUT_PASSWORD \
-    --hostname $HOSTNAME \
+    -e WALLET_PASSWORD='$DEFAULT_PASSWORD' \
+    -e ADMIN_PASSWORD='$DEFAULT_PASSWORD' \
+    --hostname '$HOSTNAME' \
     --cap-add SYS_ADMIN \
     --device /dev/fuse \
-    --volume $VOL_NAME:/u01/data \
-    --name $CONTAINER_NAME \
-     $DOCKER_IMAGE 
+    --volume '$VOL_NAME':/u01/data \
+    --name '$CONTAINER_NAME' \
+    '$DOCKER_IMAGE' "
 
     # --volume '$VOL_NAME':/u01/data \
-    # note to override the entrypint for debugging replace the last 2 lines of the docker run with the 2 following lines 
+    # note to override the entrypoint for debugging replace the last 2 lines of the docker run with the 2 following lines 
     #      --entrypoint '/bin/bash' \
     #      $DOCKER_IMAGE -c 'sleep 3600' "
 }  
+
+# Function to print the elapsed time in a human-readable format
+print_elapsed_time() {
+    local SECONDS=$1
+    local HOURS=$((SECONDS / 3600))
+    local MINUTES=$(( (SECONDS % 3600) / 60 ))
+    local SECONDS=$((SECONDS % 60))
+    printf "%02d:%02d:%02d\n" $HOURS $MINUTES $SECONDS
+}
+
+# Function to wait for the container to be in running and healthy state with timeout
+wait_for_container_healthy() {
+    TIMEOUT=$1
+    echo "Waiting for [ $TIMEOUT ] secs the container $CONTAINER_NAME to be in a running and healthy state..."
+    
+    START_TIME=$(date +%s)
+    while true; do
+        CURRENT_TIME=$(date +%s)
+        ELAPSED_TIME=$((CURRENT_TIME - START_TIME))
+        
+        if [ "$ELAPSED_TIME" -ge "$TIMEOUT" ]; then
+            echo "Timeout of $TIMEOUT seconds reached. Exiting."
+            exit 1
+        fi
+        
+        STATUS=$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER_NAME")
+        if [ "$STATUS" == "healthy" ]; then
+            echo "Container $CONTAINER_NAME is running and healthy."
+            break
+        elif [ "$STATUS" == "unhealthy" ]; then
+            echo "Container $CONTAINER_NAME is unhealthy. Exiting."
+            exit 1
+        else
+            echo "Container $CONTAINER_NAME is not yet healthy. Current status: $STATUS. Waiting..."
+            echo "Elapsed time: $(print_elapsed_time $ELAPSED_TIME)"
+            sleep 15
+        fi
+    done
+    
+    TOTAL_TIME=$((CURRENT_TIME - START_TIME))
+    echo "Total time taken: $(print_elapsed_time $TOTAL_TIME)"
+}
+
+
+
+
+# Function to download the ONNX model if not already downloaded
+get_models() {
+    MODEL_PATH="/tmp/all-MiniLM-L6-v2.onnx"
+    if [ ! -f "$MODEL_PATH" ]; then
+        echo "Downloading ONNX model from $ONNX_MODEL_URL..."
+        curl -o "$MODEL_PATH" "$ONNX_MODEL_URL"
+        if [ $? -ne 0 ]; then
+            echo "Failed to download the ONNX model. Exiting."
+            exit 1
+        fi
+        echo "ONNX model downloaded and saved to $MODEL_PATH."
+    else
+        echo "ONNX model already exists at $MODEL_PATH. Skipping download."
+    fi
+}
 
 ####### main code #######
 # to use a remote hostname this needs to be a valid FQDN or in /etc/hosts so that certs are generated correctly 
@@ -139,10 +220,12 @@ function run_adb() {
 HOSTNAME="fu8.local" 
 
 ######### These should not need to be changed ########
+OS_USER=""
 VOL_NAME="adb_container_vol" 
-DEFAUT_PASSWORD="Welcome_MY_ATP_123"
+DEFAULT_PASSWORD="Welcome_MY_ATP_123"
 CONTAINER_NAME="adb-free"
 DOCKER_IMAGE="container-registry.oracle.com/database/adb-free:latest-23ai"
+ONNX_MODEL_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/94ea1512acaefbfe2e255b2d2ea4bf0d9d7b3dc3/onnx/model.onnx"
 
 # Parse arguments
 while getopts "h" opt; do
@@ -163,6 +246,7 @@ fi
 
 # Call the functions to perform the checks
 check_root_user
+set_os_user
 check_os
 check_docker_installed
 check_and_add_hostname
@@ -170,6 +254,10 @@ user_setup
 check_existing_container
 create_docker_volume
 run_adb
+wait_for_container_healthy 600
+# now we need to configure the database and add the AI models 
+get_models
+
 
 echo "to see status of deployment use .." 
 echo "docker logs -f $CONTAINER_NAME "
