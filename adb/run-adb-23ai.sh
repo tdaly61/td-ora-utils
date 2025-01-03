@@ -14,16 +14,23 @@ check_docker_installed() {
     fi
 }
 
-# Function to set the global variable OS_USER by calling the id command
-set_os_user() {
+# Function to set the global variable SUDO_USER by calling the id command
+set_sudo_user() {
     OS_USER=$(id -un)
     if [ -z "$OS_USER" ]; then
         echo "Failed to determine the OS user. Exiting."
         exit 1
     fi
     echo "OS user is set to $OS_USER."
+    
+    if [ -n "$SUDO_UID" ]; then
+        SUDO_USER_NAME=$(getent passwd "$SUDO_UID" | cut -d: -f1)
+        echo "The UID of the user who invoked sudo is $SUDO_UID."
+        echo "The username of the user who invoked sudo is $SUDO_USER_NAME."
+    else
+        echo "This script was not invoked using sudo."
+    fi
 }
-
 
 
 # Function to check if the script is being run as root
@@ -51,23 +58,19 @@ check_and_add_hostname() {
 }
 
 # Function to set up user and groups
-user_setup() {
+oracle_user_setup() {
     echo "Setting up user and groups..."
 
     # Check and add groups if they do not exist
     for group in oinstall dba oper backupdba dgdba kmdba racdba; do
         if ! getent group $group > /dev/null; then
             sudo groupadd -g $(id -g $group 2>/dev/null || echo "5432${group: -1}") $group
-        else
-            echo "Group $group already exists. Skipping."
         fi
     done
 
     # Check and add user if it does not exist
     if ! id -u oracle > /dev/null 2>&1; then
         sudo useradd -u 54321 -g oinstall -G dba,oper,backupdba,dgdba,kmdba,racdba oracle
-    else
-        echo "User oracle already exists. Skipping."
     fi
 }
 
@@ -129,7 +132,7 @@ create_docker_volume() {
 # now run ADB with the volume mounted as /u01/data
 function run_adb() {
     echo "Running ADB using the container image $DOCKER_IMAGE" 
-    su $OS_USER -c "docker run -d \
+    su $SUDO_USER_NAME -c "docker run -d \
     -p 1521:1522 \
     -p 1522:1522 \
     -p 8443:8443 \
@@ -193,8 +196,6 @@ wait_for_container_healthy() {
 }
 
 
-
-
 # Function to download the ONNX model if not already downloaded
 get_models() {
     MODEL_PATH="/tmp/all-MiniLM-L6-v2.onnx"
@@ -211,6 +212,90 @@ get_models() {
     fi
 }
 
+
+# Function to install Oracle Instant Client
+install_oracle_instant_client() {
+    
+    ORACLE_CLIENT_DIR="$SUDO_USER_HOME_DIR/oraclient"
+    BASIC_ZIP="instantclient-basic-linux.x64-23.6.0.24.10.zip"
+    SQLPLUS_ZIP="instantclient-sqlplus-linux.x64-23.6.0.24.10.zip"
+    BASIC_URL="https://download.oracle.com/otn_software/linux/instantclient/2360000/$BASIC_ZIP"
+    SQLPLUS_URL="https://download.oracle.com/otn_software/linux/instantclient/2360000/$SQLPLUS_ZIP"
+    INSTANT_CLIENT="instantclient_23_6"
+    BASHRC_FILE="$SUDO_USER_HOME_DIR/.bashrc"
+
+    # Ensure unzip is installed
+    if ! command -v unzip &> /dev/null; then
+        echo "Unzip is not installed. Installing unzip..."
+        sudo apt update
+        sudo apt install -y unzip
+    fi
+
+    # Install the client if not already installed
+    if [ -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
+        echo "Oracle Instant Client is already installed at $ORACLE_CLIENT_DIR/$INSTANT_CLIENT."
+    else 
+        # Create the oraclient directory
+        su - $SUDO_USER_NAME -c "mkdir -p $ORACLE_CLIENT_DIR"
+
+        # Download the zip files
+        su - $SUDO_USER_NAME -c "curl -o $ORACLE_CLIENT_DIR/$BASIC_ZIP $BASIC_URL" > /dev/null 2>&1
+        su - $SUDO_USER_NAME -c "curl -o $ORACLE_CLIENT_DIR/$SQLPLUS_ZIP $SQLPLUS_URL"  > /dev/null 2>&1
+
+        # Unzip the files
+        su - $SUDO_USER_NAME -c "unzip -o $ORACLE_CLIENT_DIR/$BASIC_ZIP -d $ORACLE_CLIENT_DIR"  > /dev/null 2>&1
+        su - $SUDO_USER_NAME -c "unzip -o $ORACLE_CLIENT_DIR/$SQLPLUS_ZIP -d $ORACLE_CLIENT_DIR"  > /dev/null 2>&1
+
+        # Check if the files are unzipped
+        if [ ! -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
+            echo " ** Error **  Oracle instant client is not correctly installed in $ORACLE_CLIENT_DIR."
+            exit 1  
+        fi
+    fi
+
+    # Set the environment variables
+    ORACLE_HOME="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
+    export LD_LIBRARY_PATH="$ORACLE_HOME"
+
+    # libaio changed in Ubuntu 24 so need to create a symlink
+    rm /usr/lib/x86_64-linux-gnu/libaio.so.1
+    ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
+
+    # Add environment variables to .bashrc if not already present
+    if ! grep -q "export TNS_ADMIN=$WALLET_DIR" "$BASHRC_FILE"; then
+        echo "export TNS_ADMIN=$WALLET_DIR" >> "$BASHRC_FILE"
+    fi
+
+    if ! grep -q "export ORACLE_HOME=$ORACLE_HOME" "$BASHRC_FILE"; then
+        echo "export ORACLE_HOME=$ORACLE_HOME" >> "$BASHRC_FILE"
+    fi
+
+    if ! grep -q "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH" "$BASHRC_FILE"; then
+        echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$BASHRC_FILE"
+    fi
+
+    if ! grep -q "export PATH=$ORACLE_HOME:\$PATH" "$BASHRC_FILE"; then
+        echo "export PATH=$ORACLE_HOME:\$PATH" >> "$BASHRC_FILE"
+    fi
+
+}
+
+configure_sql_access() {
+    echo "Configuring SQL access..."
+    # change the default and expired ADMIN password 
+    #docker exec $CONTAINER_NAME /u01/scripts/change_expired_password.sh MY_ATP admin Welcome_MY_ATP_1234 $DEFAULT_PASSWORD
+    SUDO_USER_HOME_DIR=$(eval echo ~$SUDO_USER_NAME)
+    AUTH_DIR="$SUDO_USER_HOME_DIR/auth"
+    WALLET_DIR="$AUTH_DIR/tls_wallet"
+
+    rm -rf $AUTH_DIR
+    echo "Creating auth directory at $AUTH_DIR."
+    su - $SUDO_USER_NAME -c "mkdir -p $AUTH_DIR"
+    su - $SUDO_USER_NAME -c "docker cp adb-free:/u01/app/oracle/wallets/tls_wallet/ $AUTH_DIR"
+
+}
+
+
 ####### main code #######
 # to use a remote hostname this needs to be a valid FQDN or in /etc/hosts so that certs are generated correctly 
 # e.g. myhost.local must be in /etc/hosts on the remote 
@@ -220,12 +305,16 @@ get_models() {
 HOSTNAME="fu8.local" 
 
 ######### These should not need to be changed ########
-OS_USER=""
+SUDO_USER_NAME=""
 VOL_NAME="adb_container_vol" 
 DEFAULT_PASSWORD="Welcome_MY_ATP_123"
 CONTAINER_NAME="adb-free"
 DOCKER_IMAGE="container-registry.oracle.com/database/adb-free:latest-23ai"
 ONNX_MODEL_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/94ea1512acaefbfe2e255b2d2ea4bf0d9d7b3dc3/onnx/model.onnx"
+TNS_ADMIN=""
+ORACLE_HOME=""
+
+
 
 # Parse arguments
 while getopts "h" opt; do
@@ -246,21 +335,29 @@ fi
 
 # Call the functions to perform the checks
 check_root_user
-set_os_user
+set_sudo_user
 check_os
 check_docker_installed
 check_and_add_hostname
-user_setup
-check_existing_container
-create_docker_volume
-run_adb
-wait_for_container_healthy 600
+oracle_user_setup
+# check_existing_container
+# create_docker_volume
+# run_adb
+# wait_for_container_healthy 600
+
 # now we need to configure the database and add the AI models 
-get_models
+#get_models
 
 
-echo "to see status of deployment use .." 
-echo "docker logs -f $CONTAINER_NAME "
-echo " " 
-echo "Access APEX and SQlDeveloper Web use .." 
-echo "https://$HOSTNAME:8443/ords/_/landing"
+
+
+install_oracle_instant_client
+configure_sql_access
+export TNS_ADMIN="$WALLET_DIR"
+$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus admin/Welcome_MY_ATP_123@myatp_high
+
+# echo "to see status of deployment use .." 
+# echo "docker logs -f $CONTAINER_NAME "
+# echo " " 
+# echo "Access APEX and SQlDeveloper Web use .." 
+# echo "https://$HOSTNAME:8443/ords/_/landing"
