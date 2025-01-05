@@ -1,4 +1,28 @@
 #!/usr/bin/env bash
+# Function to clean up Docker resources
+cleanup() {
+    echo "Stopping and removing the Docker container $CONTAINER_NAME..."
+    docker stop $CONTAINER_NAME
+    docker rm $CONTAINER_NAME
+
+    echo "Do you want to remove the Docker volume $VOL_NAME? (y/n): "
+    read choice
+    case "$choice" in 
+        y|Y ) 
+            echo "Removing Docker volume $VOL_NAME..."
+            docker volume rm $VOL_NAME
+            ;;
+        n|N ) 
+            echo "Skipping volume removal."
+            ;;
+        * ) 
+            echo "Invalid choice. Skipping volume removal."
+            ;;
+    esac
+    exit 0
+}
+
+
 
 # Function to ensure Docker is installed
 check_docker_installed() {
@@ -27,6 +51,7 @@ set_sudo_user() {
         SUDO_USER_NAME=$(getent passwd "$SUDO_UID" | cut -d: -f1)
         echo "The UID of the user who invoked sudo is $SUDO_UID."
         echo "The username of the user who invoked sudo is $SUDO_USER_NAME."
+        SUDO_USER_HOME_DIR=$(eval echo ~$SUDO_USER_NAME)
     else
         echo "This script was not invoked using sudo."
     fi
@@ -217,6 +242,8 @@ get_models() {
 install_oracle_instant_client() {
     
     ORACLE_CLIENT_DIR="$SUDO_USER_HOME_DIR/oraclient"
+    echo "oracle_client_dir is $ORACLE_CLIENT_DIR"
+
     BASIC_ZIP="instantclient-basic-linux.x64-23.6.0.24.10.zip"
     SQLPLUS_ZIP="instantclient-sqlplus-linux.x64-23.6.0.24.10.zip"
     BASIC_URL="https://download.oracle.com/otn_software/linux/instantclient/2360000/$BASIC_ZIP"
@@ -254,7 +281,7 @@ install_oracle_instant_client() {
     fi
 
     # Set the environment variables
-    ORACLE_HOME="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
+    export ORACLE_HOME="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
     export LD_LIBRARY_PATH="$ORACLE_HOME"
 
     # libaio changed in Ubuntu 24 so need to create a symlink
@@ -284,7 +311,7 @@ configure_sql_access() {
     echo "Configuring SQL access..."
     # change the default and expired ADMIN password 
     #docker exec $CONTAINER_NAME /u01/scripts/change_expired_password.sh MY_ATP admin Welcome_MY_ATP_1234 $DEFAULT_PASSWORD
-    SUDO_USER_HOME_DIR=$(eval echo ~$SUDO_USER_NAME)
+    #SUDO_USER_HOME_DIR=$(eval echo ~$SUDO_USER_NAME)
     AUTH_DIR="$SUDO_USER_HOME_DIR/auth"
     WALLET_DIR="$AUTH_DIR/tls_wallet"
 
@@ -294,6 +321,50 @@ configure_sql_access() {
     su - $SUDO_USER_NAME -c "docker cp adb-free:/u01/app/oracle/wallets/tls_wallet/ $AUTH_DIR"
 
 }
+
+# Function to run SQL command and set DPDUMP_DIR
+set_dpdump_dir() {
+    echo "oracle_client_dir is $ORACLE_CLIENT_DIR"
+    echo "instant_client is $INSTANT_CLIENT"
+    echo "LD_LIBRARY_PATH is $LD_LIBRARY_PATH"
+    echo "Running SQL command to get DATA_PUMP_DIR..."
+    SQL_OUTPUT=$(echo "SELECT directory_path FROM dba_directories WHERE directory_name='DATA_PUMP_DIR';" | \
+                  $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/Welcome_MY_ATP_123@myatp_high)
+
+    echo $SQL_OUTPUT
+
+    DPDUMP_DIR=$(echo "$SQL_OUTPUT" | grep "^/u01/dbfs" | awk '{print $1}')
+    
+    if [ -z "$DPDUMP_DIR" ]; then
+        echo "Failed to retrieve DATA_PUMP_DIR. Exiting."
+        exit 1
+    fi
+
+    echo "DATA_PUMP_DIR is set to $DPDUMP_DIR."
+}
+# # Function to run SQL command and set DPDUMP_DIR
+# set_dpdump_dir() {
+#     echo "oracle_client_dir is $ORACLE_CLIENT_DIR"
+#     echo "instant_client is $INSTANT_CLIENT"
+#     echo "LD_LIBRARY_PATH is $LD_LIBRARY_PATH"
+#     echo "Running SQL command to get DATA_PUMP_DIR..."
+#     export TNS_ADMIN=$WALLET_DIR
+#     export LD_LIBRARY_PATH=$ORACLE_CLIENT_DIR/$INSTANT_CLIENT
+#     SQL_OUTPUT=$(echo "SELECT directory_path FROM dba_directories WHERE directory_name='DATA_PUMP_DIR';" | \
+#                   su - $SUDO_USER_NAME -c "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/Welcome_MY_ATP_123@myatp_high")
+
+#     echo $SQL_OUTPUT
+
+#     DPDUMP_DIR=$(echo "$SQL_OUTPUT" | grep "^/u01/dbfs" | awk '{print $1}')
+    
+#     if [ -z "$DPDUMP_DIR" ]; then
+#         echo "Failed to retrieve DATA_PUMP_DIR. Exiting."
+#         exit 1
+#     fi
+
+#     echo "DATA_PUMP_DIR is set to $DPDUMP_DIR."
+# }
+
 
 
 ####### main code #######
@@ -306,6 +377,7 @@ HOSTNAME="fu8.local"
 
 ######### These should not need to be changed ########
 SUDO_USER_NAME=""
+SUDO_USER_HOME_DIR=""
 VOL_NAME="adb_container_vol" 
 DEFAULT_PASSWORD="Welcome_MY_ATP_123"
 CONTAINER_NAME="adb-free"
@@ -313,14 +385,17 @@ DOCKER_IMAGE="container-registry.oracle.com/database/adb-free:latest-23ai"
 ONNX_MODEL_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/94ea1512acaefbfe2e255b2d2ea4bf0d9d7b3dc3/onnx/model.onnx"
 TNS_ADMIN=""
 ORACLE_HOME=""
-
-
+ORACLE_CLIENT_DIR=""
+INSTANT_CLIENT=""
 
 # Parse arguments
-while getopts "h" opt; do
+while getopts "hc" opt; do
     case ${opt} in
         h )
             usage
+            ;;
+        c )
+            cleanup
             ;;
         \? )
             usage
@@ -328,10 +403,10 @@ while getopts "h" opt; do
     esac
 done
 
-# Check if user argument is provided
-if [ -z "$USER" ]; then
-    usage
-fi
+# # Check if user argument is provided
+# if [ -z "$USER" ]; then
+#     usage
+# fi
 
 # Call the functions to perform the checks
 check_root_user
@@ -340,21 +415,20 @@ check_os
 check_docker_installed
 check_and_add_hostname
 oracle_user_setup
-# check_existing_container
-# create_docker_volume
-# run_adb
-# wait_for_container_healthy 600
+check_existing_container
+create_docker_volume
+run_adb
+wait_for_container_healthy 1000
 
 # now we need to configure the database and add the AI models 
 #get_models
-
-
-
-
+echo "sudo user is $SUDO_USER_NAME"
 install_oracle_instant_client
 configure_sql_access
 export TNS_ADMIN="$WALLET_DIR"
-$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus admin/Welcome_MY_ATP_123@myatp_high
+
+set_dpdump_dir
+#$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus admin/Welcome_MY_ATP_123@myatp_high
 
 # echo "to see status of deployment use .." 
 # echo "docker logs -f $CONTAINER_NAME "
