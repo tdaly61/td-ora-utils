@@ -170,7 +170,6 @@ function run_adb() {
     -e WALLET_PASSWORD='$DEFAULT_PASSWORD' \
     -e ADMIN_PASSWORD='$DEFAULT_PASSWORD' \
     --hostname '$HOSTNAME' \
-    --volume '$VOL_NAME':/u01/data \
     --cap-add SYS_ADMIN \
     --device /dev/fuse \
     --name '$CONTAINER_NAME' \
@@ -445,10 +444,10 @@ check_os
 check_docker_installed
 check_and_add_hostname
 oracle_os_user_setup
-#check_existing_container
+# check_existing_container
 # create_docker_volume
 # run_adb
-# wait_for_container_healthy 1000
+wait_for_container_healthy 1000
 
 # now we need to configure the database and add the AI models 
 #get_models
@@ -457,12 +456,11 @@ install_oracle_instant_client
 configure_sql_access
 export TNS_ADMIN="$WALLET_DIR"
 
-#set_dpdump_dir
+set_dpdump_dir
 
 #$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus admin/Welcome_MY_ATP_123@myatp_high
 
-#run_sql_file "$RUN_DIR/create-users.sql"
-run_sql_file "$RUN_DIR/vector-setup.sql"
+run_sql_file "$RUN_DIR/create-users.sql"
 
 
 
