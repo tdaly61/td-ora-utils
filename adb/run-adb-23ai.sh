@@ -1,104 +1,58 @@
 #!/usr/bin/env bash
+
 # Function to clean up Docker resources
 cleanup() {
     echo "Stopping and removing the Docker container $CONTAINER_NAME..."
-    docker stop $CONTAINER_NAME
-    docker rm $CONTAINER_NAME
+    docker stop $CONTAINER_NAME >> /dev/null 2>&1
+    docker rm $CONTAINER_NAME >> /dev/null 2>&1
 
-    echo "Do you want to remove the Docker volume $VOL_NAME? (y/n): "
+    echo "Do you want to remove the database data directory $HOME/db_data_dir? (y/n): "
     read choice
     case "$choice" in 
         y|Y ) 
-            echo "Removing Docker volume $VOL_NAME..."
-            docker volume rm $VOL_NAME
-            docker volume ls 
+            echo "Removing database data directory $HOME/db_data_dir..."
+            rm -rf "$HOME/db_data_dir"
             ;;
         n|N ) 
-            echo "Skipping volume removal."
+            echo "Skipping database data directory removal."
             ;;
         * ) 
-            echo "Invalid choice. Skipping volume removal."
+            echo "Invalid choice. Skipping database data directory removal."
             ;;
     esac
+    # echo "Do you want to remove the Docker volume $VOL_NAME? (y/n): "
+    # read choice
+    # case "$choice" in 
+    #     y|Y ) 
+    #         echo "Removing Docker volume $VOL_NAME..."
+    #         docker volume rm $VOL_NAME
+    #         docker volume ls 
+    #         ;;
+    #     n|N ) 
+    #         echo "Skipping volume removal."
+    #         ;;
+    #     * ) 
+    #         echo "Invalid choice. Skipping volume removal."
+    #         ;;
+    # esac
+    # echo "Do you want to remove the Docker image $DOCKER_IMAGE? (y/n): "
+    # read choice
+    # case "$choice" in 
+    #     y|Y ) 
+    #         echo "Removing Docker image $DOCKER_IMAGE..."
+    #         docker rmi $DOCKER_IMAGE
+    #         docker images 
+    #         ;;
+    #     n|N ) 
+    #         echo "Skipping image removal."
+    #         ;;
+    #     * ) 
+    #         echo "Invalid choice. Skipping image removal."
+    #         ;;
+    # esac
     exit 0
 }
 
-
-
-# Function to ensure Docker is installed
-check_docker_installed() {
-    if ! command -v docker &> /dev/null; then
-        echo "Docker is not installed. Installing Docker..."
-        sudo apt update
-        sudo apt install -y docker.io
-        sudo systemctl start docker
-        sudo systemctl enable docker
-        sudo usermod -aG docker $USER
-        echo "Docker installed and user $USER added to docker group. Please log out and log back in for the changes to take effect."
-        exit 0
-    fi
-}
-
-# Function to set the global variable SUDO_USER by calling the id command
-set_sudo_user() {
-    OS_USER=$(id -un)
-    if [ -z "$OS_USER" ]; then
-        echo "Failed to determine the OS user. Exiting."
-        exit 1
-    fi
-    echo "OS user is set to $OS_USER."
-    
-    if [ -n "$SUDO_UID" ]; then
-        SUDO_USER_NAME=$(getent passwd "$SUDO_UID" | cut -d: -f1)
-        echo "The UID of the user who invoked sudo is $SUDO_UID."
-        echo "The username of the user who invoked sudo is $SUDO_USER_NAME."
-        SUDO_USER_HOME_DIR=$(eval echo ~$SUDO_USER_NAME)
-    else
-        echo "This script was not invoked using sudo."
-    fi
-}
-
-
-# Function to check if the script is being run as root
-check_root_user() {
-    if [ "$EUID" -ne 0 ]; then
-        echo "This script must be run as root. Please run as root or use sudo."
-        exit 1
-    fi
-}
-
-# Function to check if the operating system is Ubuntu 24
-check_os() {
-    if ! lsb_release -a 2>/dev/null | grep -q "Ubuntu 24"; then
-        echo "This script is intended to run on Ubuntu 24. Exiting."
-        exit 1
-    fi
-}
-
-# Function to check if the hostname exists in /etc/hosts
-check_and_add_hostname() {
-    if ! grep -q "$HOSTNAME" /etc/hosts; then
-        echo "$HOSTNAME not found in /etc/hosts. Adding it."
-        sudo perl -pi -e 's/^(127\.0\.0\.1\s+.*)/\1 $ENV{HOSTNAME}/' /etc/hosts
-    fi
-}
-
-# Function to set up user and groups
-oracle_os_user_setup() {
-    echo "Setting up user and groups..."
-
-    # Check and add groups if they do not exist
-    for group in oinstall dba oper backupdba dgdba kmdba racdba; do
-        if ! getent group $group > /dev/null; then
-            sudo groupadd -g $(id -g $group 2>/dev/null || echo "5432${group: -1}") $group
-        fi
-    done
-
-    # Check and add user if it does not exist
-    if ! id -u oracle > /dev/null 2>&1; then
-        sudo useradd -u 54321 -g oinstall -G dba,oper,backupdba,dgdba,kmdba,racdba oracle
-    fi
-}
 
 # Function to check if a Docker container with the given name exists
 check_existing_container() {
@@ -120,19 +74,24 @@ usage() {
     exit 1
 }
 
-# Function to determine the volume path and change ownership
-change_volume_ownership() {
-    VOL_PATH=$(docker volume inspect "$VOL_NAME" --format '{{ .Mountpoint }}')
-    if [ -z "$VOL_PATH" ]; then
-        echo "Failed to determine the volume path for $VOL_NAME. Exiting."
-        exit 1
+create_db_data_dir() { 
+    if [ ! -d "$HOME/db_data_dir" ]; then
+        echo "Creating db_data_dir directory at $HOME/db_data_dir..."
+        mkdir -p "$HOME/db_data_dir"
+        chmod 777 "$HOME/db_data_dir"
     fi
-    echo "Changing ownership of volume path $VOL_PATH to user oracle and group oinstall."
-    sudo chown -R oracle:oinstall "$VOL_PATH"
 }
 
-# Function to create a Docker volume
+
+# # Function to create a Docker volume
 create_docker_volume() {
+    LOCAL_VOL_DIR="$HOME/dbvol"
+    if [ ! -d "$LOCAL_VOL_DIR" ]; then
+        echo "Creating local volume directory at $LOCAL_VOL_DIR..."
+        mkdir -p "$LOCAL_VOL_DIR"
+    fi
+
+    echo "Creating Docker volume $VOL_NAME..."
     if docker volume inspect "$VOL_NAME" >/dev/null 2>&1; then
         echo "Warning: Volume '$VOL_NAME' already exists."
         read -p "Do you want to use the existing volume? (y/n): " choice
@@ -150,33 +109,74 @@ create_docker_volume() {
                 ;;
         esac
     else
-        # create a local volume
-        docker volume create $VOL_NAME
-        change_volume_ownership
+        docker volume create --driver local --opt type=none --opt device="$LOCAL_VOL_DIR" --opt o=bind "$VOL_NAME"
+        docker run --rm -v "$VOL_NAME":/mnt busybox sh -c "addgroup -S oinstall && adduser -S oracle -G oinstall && chown -R oracle:oinstall /mnt"
     fi
 }
+# create_docker_volume() {
+#     LOCAL_VOL_DIR="$HOME/dbvol"
+#     if [ ! -d "$LOCAL_VOL_DIR" ]; then
+#         echo "Creating local volume directory at $LOCAL_VOL_DIR..."
+#         mkdir -p "$LOCAL_VOL_DIR"
+#     fi
+
+#     echo "Creating Docker volume $VOL_NAME..."
+#     if docker volume inspect "$VOL_NAME" >/dev/null 2>&1; then
+#         echo "Warning: Volume '$VOL_NAME' already exists."
+#         read -p "Do you want to use the existing volume? (y/n): " choice
+#         case "$choice" in 
+#             y|Y ) 
+#                 echo "Using existing volume '$VOL_NAME'."
+#                 ;;
+#             n|N ) 
+#                 echo "Exiting. Please remove the existing volume with 'docker volume rm $VOL_NAME' before trying again."
+#                 exit 1
+#                 ;;
+#             * ) 
+#                 echo "Invalid choice. Exiting."
+#                 exit 1
+#                 ;;
+#         esac
+#     else
+
+#         # create a local volume
+#         docker volume create $VOL_NAME
+#         #docker volume create --driver local --opt type=none --opt device="$LOCAL_VOL_DIR" --opt o=bind "$VOL_NAME"
+#         #change_volume_ownership
+#         # Run a Docker container to set the ownership
+#         #docker run --rm -v "$VOL_NAME":/mnt busybox sh -c "addgroup -S oinstall && adduser -S oracle -G oinstall && chown -R oracle:oinstall /mnt"
+#         docker inspect $VOL_NAME
+#     fi
+
+# }
 
 # run adb docker container 
 # this script will run the ADB container with the required ports exposed
 # now run ADB with the volume mounted as /u01/data
+HOSTNAME="fu8.local"
+VOL_NAME="adb_container_vol"
+
 function run_adb() {
-    echo "Running ADB using the container image $DOCKER_IMAGE" 
-    su $SUDO_USER_NAME -c "docker run -d \
+    echo "Running ADB using image $DOCKER_IMAGE & DB data directory $HOME/db_data_dir" 
+    docker run -d \
     -p 1521:1522 \
     -p 1522:1522 \
     -p 8443:8443 \
     -p 27017:27017 \
     -e WORKLOAD_TYPE='ATP' \
-    -e WALLET_PASSWORD='$DEFAULT_PASSWORD' \
-    -e ADMIN_PASSWORD='$DEFAULT_PASSWORD' \
-    --hostname '$HOSTNAME' \
-    --volume '$VOL_NAME':/u01/data \
+    -e WALLET_PASSWORD=$DEFAULT_PASSWORD \
+    -e ADMIN_PASSWORD=$DEFAULT_PASSWORD \
+    --hostname $HOSTNAME \
     --cap-add SYS_ADMIN \
     --device /dev/fuse \
-    --name '$CONTAINER_NAME' \
-    '$DOCKER_IMAGE' "
+    --security-opt apparmor:unconfined \
+    --volume "$HOME/db_data_dir":/u01/data \
+    --name adb-free \
+    "$DOCKER_IMAGE"
 
-    # --volume '$VOL_NAME':/u01/data \
+    # 
+    #--volume "$HOME/db_data_dir":/u01/data \
+    # --volume "$VOL_NAME":/u01/data \
     # note to override the entrypoint for debugging replace the last 2 lines of the docker run with the 2 following lines 
     #      --entrypoint '/bin/bash' \
     #      $DOCKER_IMAGE -c 'sleep 3600' "
@@ -226,10 +226,9 @@ wait_for_container_healthy() {
 
 
 # Function to download the ONNX model if not already downloaded
-get_models() {
-    MODEL_PATH="/tmp/all-MiniLM-L6-v2.onnx"
+get_model() {
     if [ ! -f "$MODEL_PATH" ]; then
-        echo "Downloading ONNX model from $ONNX_MODEL_URL..."
+        echo "Downloading ONNX model from $ONNX_MODEL_URL... to $MODEL_PATH"
         curl -o "$MODEL_PATH" "$ONNX_MODEL_URL"
         if [ $? -ne 0 ]; then
             echo "Failed to download the ONNX model. Exiting."
@@ -241,89 +240,18 @@ get_models() {
     fi
 }
 
-
-# Function to install Oracle Instant Client
-install_oracle_instant_client() {
-    
-    ORACLE_CLIENT_DIR="$SUDO_USER_HOME_DIR/oraclient"
-    echo "oracle_client_dir is $ORACLE_CLIENT_DIR"
-
-    BASIC_ZIP="instantclient-basic-linux.x64-23.6.0.24.10.zip"
-    SQLPLUS_ZIP="instantclient-sqlplus-linux.x64-23.6.0.24.10.zip"
-    BASIC_URL="https://download.oracle.com/otn_software/linux/instantclient/2360000/$BASIC_ZIP"
-    SQLPLUS_URL="https://download.oracle.com/otn_software/linux/instantclient/2360000/$SQLPLUS_ZIP"
-    INSTANT_CLIENT="instantclient_23_6"
-    BASHRC_FILE="$SUDO_USER_HOME_DIR/.bashrc"
-
-    # Ensure unzip is installed
-    if ! command -v unzip &> /dev/null; then
-        echo "Unzip is not installed. Installing unzip..."
-        sudo apt update
-        sudo apt install -y unzip
-    fi
-
-    # Install the client if not already installed
-    if [ -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
-        echo "Oracle Instant Client is already installed at $ORACLE_CLIENT_DIR/$INSTANT_CLIENT."
-    else 
-        # Create the oraclient directory
-        su - $SUDO_USER_NAME -c "mkdir -p $ORACLE_CLIENT_DIR"
-
-        # Download the zip files
-        su - $SUDO_USER_NAME -c "curl -o $ORACLE_CLIENT_DIR/$BASIC_ZIP $BASIC_URL" > /dev/null 2>&1
-        su - $SUDO_USER_NAME -c "curl -o $ORACLE_CLIENT_DIR/$SQLPLUS_ZIP $SQLPLUS_URL"  > /dev/null 2>&1
-
-        # Unzip the files
-        su - $SUDO_USER_NAME -c "unzip -o $ORACLE_CLIENT_DIR/$BASIC_ZIP -d $ORACLE_CLIENT_DIR"  > /dev/null 2>&1
-        su - $SUDO_USER_NAME -c "unzip -o $ORACLE_CLIENT_DIR/$SQLPLUS_ZIP -d $ORACLE_CLIENT_DIR"  > /dev/null 2>&1
-
-        # Check if the files are unzipped
-        if [ ! -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
-            echo " ** Error **  Oracle instant client is not correctly installed in $ORACLE_CLIENT_DIR."
-            exit 1  
-        fi
-    fi
-
-    # Set the environment variables
-    export ORACLE_HOME="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
-    export LD_LIBRARY_PATH="$ORACLE_HOME"
-
-    # libaio changed in Ubuntu 24 so need to create a symlink
-    rm /usr/lib/x86_64-linux-gnu/libaio.so.1
-    ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
-
-    # Add environment variables to .bashrc if not already present
-    if ! grep -q "export TNS_ADMIN=$WALLET_DIR" "$BASHRC_FILE"; then
-        echo "export TNS_ADMIN=$WALLET_DIR" >> "$BASHRC_FILE"
-    fi
-
-    if ! grep -q "export ORACLE_HOME=$ORACLE_HOME" "$BASHRC_FILE"; then
-        echo "export ORACLE_HOME=$ORACLE_HOME" >> "$BASHRC_FILE"
-    fi
-
-    if ! grep -q "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH" "$BASHRC_FILE"; then
-        echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$BASHRC_FILE"
-    fi
-
-    if ! grep -q "export PATH=$ORACLE_HOME:\$PATH" "$BASHRC_FILE"; then
-        echo "export PATH=$ORACLE_HOME:\$PATH" >> "$BASHRC_FILE"
-    fi
-
-}
-
 configure_sql_access() {
     echo "Configuring SQL access..."
     # change the default and expired ADMIN password 
     #docker exec $CONTAINER_NAME /u01/scripts/change_expired_password.sh MY_ATP admin Welcome_MY_ATP_1234 $DEFAULT_PASSWORD
     #SUDO_USER_HOME_DIR=$(eval echo ~$SUDO_USER_NAME)
-    AUTH_DIR="$SUDO_USER_HOME_DIR/auth"
+    AUTH_DIR="$HOME/auth"
     WALLET_DIR="$AUTH_DIR/tls_wallet"
 
     rm -rf $AUTH_DIR
     echo "Creating auth directory at $AUTH_DIR."
-    su - $SUDO_USER_NAME -c "mkdir -p $AUTH_DIR"
-    su - $SUDO_USER_NAME -c "docker cp adb-free:/u01/app/oracle/wallets/tls_wallet/ $AUTH_DIR"
-
+    mkdir -p $AUTH_DIR
+    docker cp adb-free:/u01/app/oracle/wallets/tls_wallet/ $AUTH_DIR
 }
 
 # Function to run SQL command and set DPDUMP_DIR
@@ -331,10 +259,10 @@ set_dpdump_dir() {
     echo "oracle_client_dir is $ORACLE_CLIENT_DIR"
     echo "instant_client is $INSTANT_CLIENT"
     echo "LD_LIBRARY_PATH is $LD_LIBRARY_PATH"
+    echo "TNS_ADMIN is $TNS_ADMIN"
     echo "Running SQL command to get DATA_PUMP_DIR..."
     SQL_OUTPUT=$(echo "SELECT directory_path FROM dba_directories WHERE directory_name='DATA_PUMP_DIR';" | \
-                  $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/Welcome_MY_ATP_123@myatp_high)
-
+                  $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/$DEFAULT_PASSWORD@myatp_high)
     echo $SQL_OUTPUT
 
     DPDUMP_DIR=$(echo "$SQL_OUTPUT" | grep "^/u01/dbfs" | awk '{print $1}')
@@ -343,82 +271,63 @@ set_dpdump_dir() {
         echo "Failed to retrieve DATA_PUMP_DIR. Exiting."
         exit 1
     fi
-
     echo "DATA_PUMP_DIR is set to $DPDUMP_DIR."
 }
-# # Function to run SQL command and set DPDUMP_DIR
-# set_dpdump_dir() {
-#     echo "oracle_client_dir is $ORACLE_CLIENT_DIR"
-#     echo "instant_client is $INSTANT_CLIENT"
-#     echo "LD_LIBRARY_PATH is $LD_LIBRARY_PATH"
-#     echo "Running SQL command to get DATA_PUMP_DIR..."
-#     export TNS_ADMIN=$WALLET_DIR
-#     export LD_LIBRARY_PATH=$ORACLE_CLIENT_DIR/$INSTANT_CLIENT
-#     SQL_OUTPUT=$(echo "SELECT directory_path FROM dba_directories WHERE directory_name='DATA_PUMP_DIR';" | \
-#                   su - $SUDO_USER_NAME -c "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/Welcome_MY_ATP_123@myatp_high")
-
-#     echo $SQL_OUTPUT
-
-#     DPDUMP_DIR=$(echo "$SQL_OUTPUT" | grep "^/u01/dbfs" | awk '{print $1}')
-    
-#     if [ -z "$DPDUMP_DIR" ]; then
-#         echo "Failed to retrieve DATA_PUMP_DIR. Exiting."
-#         exit 1
-#     fi
-
-#     echo "DATA_PUMP_DIR is set to $DPDUMP_DIR."
-# }
 
 # Function to run a SQL file
 run_sql_file() {
     local sql_file="$1"
+    local user="$2"
     local sql_output
 
     if [ ! -f "$sql_file" ]; then
         echo "SQL file $sql_file does not exist. Exiting."
         return 1
     fi
-
     echo "Running SQL file $sql_file..."
-    #su - $SUDO_USER_NAME -c "source ~/.bashrc; echo $LD_LIBRARY_PATH"
-    #sql_output=$(su - $SUDO_USER_NAME -c "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH; $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/Welcome_MY_ATP_123@myatp_high @$sql_file")
-    #su - $SUDO_USER_NAME -c "source ~/.bashrc; $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/Welcome_MY_ATP_123@myatp_high @$sql_file"
-    #sql_output=$($ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/Welcome_MY_ATP_123@myatp_high @$sql_file)
-    $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/Welcome_MY_ATP_123@myatp_high @$sql_file
+    $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s $user/$DEFAULT_PASSWORD@myatp_high @$sql_file
     if [ $? -ne 0 ]; then
         echo "Failed to execute SQL file $sql_file. Exiting."
         return 1
     fi
-
     echo "SQL file $sql_file executed successfully."
     #echo "$sql_output"
 }
 
+# Function to read configuration from config.ini
+read_config() {
+    CONFIG_FILE="$RUN_DIR/config.ini"
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "Configuration file config.ini not found in $RUN_DIR. Exiting."
+        exit 1
+    fi
+    SQLPLUS_URL=$(awk -F "=" '/^SQLPLUS_URL/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    INSTANT_CLIENT=$(awk -F "=" '/^INSTANT_CLIENT/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    HOSTNAME=$(awk -F "=" '/^HOSTNAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    #VOL_NAME=$(awk -F "=" '/^VOL_NAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    DEFAULT_PASSWORD=$(awk -F "=" '/^DEFAULT_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' '  | tr -d '\n' | tr -d '\r')
+    CONTAINER_NAME=$(awk -F "=" '/^CONTAINER_NAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    DOCKER_IMAGE=$(awk -F "=" '/^DOCKER_IMAGE/ {print $2}' "$CONFIG_FILE" | tr -d ' '  )
+    ONNX_MODEL_URL=$(awk -F "=" '/^ONNX_MODEL_URL/ {print $2}' "$CONFIG_FILE" | tr -d ' '  )
+
+    if [ -z "$SQLPLUS_URL" ] || [ -z "$INSTANT_CLIENT" ] || [ -z "$HOSTNAME" ] || [ -z "$VOL_NAME" ] || [ -z "$DEFAULT_PASSWORD" ] || [ -z "$CONTAINER_NAME" ] || [ -z "$DOCKER_IMAGE" ]; then
+        echo "One or more configuration values are missing in config.ini. Exiting."
+        exit 1
+    fi
+}
+
+
 ####### main code #######
-# to use a remote hostname this needs to be a valid FQDN or in /etc/hosts so that certs are generated correctly 
-# e.g. myhost.local must be in /etc/hosts on the remote 
-# also make sure port 8443 is open just 443 is not sufficient (at least on azure cloud)
-
-#########  Modify these global variables for your deployment ########
-HOSTNAME="fu8.local" 
-
-######### These should not need to be changed ########
-SUDO_USER_NAME=""
-SUDO_USER_HOME_DIR=""
-VOL_NAME="adb_container_vol" 
-DEFAULT_PASSWORD="Welcome_MY_ATP_123"
-CONTAINER_NAME="adb-free"
-DOCKER_IMAGE="container-registry.oracle.com/database/adb-free:latest-23ai"
-ONNX_MODEL_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/94ea1512acaefbfe2e255b2d2ea4bf0d9d7b3dc3/onnx/model.onnx"
+WALLET_DIR=""
 TNS_ADMIN=""
-ORACLE_HOME=""
-ORACLE_CLIENT_DIR=""
-INSTANT_CLIENT=""
-
-############# don't change these ############
+ORACLE_CLIENT_DIR="$HOME/oraclient"
+MODEL_PATH="$HOME/model.onnx"
 RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )" # the directory that this script is in 
 
-set_sudo_user
+# Read configuration
+read_config
+echo $DEFAULT_PASSWORD
+
 # Parse arguments
 while getopts "hc" opt; do
     case ${opt} in
@@ -434,40 +343,46 @@ while getopts "hc" opt; do
     esac
 done
 
-# # Check if user argument is provided
-# if [ -z "$USER" ]; then
-#     usage
-# fi
-
 # Call the functions to perform the checks
-check_root_user
-check_os
-check_docker_installed
-check_and_add_hostname
-oracle_os_user_setup
-#check_existing_container
-# create_docker_volume
-# run_adb
-# wait_for_container_healthy 1000
+#create_docker_volume
+check_existing_container
+create_db_data_dir
+run_adb
+wait_for_container_healthy 1000
+get_model
 
-# now we need to configure the database and add the AI models 
-#get_models
-echo "sudo user is $SUDO_USER_NAME"
-install_oracle_instant_client
+sleep 30 
+
 configure_sql_access
 export TNS_ADMIN="$WALLET_DIR"
+echo "TNS_ADMIN is $TNS_ADMIN"
 
 #set_dpdump_dir
+DBFS_DIR=`docker exec -it adb-free ls -ltr /u01/dbfs | tail -1 | awk '{print $9}' | tr -d "\r"` 
+echo "DBFS_DIR is $DBFS_DIR"
+DATA_PUMP_DIR="/u01/dbfs/${DBFS_DIR}/data/dpdump"
+echo "DATA_PUMP_DIR is $DATA_PUMP_DIR"
+docker exec -it adb-free ls -l $DPDUMP_DIR
+echo "DPDUMP_DIR is $DPDUMP_DIR"
+docker exec -it adb-free ls -l $DPDUMP_DIR
+echo "====" 
 
-#$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus admin/Welcome_MY_ATP_123@myatp_high
+# copy onnx model into the container
+docker cp "$MODEL_PATH" "adb-free:/tmp/model.onnx"
+docker exec -it adb-free cp '/tmp/model.onnx' "$DATA_PUMP_DIR/model.onnx"
+# echo "dump dir file results" 
+# docker exec -it adb-free ls -l /u01/data
+#docker exec -it adb-free mount 
 
-#run_sql_file "$RUN_DIR/create-users.sql"
-run_sql_file "$RUN_DIR/vector-setup.sql"
+
+#run_sql_file "$RUN_DIR/test.sql"
+run_sql_file "$RUN_DIR/sql-scripts/create-users.sql" admin 
+run_sql_file "$RUN_DIR/sql-scripts/vector-setup.sql"  admin
 
 
+echo "Notes ..." 
+echo "1. to see database status use docker logs -f $CONTAINER_NAME "
+echo "2. this deployment is NOT secure it is intended for Demo and POC use only" 
+echo "3. Access APEX and SQlDeveloper https://$HOSTNAME:8443/ords/_/landing"
+echo "4. SQLplus Login via $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus admin/$DEFAULT_PASSWORD@myatp_high"
 
-# echo "to see status of deployment use .." 
-# echo "docker logs -f $CONTAINER_NAME "
-# echo " " 
-# echo "Access APEX and SQlDeveloper Web use .." 
-# echo "https://$HOSTNAME:8443/ords/_/landing"

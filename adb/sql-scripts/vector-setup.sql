@@ -10,7 +10,7 @@ END;
 
  
  
-Check it is “loaded”
+-- Check it is “loaded”
 select
   model_name
   , mining_function
