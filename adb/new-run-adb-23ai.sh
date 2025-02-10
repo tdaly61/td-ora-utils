@@ -171,7 +171,7 @@ function run_adb() {
     --hostname $HOSTNAME \
     --cap-add SYS_ADMIN \
     --device /dev/fuse \
-    --volume /home/ubuntu/db_data_dir:/u01/data \
+    --security-opt apparmor:unconfined \
     --name adb-free \
     "$DOCKER_IMAGE"
 
@@ -227,10 +227,9 @@ wait_for_container_healthy() {
 
 
 # Function to download the ONNX model if not already downloaded
-get_models() {
-    MODEL_PATH="/tmp/all-MiniLM-L6-v2.onnx"
+get_model() {
     if [ ! -f "$MODEL_PATH" ]; then
-        echo "Downloading ONNX model from $ONNX_MODEL_URL..."
+        echo "Downloading ONNX model from $ONNX_MODEL_URL... to $MODEL_PATH"
         curl -o "$MODEL_PATH" "$ONNX_MODEL_URL"
         if [ $? -ne 0 ]; then
             echo "Failed to download the ONNX model. Exiting."
@@ -254,7 +253,6 @@ configure_sql_access() {
     echo "Creating auth directory at $AUTH_DIR."
     mkdir -p $AUTH_DIR
     docker cp adb-free:/u01/app/oracle/wallets/tls_wallet/ $AUTH_DIR
-
 }
 
 # Function to run SQL command and set DPDUMP_DIR
@@ -265,8 +263,7 @@ set_dpdump_dir() {
     echo "TNS_ADMIN is $TNS_ADMIN"
     echo "Running SQL command to get DATA_PUMP_DIR..."
     SQL_OUTPUT=$(echo "SELECT directory_path FROM dba_directories WHERE directory_name='DATA_PUMP_DIR';" | \
-                  $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/Welcome_MY_ATP_123@myatp_high)
-
+                  $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/$DEFAULT_PASSWORD@myatp_high)
     echo $SQL_OUTPUT
 
     DPDUMP_DIR=$(echo "$SQL_OUTPUT" | grep "^/u01/dbfs" | awk '{print $1}')
@@ -275,7 +272,6 @@ set_dpdump_dir() {
         echo "Failed to retrieve DATA_PUMP_DIR. Exiting."
         exit 1
     fi
-
     echo "DATA_PUMP_DIR is set to $DPDUMP_DIR."
 }
 
@@ -285,23 +281,16 @@ run_sql_file() {
     local user="$2"
     local sql_output
 
-
     if [ ! -f "$sql_file" ]; then
         echo "SQL file $sql_file does not exist. Exiting."
         return 1
     fi
-
     echo "Running SQL file $sql_file..."
-    #su - $SUDO_USER_NAME -c "source ~/.bashrc; echo $LD_LIBRARY_PATH"
-    #sql_output=$(su - $SUDO_USER_NAME -c "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH; $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/Welcome_MY_ATP_123@myatp_high @$sql_file")
-    #su - $SUDO_USER_NAME -c "source ~/.bashrc; $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/Welcome_MY_ATP_123@myatp_high @$sql_file"
-    #sql_output=$($ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s admin/Welcome_MY_ATP_123@myatp_high @$sql_file)
     $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s $user/$DEFAULT_PASSWORD@myatp_high @$sql_file
     if [ $? -ne 0 ]; then
         echo "Failed to execute SQL file $sql_file. Exiting."
         return 1
     fi
-
     echo "SQL file $sql_file executed successfully."
     #echo "$sql_output"
 }
@@ -313,7 +302,6 @@ read_config() {
         echo "Configuration file config.ini not found in $RUN_DIR. Exiting."
         exit 1
     fi
-
     SQLPLUS_URL=$(awk -F "=" '/^SQLPLUS_URL/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
     INSTANT_CLIENT=$(awk -F "=" '/^INSTANT_CLIENT/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
     HOSTNAME=$(awk -F "=" '/^HOSTNAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
@@ -321,7 +309,7 @@ read_config() {
     DEFAULT_PASSWORD=$(awk -F "=" '/^DEFAULT_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' '  | tr -d '\n' | tr -d '\r')
     CONTAINER_NAME=$(awk -F "=" '/^CONTAINER_NAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
     DOCKER_IMAGE=$(awk -F "=" '/^DOCKER_IMAGE/ {print $2}' "$CONFIG_FILE" | tr -d ' '  )
-
+    ONNX_MODEL_URL=$(awk -F "=" '/^ONNX_MODEL_URL/ {print $2}' "$CONFIG_FILE" | tr -d ' '  )
 
     if [ -z "$SQLPLUS_URL" ] || [ -z "$INSTANT_CLIENT" ] || [ -z "$HOSTNAME" ] || [ -z "$VOL_NAME" ] || [ -z "$DEFAULT_PASSWORD" ] || [ -z "$CONTAINER_NAME" ] || [ -z "$DOCKER_IMAGE" ]; then
         echo "One or more configuration values are missing in config.ini. Exiting."
@@ -331,13 +319,10 @@ read_config() {
 
 
 ####### main code #######
-ONNX_MODEL_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/94ea1512acaefbfe2e255b2d2ea4bf0d9d7b3dc3/onnx/model.onnx"
+WALLET_DIR=""
 TNS_ADMIN=""
-# ORACLE_HOME=""
 ORACLE_CLIENT_DIR="$HOME/oraclient"
-# INSTANT_CLIENT=""
-
-############# don't change these ############
+MODEL_PATH="$HOME/model.onnx"
 RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )" # the directory that this script is in 
 
 # Read configuration
@@ -365,6 +350,9 @@ check_existing_container
 create_db_data_dir
 run_adb
 wait_for_container_healthy 1000
+get_model
+
+sleep 30 
 
 configure_sql_access
 export TNS_ADMIN="$WALLET_DIR"
@@ -380,19 +368,17 @@ echo "DPDUMP_DIR is $DPDUMP_DIR"
 docker exec -it adb-free ls -l $DPDUMP_DIR
 echo "====" 
 
-echo "dump dir file results" 
-docker exec -it adb-free ls -lasr /u01
-
-
-#docker cp "$HOME/all-MiniLM-L6-v2.onnx" "adb-free:$DPDUMP_DIR"
-echo "dump dir file results" 
-docker exec -it adb-free ls -l $DPDUMP_DIR
-docker exec -it adb-free mount 
+# copy onnx model into the container
+docker cp "$MODEL_PATH" "adb-free:/tmp/model.onnx"
+docker exec -it adb-free cp '/tmp/model.onnx' "$DATA_PUMP_DIR/model.onnx"
+# echo "dump dir file results" 
+# docker exec -it adb-free ls -l /u01/data
+#docker exec -it adb-free mount 
 
 
 #run_sql_file "$RUN_DIR/test.sql"
-#run_sql_file "$RUN_DIR/create-users.sql" admin 
-#run_sql_file "$RUN_DIR/vector-setup.sql"  admin
+# run_sql_file "$RUN_DIR/create-users.sql" admin 
+run_sql_file "$RUN_DIR/vector-setup.sql"  admin
 
 
 # echo "to see status of deployment use .." 
@@ -400,4 +386,4 @@ docker exec -it adb-free mount
 # echo " " 
 # echo "Access APEX and SQlDeveloper Web use .." 
 # echo "https://$HOSTNAME:8443/ords/_/landing"
-# #$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus admin/Welcome_MY_ATP_123@myatp_high
+# #$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus admin/$DEFAULT_PASSWORD@myatp_high

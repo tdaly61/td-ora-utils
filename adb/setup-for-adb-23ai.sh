@@ -256,7 +256,7 @@ check_and_add_hostname
 oracle_os_user_setup
 echo "sudo user is $SUDO_USER_NAME"
 install_oracle_instant_client
-create_docker_volume
+#create_docker_volume
 
 echo 
-echo "Setup for ADB 23ai completed "
+echo "OS and Docker Setup for ADB 23ai completed "
