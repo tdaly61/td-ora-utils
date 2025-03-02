@@ -1,10 +1,6 @@
 # Oracle Autonomous 23ai Database Container Setup
 
-This repository contains scripts and configuration files to set up and run the Oracle Autonomous 23ai database container. It also configures the database to work with the ONNX language model. The scripts here are intended for demonstration purposes and for testing but are not deploying Oracle in a very secure fashion and so should NOT be used *as is* for any sort of production environment. 
-
-## Purpose
-
-The purpose of this repository is to automate the setup and configuration of the Oracle Autonomous 23ai database container. This includes downloading and installing the Oracle Instant Client, setting up the database container, and configuring it to work with the ONNX language model.
+This repository contains scripts and configuration files to set up and run the Oracle Autonomous 23ai database container. It also configures the database to work with the ONNX language model. The scripts here are intended for demonstration purposes and for testing but are not deploying Oracle in a very secure fashion and so should NOT be used *as is* for any sort of production environment. These utilities are aimed at simplifying the Oracle ADB container instructions at https://docs.oracle.com/en-us/iaas/autonomous-database-serverless/doc/autonomous-database-container-free.html#GUID-B2E52334-2171-47F0-B951-B8007DD1B63C 
 
 ## Repository Contents
 
@@ -25,19 +21,20 @@ The purpose of this repository is to automate the setup and configuration of the
 
     ```bash
     git clone https://github.com/tdaly61/td-ora-utils.git
-    cd td-ora-utils
+    edit the 
+    cd td-ora-utils/adb
     ```
 
 2. **Run the setup script:**
 
     ```bash
-    ./setup-for-adb-23ai.sh
+    sudo ./setup-for-adb-23ai.sh
     ```
 
     This script will:
     - Check for root user privileges.
     - Verify the operating system.
-    - Check if Docker is installed.
+    - ensure docker is installed.
     - Set up the Oracle OS user.
     - Install the Oracle Instant Client.
     - Perform other necessary setup tasks.
@@ -46,7 +43,7 @@ The purpose of this repository is to automate the setup and configuration of the
 3. **Run the database container:**
 
     ```bash
-    ./run-adb-23ai.sh
+         ./run-adb-23ai.sh
     ```
 
     This script will:

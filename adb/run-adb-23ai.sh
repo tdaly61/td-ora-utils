@@ -376,6 +376,7 @@ docker exec -it adb-free cp '/tmp/model.onnx' "$DATA_PUMP_DIR/model.onnx"
 
 
 #run_sql_file "$RUN_DIR/test.sql"
+# ADD SQL-SETUP HERE 
 run_sql_file "$RUN_DIR/sql-scripts/create-users.sql" admin 
 run_sql_file "$RUN_DIR/sql-scripts/vector-setup.sql"  admin
 
