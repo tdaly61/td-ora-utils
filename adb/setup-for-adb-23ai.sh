@@ -1,16 +1,55 @@
 #!/usr/bin/env bash
 
-# Function to ensure Docker is installed
+cleanup() {
+    echo "Cleaning up Docker and related configurations..."
+
+    # Remove Docker containers, images, volumes, and networks
+    docker system prune -a -f --volumes
+
+    # Remove Docker package
+    sudo apt-get purge -y docker.io
+    sudo apt-get autoremove -y --purge docker.io
+
+    # Remove Docker group
+    if getent group docker > /dev/null; then
+        sudo groupdel docker
+    fi
+
+    # Remove Docker user
+    if id -u docker > /dev/null 2>&1; then
+        sudo userdel -r docker
+    fi
+
+    echo "Docker and related configurations have been removed."
+    exit 0
+}
+
+# Function to ensure Docker is installed and started successfully
+ensure_docker_running() {
+    for i in {1..5}; do
+        if systemctl is-active --quiet docker; then
+            echo "Docker is running."
+            return
+        else
+            echo "Docker is not running. Attempting to start Docker... (Attempt $i of 5)"
+            systemctl restart docker
+            sleep 30
+        fi
+    done
+
+    echo "Failed to start Docker after 5 attempts. Exiting."
+    exit 1
+}
+
 check_docker_installed() {
     if ! command -v docker &> /dev/null; then
         echo "Docker is not installed. Installing Docker..."
-        sudo apt update
-        sudo apt install -y docker.io
-        sudo systemctl start docker
-        sudo systemctl enable docker
-        sudo usermod -aG docker $USER
-        echo "Docker installed and user $USER added to docker group. Please log out and log back in for the changes to take effect."
-        exit 0
+        apt update
+        apt install -y docker.io
+        systemctl start docker
+        systemctl enable docker
+        usermod -aG docker $SUDO_USER_NAME
+        echo "Docker installed and user $SUDO_USER_NAME added to docker group. Please log out and log back in for the changes to take effect."
     fi
 }
 
@@ -251,10 +290,11 @@ done
 # Call the functions to perform the checks
 check_root_user
 check_os
+echo "sudo user is $SUDO_USER_NAME"
 check_docker_installed
+ensure_docker_running
 check_and_add_hostname
 oracle_os_user_setup
-echo "sudo user is $SUDO_USER_NAME"
 install_oracle_instant_client
 #create_docker_volume
 
