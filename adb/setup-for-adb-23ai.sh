@@ -38,7 +38,6 @@ ensure_docker_running() {
     done
 
     echo "Failed to start Docker after 5 attempts. Exiting."
-    exit 1
 }
 
 check_docker_installed() {
