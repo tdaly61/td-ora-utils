@@ -93,7 +93,7 @@ check_os() {
 check_and_add_hostname() {
     if ! grep -q "$HOSTNAME" /etc/hosts; then
         echo "$HOSTNAME not found in /etc/hosts. Adding it."
-        sudo perl -pi -e 's/^(127\.0\.0\.1\s+.*)/\1 $ENV{HOSTNAME}/' /etc/hosts
+        sed -i "s/^\(127\.0\.0\.1\s.*\)/\1 $HOSTNAME/" /etc/hosts
     fi
 }
 
@@ -104,7 +104,7 @@ oracle_os_user_setup() {
     # Check and add groups if they do not exist
     for group in oinstall dba oper backupdba dgdba kmdba racdba; do
         if ! getent group $group > /dev/null; then
-            sudo groupadd -g $(id -g $group 2>/dev/null || echo "5432${group: -1}") $group
+            groupadd -g $(id -g $group 2>/dev/null || echo "5432${group: -1}") $group
         fi
     done
 
