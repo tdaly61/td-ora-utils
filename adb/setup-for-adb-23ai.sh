@@ -100,16 +100,28 @@ check_and_add_hostname() {
 oracle_os_user_setup() {
     echo "Setting up user and groups..."
 
+    # Define the group IDs
+    declare -A group_ids
+    group_ids=(
+        ["oinstall"]="54321"
+        ["dba"]="54322"
+        ["oper"]="54323"
+        ["backupdba"]="54324"
+        ["dginstall"]="54325"
+        ["kmdba"]="54326"
+        ["racdba"]="54330"
+    )
+
     # Check and add groups if they do not exist
-    for group in oinstall dba oper backupdba dgdba kmdba racdba; do
+    for group in "${!group_ids[@]}"; do
         if ! getent group $group > /dev/null; then
-            groupadd -g $(id -g $group 2>/dev/null || echo "5432${group: -1}") $group
+            groupadd -g ${group_ids[$group]} $group
         fi
     done
 
     # Check and add user if it does not exist
     if ! id -u oracle > /dev/null 2>&1; then
-        sudo useradd -u 54321 -g oinstall -G dba,oper,backupdba,dgdba,kmdba,racdba oracle
+        useradd -u 54321 -g oinstall -G dba,oper,backupdba,dgdba,kmdba,racdba oracle
     fi
 }
 
