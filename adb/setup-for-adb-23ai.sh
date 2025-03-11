@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 
+
 cleanup() {
     echo "Cleaning up Docker and related configurations..."
 
@@ -9,6 +10,12 @@ cleanup() {
     # Remove Docker package
     sudo apt-get purge -y docker.io
     sudo apt-get autoremove -y --purge docker.io
+
+    # Remove Docker data
+    rm -rf /var/lib/docker
+
+    # Remove containerd socket file
+    rm -f /run/containerd/containerd.sock
 
     # Remove Docker group
     if getent group docker > /dev/null; then
@@ -31,22 +38,39 @@ ensure_docker_running() {
             echo "Docker is running."
             return
         else
-            echo "Docker is not running. Attempting to start Docker... (Attempt $i of 5)"
-            systemctl restart docker
+            echo "Docker is not running yet. Starting Docker... (Attempt $i of 5)"
+            systemctl restart containerd > /dev/null 2>&1
+            systemctl restart docker > /dev/null 2>&1
             sleep 30
         fi
     done
 
-    echo "Failed to start Docker after 5 attempts. Exiting."
+    echo "Failed to start Docker after 5 attempts. "
+    echo "Please try sudo systemctl restart docker as this may resolve the issue"
+    echo " and then run this script again."
 }
 
 check_docker_installed() {
     if ! command -v docker &> /dev/null; then
         echo "Docker is not installed. Installing Docker..."
-        apt update
+        #apt update
         apt install -y docker.io
-        systemctl start docker
+        
+        # # Reload systemd daemon
+        systemctl daemon-reload
+        
+        # # Start Docker service
+        # if ! systemctl start docker; then
+        #     echo "Failed to start Docker service. Please check the logs for more information."
+        #     exit 1
+        # fi
+        
+        # Enable Docker service to start at boot
         systemctl enable docker
+        systemctl restart containerd
+        systemctl restart docker
+        
+        # Add user to Docker group
         usermod -aG docker $SUDO_USER_NAME
         echo "Docker installed and user $SUDO_USER_NAME added to docker group. Please log out and log back in for the changes to take effect."
     fi
@@ -301,10 +325,10 @@ done
 # Call the functions to perform the checks
 check_root_user
 check_os
+check_and_add_hostname
 echo "sudo user is $SUDO_USER_NAME"
 check_docker_installed
 ensure_docker_running
-check_and_add_hostname
 oracle_os_user_setup
 install_oracle_instant_client
 #create_docker_volume
