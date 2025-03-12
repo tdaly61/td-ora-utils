@@ -120,6 +120,16 @@ check_and_add_hostname() {
     fi
 }
 
+check_and_install_packages() {
+    # Check if the required packages are installed
+    for package in "$@"; do
+        if ! dpkg -l | grep -q "ii  $package"; then
+            echo "$package is not installed. Installing $package..."
+            apt install -y $package
+        fi
+    done
+}
+
 # Function to set up user and groups
 oracle_os_user_setup() {
     echo "Setting up user and groups..."
@@ -325,6 +335,7 @@ done
 # Call the functions to perform the checks
 check_root_user
 check_os
+check_and_install_packages "unzip" "curl" "git" 
 check_and_add_hostname
 echo "sudo user is $SUDO_USER_NAME"
 check_docker_installed
