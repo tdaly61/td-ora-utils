@@ -145,7 +145,7 @@ oracle_os_user_setup() {
 
     # Check and add user if it does not exist
     if ! id -u oracle > /dev/null 2>&1; then
-        useradd -u 54321 -g oinstall -G dba,oper,backupdba,dgdba,kmdba,racdba oracle
+        useradd -u 54321 -g oinstall -G dba,oper,oinstall,backupdba,dginstall,kmdba,racdba oracle
     fi
 }
 
