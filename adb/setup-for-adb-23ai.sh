@@ -12,6 +12,7 @@ cleanup() {
     sudo apt-get autoremove -y --purge docker.io
 
     # Remove Docker data
+    umount /var/lib/docker > /dev/null 2>&1
     rm -rf /var/lib/docker
 
     # Remove containerd socket file
