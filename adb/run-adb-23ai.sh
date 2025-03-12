@@ -348,7 +348,7 @@ done
 check_existing_container
 create_db_data_dir
 run_adb
-wait_for_container_healthy 1000
+wait_for_container_healthy 1800
 get_model
 
 sleep 30 
