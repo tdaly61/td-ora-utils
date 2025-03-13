@@ -217,9 +217,11 @@ install_oracle_instant_client() {
     export ORACLE_HOME="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
     export LD_LIBRARY_PATH="$ORACLE_HOME"
 
-    # libaio changed in Ubuntu 24 so need to create a symlink
+    # libaio changed in Ubuntu 24 so need to create a symlink for 24.04 
+    # or install libaio1t64
     rm /usr/lib/x86_64-linux-gnu/libaio.so.1
     ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
+    apt-get install -y libaio1t64
 
     # Add environment variables to .bashrc if not already present
     if ! grep -q "export TNS_ADMIN=$WALLET_DIR" "$BASHRC_FILE"; then
