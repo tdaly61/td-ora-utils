@@ -113,47 +113,11 @@ create_docker_volume() {
         docker run --rm -v "$VOL_NAME":/mnt busybox sh -c "addgroup -S oinstall && adduser -S oracle -G oinstall && chown -R oracle:oinstall /mnt"
     fi
 }
-# create_docker_volume() {
-#     LOCAL_VOL_DIR="$HOME/dbvol"
-#     if [ ! -d "$LOCAL_VOL_DIR" ]; then
-#         echo "Creating local volume directory at $LOCAL_VOL_DIR..."
-#         mkdir -p "$LOCAL_VOL_DIR"
-#     fi
-
-#     echo "Creating Docker volume $VOL_NAME..."
-#     if docker volume inspect "$VOL_NAME" >/dev/null 2>&1; then
-#         echo "Warning: Volume '$VOL_NAME' already exists."
-#         read -p "Do you want to use the existing volume? (y/n): " choice
-#         case "$choice" in 
-#             y|Y ) 
-#                 echo "Using existing volume '$VOL_NAME'."
-#                 ;;
-#             n|N ) 
-#                 echo "Exiting. Please remove the existing volume with 'docker volume rm $VOL_NAME' before trying again."
-#                 exit 1
-#                 ;;
-#             * ) 
-#                 echo "Invalid choice. Exiting."
-#                 exit 1
-#                 ;;
-#         esac
-#     else
-
-#         # create a local volume
-#         docker volume create $VOL_NAME
-#         #docker volume create --driver local --opt type=none --opt device="$LOCAL_VOL_DIR" --opt o=bind "$VOL_NAME"
-#         #change_volume_ownership
-#         # Run a Docker container to set the ownership
-#         #docker run --rm -v "$VOL_NAME":/mnt busybox sh -c "addgroup -S oinstall && adduser -S oracle -G oinstall && chown -R oracle:oinstall /mnt"
-#         docker inspect $VOL_NAME
-#     fi
-
-# }
 
 # run adb docker container 
 # this script will run the ADB container with the required ports exposed
 # now run ADB with the volume mounted as /u01/data
-HOSTNAME="fu8.local"
+HOSTNAME="myadb.local"
 VOL_NAME="adb_container_vol"
 
 function run_adb() {
@@ -173,9 +137,7 @@ function run_adb() {
     --name adb-free \
     "$DOCKER_IMAGE"
 
-    #     --security-opt apparmor:unconfined \
     #--volume "$HOME/db_data_dir":/u01/data \
-    # --volume "$VOL_NAME":/u01/data \
     # note to override the entrypoint for debugging replace the last 2 lines of the docker run with the 2 following lines 
     #      --entrypoint '/bin/bash' \
     #      $DOCKER_IMAGE -c 'sleep 3600' "

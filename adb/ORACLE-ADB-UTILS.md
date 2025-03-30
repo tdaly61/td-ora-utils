@@ -11,13 +11,16 @@ This repository contains scripts and configuration files to set up and run the O
 
 ### Prerequisites
 
-- A running Ubuntu 24.04 OS with sufficient memory and disk for Oracle ADB 
+- A running Oracle Linux 8.9 or 8.10 OS with sufficient memory and disk for Oracle ADB 
 - Internet connection to download necessary files.
 - Access to sudo 
 
 ### Quick Setup
-
-1. **Clone the repository:**
+1. **Install git:**
+    ```
+    sudo dnf install -y git  
+    ```
+2. **Clone the repository:**
 
     ```bash
     git clone https://github.com/tdaly61/td-ora-utils.git
@@ -25,15 +28,15 @@ This repository contains scripts and configuration files to set up and run the O
     cd td-ora-utils/adb
     ```
 
-2. **Run the setup script:**
+3. **Run the setup script:**
 
     ```bash
-    sudo ./setup-for-adb-23ai.sh
+    sudo ./setup-for-adb-23ai.sh 
     ```
 
     This script will:
     - Check for root user privileges.
-    - Verify the operating system.
+    - Verify the operating system is one the author has tested.
     - ensure docker is installed.
     - Set up the Oracle OS user.
     - Install the Oracle Instant Client.

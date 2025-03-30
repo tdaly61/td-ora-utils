@@ -8,8 +8,8 @@ cleanup() {
     docker system prune -a -f --volumes
 
     # Remove Docker package
-    sudo apt-get purge -y docker.io
-    sudo apt-get autoremove -y --purge docker.io
+    sudo dnf remove -y docker-ce
+    sudo dnf autoremove -y
 
     # Remove Docker data
     umount /var/lib/docker > /dev/null 2>&1
@@ -51,7 +51,7 @@ ensure_docker_running() {
     echo " and then run this script again."
 }
 
-ol_check_docker_installed() {
+check_docker_installed() {
     if ! command -v docker &> /dev/null; then
         echo "Docker is not installed. Installing Docker..."
         dnf config-manager --add-repo=https://download.docker.com/linux/centos/docker-ce.repo
@@ -72,33 +72,6 @@ ol_check_docker_installed() {
     fi
 }
 
-
-# check_docker_installed() {
-#     if ! command -v docker &> /dev/null; then
-#         echo "Docker is not installed. Installing Docker..."
-#         #apt update
-#         apt install -y docker.io
-        
-#         # # Reload systemd daemon
-#         systemctl daemon-reload
-        
-#         # # Start Docker service
-#         # if ! systemctl start docker; then
-#         #     echo "Failed to start Docker service. Please check the logs for more information."
-#         #     exit 1
-#         # fi
-        
-#         # Enable Docker service to start at boot
-#         systemctl enable docker
-#         systemctl restart containerd
-#         systemctl restart docker
-        
-#         # Add user to Docker group
-#         usermod -aG docker $SUDO_USER_NAME
-#         echo "Docker installed and user $SUDO_USER_NAME added to docker group. Please log out and log back in for the changes to take effect."
-#     fi
-# }
-
 # Function to set the global variable SUDO_USER by calling the id command
 set_sudo_user() {
     OS_USER=$(id -un)
@@ -118,7 +91,6 @@ set_sudo_user() {
     fi
 }
 
-
 # Function to check if the script is being run as root
 check_root_user() {
     if [ "$EUID" -ne 0 ]; then
@@ -127,16 +99,8 @@ check_root_user() {
     fi
 }
 
-# Function to check if the operating system is Ubuntu 24
-# check_os() {
-#     if ! lsb_release -a 2>/dev/null | grep -q "Ubuntu 24"; then
-#         echo "This script is intended to run on Ubuntu 24. Exiting."
-#         exit 1
-#     fi
-# }
-
 ## Oracle Linux 
-ol_check_os() {
+check_os() {
     if ! grep -q "Oracle Linux Server release 8\.[9|10]" /etc/oracle-release; then
         echo "This script is intended to run on Oracle Linux 8.9 or 8.10. Exiting."
         exit 1
@@ -151,7 +115,7 @@ check_and_add_hostname() {
     fi
 }
 
-ol_check_and_install_packages() {
+check_and_install_packages() {
     # Check if the required packages are installed
     for package in "$@"; do
         if ! dnf list installed "$package" &> /dev/null; then
@@ -160,16 +124,6 @@ ol_check_and_install_packages() {
         fi
     done
 }
-
-# check_and_install_packages() {
-#     # Check if the required packages are installed
-#     for package in "$@"; do
-#         if ! dpkg -l | grep -q "ii  $package"; then
-#             echo "$package is not installed. Installing $package..."
-#             apt install -y $package
-#         fi
-#     done
-# }
 
 # Function to set up user and groups
 oracle_os_user_setup() {
@@ -200,7 +154,6 @@ oracle_os_user_setup() {
     fi
 }
 
-
 # Function to display usage
 usage() {
     echo "Usage: $0 -c | -h"
@@ -210,25 +163,11 @@ usage() {
 }
 
 # Function to install Oracle Instant Client
-
 install_oracle_instant_client() {
     
     ORACLE_CLIENT_DIR="$SUDO_USER_HOME_DIR/oraclient"
     echo "oracle_client_dir is $ORACLE_CLIENT_DIR"
-
-    # BASIC_ZIP="instantclient-basic-linux.x64-23.6.0.24.10.zip"
-    # SQLPLUS_ZIP="instantclient-sqlplus-linux.x64-23.6.0.24.10.zip"
-    # BASIC_URL="https://download.oracle.com/otn_software/linux/instantclient/2360000/$BASIC_ZIP"
-    # SQLPLUS_URL="https://download.oracle.com/otn_software/linux/instantclient/2360000/$SQLPLUS_ZIP"
-    # INSTANT_CLIENT="instantclient_23_6"
     BASHRC_FILE="$SUDO_USER_HOME_DIR/.bashrc"
-
-    # # Ensure unzip is installed
-    # if ! command -v unzip &> /dev/null; then
-    #     echo "Unzip is not installed. Installing unzip..."
-    #     sudo apt update
-    #     sudo apt install -y unzip
-    # fi
 
     # Install the client if not already installed
     if [ -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
@@ -251,17 +190,10 @@ install_oracle_instant_client() {
             exit 1  
         fi
     fi
-    echo "ok skipped insta-client-setup" 
 
     # Set the environment variables
     export ORACLE_HOME="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
     export LD_LIBRARY_PATH="$ORACLE_HOME"
-
-    # libaio changed in Ubuntu 24 so need to create a symlink for 24.04 
-    # or install libaio1t64
-    # rm /usr/lib/x86_64-linux-gnu/libaio.so.1
-    # ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
-    # apt-get install -y libaio1t64
 
     # Add environment variables to .bashrc if not already present
     if ! grep -q "export TNS_ADMIN=$WALLET_DIR" "$BASHRC_FILE"; then
@@ -336,8 +268,6 @@ read_config() {
     HOSTNAME=$(awk -F "=" '/^HOSTNAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
     VOL_NAME=$(awk -F "=" '/^VOL_NAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
     DEFAULT_PASSWORD=$(awk -F "=" '/^DEFAULT_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-
-
     if [ -z "$BASIC_ZIP" ] || [ -z "$SQLPLUS_ZIP" ] || [ -z "$BASIC_URL" ] || [ -z "$SQLPLUS_URL" ] || [ -z "$INSTANT_CLIENT" ]; then
         echo "One or more configuration values are missing in config.ini. Exiting."
         exit 1
@@ -352,8 +282,6 @@ TNS_ADMIN=""
 ORACLE_HOME=""
 ORACLE_CLIENT_DIR=""
 INSTANT_CLIENT=""
-
-############# don't change these ############
 RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )" # the directory that this script is in 
 
 # Read configuration
@@ -377,11 +305,11 @@ done
 
 # Call the functions to perform the checks
 check_root_user
-ol_check_os
-ol_check_and_install_packages "unzip" "curl" "git" "unzip"
+check_os
+check_and_install_packages "unzip" "curl" "git" "unzip"
 check_and_add_hostname
 echo "sudo user is $SUDO_USER_NAME"
-ol_check_docker_installed
+check_docker_installed
 ensure_docker_running
 oracle_os_user_setup
 install_oracle_instant_client
