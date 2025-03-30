@@ -169,12 +169,11 @@ function run_adb() {
     --hostname $HOSTNAME \
     --cap-add SYS_ADMIN \
     --device /dev/fuse \
-    --security-opt apparmor:unconfined \
     --volume "$HOME/db_data_dir":/u01/data \
     --name adb-free \
     "$DOCKER_IMAGE"
 
-    # 
+    #     --security-opt apparmor:unconfined \
     #--volume "$HOME/db_data_dir":/u01/data \
     # --volume "$VOL_NAME":/u01/data \
     # note to override the entrypoint for debugging replace the last 2 lines of the docker run with the 2 following lines 
