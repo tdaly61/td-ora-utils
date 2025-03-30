@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 
-
 cleanup() {
     echo "Cleaning up Docker and related configurations..."
 
