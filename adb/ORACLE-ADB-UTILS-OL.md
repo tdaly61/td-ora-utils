@@ -91,6 +91,32 @@ This script:
 - Configures database integration with the ONNX language model
 - Provides connection information upon successful startup
 
+### 7. Accessing ADB from your laptop / (remote) desktop using localhost"
+Add the HOSTNAME (i.e. the value from config.ini ) to your hosts file on the laptop/desktop system where your web browser is running where <IP> (without the angle brackets) is the IP of the server or VM where ADB has been deployed. If your browser is running on Linux or MacOS then all hosts entries go on one line , if your browser is running on Windows then you need a separate line for each entry. If you are deploying and running to the same system then <IP> will be localhost i.e. 127.0.0.1.
+
+#### If you have specified a FQDN in the config.ini then you can skip this setup
+
+```bash
+# Linux/MacOS using a remote OCI VM (/etc/hosts) 
+<IP> myadb.local
+
+# Linux/MacOS running on the system where ADB is deployed  (/etc/hosts) 
+<IP> myadb.local
+
+# Windows remote (C:\Windows\System32\drivers\etc\hosts)
+127.0.0.1 
+<IP> myadb.local
+```
+#### Access ADB
+```
+    https://myadb.local:9443/ords/_/landing
+```
+or 
+```
+    https://<your FQDN>:9443/ords/_/landing
+```
+login using the users and passwords set in the config.ini
+
 ## Configuration Options
 
 The `config.ini` file allows customization of various parameters:
@@ -119,6 +145,10 @@ Common issues and their solutions:
    ```bash
    docker logs <container_name>
    ```
+4. **Can't access apex  
+
+## Using port forward to access ADB from an OCI VM
+assuming port 443 is open and you have set HOSTNAME in the config.ini to myadb.local (for example)
 
 ## License
 
