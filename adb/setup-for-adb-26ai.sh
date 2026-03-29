@@ -105,10 +105,10 @@ check_root_user() {
     fi
 }
 
-# Function to check if the operating system is Ubuntu 24
+# Function to check if the operating system is Ubuntu 22 or 24
 check_os() {
-    if ! lsb_release -a 2>/dev/null | grep -q "Ubuntu 24"; then
-        echo "This script is intended to run on Ubuntu 24. Exiting."
+    if ! lsb_release -a 2>/dev/null | grep -qE "Ubuntu (22|24)"; then
+        echo "This script is intended to run on Ubuntu 22 or 24. Exiting."
         exit 1
     fi
 }
@@ -169,6 +169,96 @@ usage() {
     exit 1
 }
 
+# Function to ensure docker compose plugin is installed
+check_docker_compose() {
+    if docker compose version >/dev/null 2>&1; then
+        echo "Docker Compose plugin available: $(docker compose version)"
+        return
+    fi
+    echo "Docker Compose plugin not found. Installing docker-compose-plugin..."
+    apt-get install -y docker-compose-v2
+    if ! docker compose version >/dev/null 2>&1; then
+        echo "Failed to install Docker Compose plugin. Exiting."
+        exit 1
+    fi
+    echo "Docker Compose plugin installed: $(docker compose version)"
+}
+
+# Function to unzip APEX into APEX_DIR for ORDS to pick up
+prepare_apex() {
+    # Default to $HOME/apex if not set in config.ini — keeps large files out of the repo
+    local EFFECTIVE_APEX_DIR="${APEX_DIR:-$SUDO_USER_HOME_DIR/apex}"
+    local APEX_ZIP="$SUDO_USER_HOME_DIR/apex-latest.zip"
+    local APEX_PARENT=$(dirname "$EFFECTIVE_APEX_DIR")
+
+    if [ -d "$EFFECTIVE_APEX_DIR" ] && [ "$(ls -A "$EFFECTIVE_APEX_DIR" 2>/dev/null)" ]; then
+        echo "APEX directory already prepared at $EFFECTIVE_APEX_DIR. Skipping."
+        return
+    fi
+
+    if [ ! -f "$APEX_ZIP" ]; then
+        echo "Downloading Oracle APEX (~290MB)..."
+        curl -L -o "$APEX_ZIP" "https://download.oracle.com/otn_software/apex/apex-latest.zip"
+        if [ $? -ne 0 ]; then
+            echo "Failed to download APEX. Exiting."
+            exit 1
+        fi
+        chown "$SUDO_USER_NAME" "$APEX_ZIP" 2>/dev/null || true
+    else
+        echo "Using existing APEX zip at $APEX_ZIP."
+    fi
+
+    echo "Unzipping APEX to $APEX_PARENT (will create $EFFECTIVE_APEX_DIR)..."
+    mkdir -p "$APEX_PARENT"
+    unzip -q -o "$APEX_ZIP" -d "$APEX_PARENT"
+    if [ $? -ne 0 ] || [ ! -d "$EFFECTIVE_APEX_DIR" ]; then
+        echo "Failed to unzip APEX. Exiting."
+        exit 1
+    fi
+    chown -R "$SUDO_USER_NAME" "$EFFECTIVE_APEX_DIR" 2>/dev/null || true
+    echo "APEX prepared at $EFFECTIVE_APEX_DIR."
+}
+
+# Function to create the ORDS config directory (ORDS writes its config here on first run)
+create_ords_config_dir() {
+    local ORDS_CONFIG_DIR="$RUN_DIR/ords_config"
+    if [ ! -d "$ORDS_CONFIG_DIR" ]; then
+        echo "Creating ORDS config directory at $ORDS_CONFIG_DIR..."
+        mkdir -p "$ORDS_CONFIG_DIR"
+        chmod 777 "$ORDS_CONFIG_DIR"  # ORDS container runs as oracle (uid 54321), needs write access
+    else
+        echo "ORDS config directory already exists at $ORDS_CONFIG_DIR."
+    fi
+}
+
+# Function to login to Oracle Container Registry
+oracle_registry_login() {
+    if [ -z "$ORACLE_REGISTRY_USER" ] || [ -z "$ORACLE_REGISTRY_PASSWORD" ]; then
+        echo "Warning: ORACLE_REGISTRY_USER or ORACLE_REGISTRY_PASSWORD not set in config.ini."
+        echo "Skipping Oracle Container Registry login."
+        echo "Ensure you run 'docker login container-registry.oracle.com' manually before running run-adb-26ai.sh,"
+        echo "and that you have accepted the Database license at https://container-registry.oracle.com"
+        return
+    fi
+
+    echo "Logging in to Oracle Container Registry as $ORACLE_REGISTRY_USER..."
+    echo "$ORACLE_REGISTRY_PASSWORD" | docker login container-registry.oracle.com -u "$ORACLE_REGISTRY_USER" --password-stdin
+    if [ $? -ne 0 ]; then
+        echo "Docker login to Oracle Container Registry failed."
+        echo "Check your credentials and ensure you have accepted the Database license at:"
+        echo "  https://container-registry.oracle.com"
+        exit 1
+    fi
+
+    echo "Pulling Docker image $DOCKER_IMAGE to verify access..."
+    docker pull "$DOCKER_IMAGE"
+    if [ $? -ne 0 ]; then
+        echo "Failed to pull image $DOCKER_IMAGE. Check that the tag exists and the license is accepted."
+        exit 1
+    fi
+    echo "Oracle Container Registry login and image pull successful."
+}
+
 # Function to install Oracle Instant Client
 
 install_oracle_instant_client() {
@@ -217,11 +307,23 @@ install_oracle_instant_client() {
     export ORACLE_HOME="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
     export LD_LIBRARY_PATH="$ORACLE_HOME"
 
-    # libaio changed in Ubuntu 24 so need to create a symlink for 24.04 
-    # or install libaio1t64
-    rm /usr/lib/x86_64-linux-gnu/libaio.so.1
-    ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
-    apt-get install -y libaio1t64
+    # libaio package and symlink differ between Ubuntu versions
+    UBUNTU_VER=$(lsb_release -rs | cut -d. -f1)
+    if [ "$UBUNTU_VER" -ge 24 ]; then
+        # Ubuntu 24+: library is libaio.so.1t64; instant client needs libaio.so.1 symlink
+        apt-get install -y libaio1t64
+        LIBAIO_TARGET="/usr/lib/x86_64-linux-gnu/libaio.so.1t64"
+    else
+        # Ubuntu 22: library is libaio.so.1.0.1; instant client needs libaio.so.1 symlink
+        apt-get install -y libaio1
+        LIBAIO_TARGET="/usr/lib/x86_64-linux-gnu/libaio.so.1.0.1"
+    fi
+    # Ensure libaio.so.1 symlink exists and points to the correct target
+    LIBAIO_LINK="/usr/lib/x86_64-linux-gnu/libaio.so.1"
+    if [ ! -e "$LIBAIO_LINK" ] || [ "$(readlink $LIBAIO_LINK)" != "$LIBAIO_TARGET" ]; then
+        echo "Creating/fixing libaio.so.1 symlink -> $LIBAIO_TARGET"
+        ln -sf "$LIBAIO_TARGET" "$LIBAIO_LINK"
+    fi
 
     # Add environment variables to .bashrc if not already present
     if ! grep -q "export TNS_ADMIN=$WALLET_DIR" "$BASHRC_FILE"; then
@@ -294,9 +396,11 @@ read_config() {
     SQLPLUS_URL=$(awk -F "=" '/^SQLPLUS_URL/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
     INSTANT_CLIENT=$(awk -F "=" '/^INSTANT_CLIENT/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
     HOSTNAME=$(awk -F "=" '/^HOSTNAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    VOL_NAME=$(awk -F "=" '/^VOL_NAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
     DEFAULT_PASSWORD=$(awk -F "=" '/^DEFAULT_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-
+    ORACLE_REGISTRY_USER=$(awk -F "=" '/^ORACLE_REGISTRY_USER/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    ORACLE_REGISTRY_PASSWORD=$(awk -F "=" '/^ORACLE_REGISTRY_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    DOCKER_IMAGE=$(awk -F "=" '/^DOCKER_IMAGE/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    APEX_DIR=$(awk -F "=" '/^APEX_DIR/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
 
     if [ -z "$BASIC_ZIP" ] || [ -z "$SQLPLUS_ZIP" ] || [ -z "$BASIC_URL" ] || [ -z "$SQLPLUS_URL" ] || [ -z "$INSTANT_CLIENT" ]; then
         echo "One or more configuration values are missing in config.ini. Exiting."
@@ -345,7 +449,11 @@ check_docker_installed
 ensure_docker_running
 oracle_os_user_setup
 install_oracle_instant_client
-#create_docker_volume
+oracle_registry_login
+check_docker_compose
+prepare_apex
+create_ords_config_dir
 
-echo 
-echo "OS and Docker Setup for ADB 23ai completed "
+echo
+echo "OS and Docker Setup for ADB 26ai completed"
+echo "Next step: run ./run-adb-26ai.sh to start the database and ORDS/APEX"
