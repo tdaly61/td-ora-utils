@@ -14,15 +14,17 @@ cleanup() {
         docker rm ords >/dev/null 2>&1
     }
 
-    echo "Clearing ORDS config directory $RUN_DIR/ords_config (will be regenerated on next run)..."
-    sudo rm -rf "$RUN_DIR/ords_config" && mkdir -p "$RUN_DIR/ords_config" && chmod 777 "$RUN_DIR/ords_config"
-
+    # ORDS config is kept by default so credentials survive across restarts.
+    # Clearing it without also wiping the DB causes ORA-01017 (ORDS_PUBLIC_USER
+    # password mismatch). Only clear when the DB data dir is also being removed.
     echo "Do you want to remove the database data directory $HOME/db_data_dir? (y/n): "
     read choice
     case "$choice" in
         y|Y )
             echo "Removing database data directory $HOME/db_data_dir..."
             sudo rm -rf "$HOME/db_data_dir"
+            echo "Clearing ORDS config (DB removed, so credentials no longer valid)..."
+            sudo rm -rf "$RUN_DIR/ords_config" && mkdir -p "$RUN_DIR/ords_config" && chmod 777 "$RUN_DIR/ords_config"
             ;;
         n|N )
             echo "Skipping database data directory removal."
@@ -131,24 +133,51 @@ wait_for_container_healthy() {
 }
 
 # Function to patch ORDS pool.xml after APEX install completes.
-# ORDS 25.x does not persist the DBHOST env var to pool.xml — it only uses it
-# during installation. At runtime pool.xml only has plsql.gateway.mode=proxied,
-# so ORDS defaults to localhost:1521 → "No listener" → HTTP 571.
-# We detect 571, patch pool.xml, and restart the container exactly once.
+#
+# ORDS 25.x behaviour in containers:
+#   - During install it uses DBHOST/ORACLE_PWD env vars to connect as SYS.
+#   - After install it writes pool.xml with only plsql.gateway.mode=proxied
+#     (no hostname, no credentials).
+#   - At runtime it defaults to localhost:1521 → ORA-12541 → HTTP 571.
+#   - Even if the hostname is added to pool.xml, ORDS_PUBLIC_USER has no
+#     stored credential and auth fails with ORA-01017 → HTTP 574.
+#
+# Fix (repeatable):
+#   1. Reset ORDS_PUBLIC_USER password in the DB to DEFAULT_PASSWORD.
+#   2. Write pool.xml with hostname + ORDS_PUBLIC_USER + DEFAULT_PASSWORD.
+#   Both sides now agree on credentials every time.
 patch_ords_pool_config() {
-    echo "Patching ORDS pool.xml: setting db.hostname=oracle-db (ORDS 25.x does not persist DBHOST env var)..."
     local POOL_XML="$RUN_DIR/ords_config/databases/default/pool.xml"
-    sudo mkdir -p "$(dirname "$POOL_XML")"
-    sudo tee "$POOL_XML" > /dev/null << EOF
+
+    echo "Patching ORDS pool.xml (ORDS 25.x does not persist hostname or credentials)..."
+
+    # Step 1: Reset ORDS_PUBLIC_USER password in the DB to DEFAULT_PASSWORD so
+    # it matches what we will put in pool.xml.
+    echo "  Resetting ORDS_PUBLIC_USER password in DB..."
+    docker exec "$CONTAINER_NAME" bash -c \
+        "echo \"ALTER USER ORDS_PUBLIC_USER IDENTIFIED BY \\\"$DEFAULT_PASSWORD\\\";\" | \
+         sqlplus -s sys/$DEFAULT_PASSWORD@localhost:1521/$SERVICE_NAME as sysdba" \
+        2>/dev/null | grep -v '^$' || echo "  Warning: could not reset ORDS_PUBLIC_USER password."
+
+    # Step 2: Write pool.xml with all required entries.
+    # pool.xml may be owned by oracle (uid 54321) inside the container — remove it
+    # via docker exec so we can create a fresh one (ords_config dir is chmod 777).
+    docker exec ords rm -f /etc/ords/config/databases/default/pool.xml 2>/dev/null || true
+    mkdir -p "$(dirname "$POOL_XML")"
+    cat > "$POOL_XML" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE properties SYSTEM "http://java.sun.com/dtd/properties.dtd">
 <properties>
 <entry key="db.hostname">oracle-db</entry>
 <entry key="db.port">1521</entry>
 <entry key="db.servicename">${SERVICE_NAME}</entry>
+<entry key="db.username">ORDS_PUBLIC_USER</entry>
+<entry key="db.password">${DEFAULT_PASSWORD}</entry>
 <entry key="plsql.gateway.mode">proxied</entry>
 </properties>
 EOF
+    echo "  Pool config written."
+
     echo "Restarting ORDS container to apply patched pool config..."
     docker restart ords
     sleep 15
@@ -207,7 +236,12 @@ configure_sql_access() {
     AUTH_DIR="$HOME/auth"
     TNS_DIR="$AUTH_DIR/tns"
 
-    rm -rf $AUTH_DIR
+    # Remove previous auth dir — may be root-owned if a prior sudo run created it
+    if [ -d "$AUTH_DIR" ] && [ ! -w "$AUTH_DIR" ]; then
+        sudo rm -rf "$AUTH_DIR"
+    else
+        rm -rf "$AUTH_DIR"
+    fi
     echo "Creating TNS config directory at $TNS_DIR."
     mkdir -p $TNS_DIR
 
@@ -244,7 +278,8 @@ run_sql_file() {
         return 1
     fi
     echo "Running SQL file $sql_file..."
-    $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus -s $user/$DEFAULT_PASSWORD@$SERVICE_NAME @$sql_file
+    LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus" -s "$user/$DEFAULT_PASSWORD@$SERVICE_NAME" "@$sql_file"
     if [ $? -ne 0 ]; then
         echo "Failed to execute SQL file $sql_file."
         return 1
@@ -279,10 +314,86 @@ read_config() {
     APEX_PASSWORD=$(awk -F "=" '/^APEX_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' ' | tr -d '\n' | tr -d '\r')
     APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
 
-    if [ -z "$SQLPLUS_URL" ] || [ -z "$INSTANT_CLIENT" ] || [ -z "$HOSTNAME" ] || [ -z "$DEFAULT_PASSWORD" ] || [ -z "$CONTAINER_NAME" ] || [ -z "$DOCKER_IMAGE" ] || [ -z "$SERVICE_NAME" ]; then
-        echo "One or more configuration values are missing in config.ini. Exiting."
+    local missing=""
+    [ -z "$SQLPLUS_URL" ]      && missing="$missing SQLPLUS_URL"
+    [ -z "$INSTANT_CLIENT" ]   && missing="$missing INSTANT_CLIENT"
+    [ -z "$HOSTNAME" ]         && missing="$missing HOSTNAME"
+    [ -z "$DEFAULT_PASSWORD" ] && missing="$missing DEFAULT_PASSWORD"
+    [ -z "$CONTAINER_NAME" ]   && missing="$missing CONTAINER_NAME"
+    [ -z "$DOCKER_IMAGE" ]     && missing="$missing DOCKER_IMAGE"
+    [ -z "$SERVICE_NAME" ]     && missing="$missing SERVICE_NAME"
+    if [ -n "$missing" ]; then
+        echo "Missing required config.ini values:$missing"
         exit 1
     fi
+}
+
+# Pre-flight checks — catch common environment problems before starting long operations
+preflight_check() {
+    local errors=0
+
+    echo "--- Pre-flight checks ---"
+
+    # Docker must be installed and running
+    if ! command -v docker &>/dev/null; then
+        echo "ERROR: Docker is not installed. Run: sudo ./setup-for-adb-26ai.sh"
+        errors=$((errors + 1))
+    elif ! docker info &>/dev/null 2>&1; then
+        if sudo systemctl is-active --quiet docker 2>/dev/null; then
+            echo "ERROR: Docker is running but not accessible. Log out and back in, or re-run with sudo."
+        else
+            echo "ERROR: Docker is not running. Run: sudo systemctl start docker"
+        fi
+        errors=$((errors + 1))
+    fi
+
+    # Docker Compose plugin
+    if ! docker compose version &>/dev/null 2>&1; then
+        echo "ERROR: Docker Compose plugin not found. Run: sudo ./setup-for-adb-26ai.sh"
+        errors=$((errors + 1))
+    fi
+
+    # Oracle Instant Client (sqlplus)
+    if [ ! -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
+        echo "ERROR: Instant Client not found at $ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
+        echo "       Run: sudo ./setup-for-adb-26ai.sh"
+        errors=$((errors + 1))
+    fi
+
+    # APEX directory must be populated (ORDS needs it on first run)
+    local effective_apex_dir="${APEX_DIR:-$HOME/apex}"
+    if [ ! -d "$effective_apex_dir" ] || [ -z "$(ls -A "$effective_apex_dir" 2>/dev/null)" ]; then
+        echo "ERROR: APEX directory missing or empty: $effective_apex_dir"
+        echo "       Run: sudo ./setup-for-adb-26ai.sh"
+        errors=$((errors + 1))
+    fi
+
+    # Oracle Container Registry — images are publicly pullable (no login required).
+    # Login is only needed if pulls start failing (e.g. rate limits or policy change).
+    if ! docker image inspect "$DOCKER_IMAGE" &>/dev/null || \
+       ! docker image inspect container-registry.oracle.com/database/ords:latest &>/dev/null; then
+        echo "Note: Oracle images not cached locally — will pull from container-registry.oracle.com (no login required)."
+    fi
+
+    # Disk space: Oracle Free container needs ~15 GB for oradata
+    local avail_kb
+    avail_kb=$(df "$HOME" --output=avail 2>/dev/null | tail -1)
+    if [ -n "$avail_kb" ] && [ "$avail_kb" -lt 15728640 ]; then  # 15 GB in KB
+        echo "WARNING: Less than 15 GB free in $HOME — Oracle Database container may run out of space."
+    fi
+
+    # docker-compose.yml must be present
+    if [ ! -f "$RUN_DIR/docker-compose.yml" ]; then
+        echo "ERROR: docker-compose.yml not found in $RUN_DIR"
+        errors=$((errors + 1))
+    fi
+
+    if [ "$errors" -gt 0 ]; then
+        echo "--- $errors pre-flight error(s). Fix the above before continuing. ---"
+        exit 1
+    fi
+
+    echo "--- Pre-flight checks passed ---"
 }
 
 # Generate SQL files from templates, substituting config values
@@ -307,9 +418,25 @@ MODEL_PATH="$HOME/model.onnx"
 REMOVE_IMAGES=false
 RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )" # the directory that this script is in
 
+# If docker isn't accessible, try to apply the docker group without requiring a logout.
+# We check /etc/group (via id -nG <username>) rather than the current session's groups,
+# because this session may predate the docker group add done by setup-for-adb-26ai.sh.
+if ! docker info &>/dev/null 2>&1; then
+    _current_user="${SUDO_USER:-$USER}"
+    if id -nG "$_current_user" 2>/dev/null | grep -qw docker; then
+        echo "Docker group not active in this session — re-launching in docker group context..."
+        exec sg docker -c "bash $(printf '%q ' "$0" "$@")"
+    fi
+    unset _current_user
+    # docker isn't installed/running — preflight_check will report this clearly
+fi
+
+# sg disconnects stdin from the TTY. Reconnect so interactive prompts (e.g. cleanup read)
+# work correctly in the re-exec'd process. Suppress error if no controlling TTY (non-interactive).
+[ ! -t 0 ] && exec < /dev/tty 2>/dev/null || true
+
 # Read configuration
 read_config
-echo $DEFAULT_PASSWORD
 
 # Parse arguments — collect all flags before acting
 DO_CLEANUP=false
@@ -326,13 +453,29 @@ if [ "$DO_CLEANUP" = "true" ]; then
     cleanup
 fi
 
+preflight_check
+
 # --- Phase 1: Start Oracle Database ---
 check_existing_container
 create_db_data_dir
 generate_env_file
 
-echo "Pulling Docker images (DB + ORDS)..."
-docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" pull
+# Pull images from Oracle Container Registry.
+# The database/free and database/ords images are publicly accessible — no login required.
+# If already cached locally the pull will just confirm the digest; if the registry is
+# unreachable the cached image is used and the script continues.
+echo "Pulling Docker images (DB + ORDS) — login not required for Oracle free-tier images..."
+docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" pull || {
+    echo "Warning: image pull failed (registry unreachable or auth required)."
+    echo "Checking for locally cached images..."
+    if ! docker image inspect "$DOCKER_IMAGE" &>/dev/null || \
+       ! docker image inspect container-registry.oracle.com/database/ords:latest &>/dev/null; then
+        echo "ERROR: Required images not cached locally. Ensure you can reach container-registry.oracle.com"
+        echo "       or run: docker login container-registry.oracle.com"
+        exit 1
+    fi
+    echo "Using locally cached images."
+}
 
 echo "Starting Oracle Database container..."
 docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" up -d oracle-db

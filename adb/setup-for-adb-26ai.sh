@@ -54,26 +54,23 @@ ensure_docker_running() {
 check_docker_installed() {
     if ! command -v docker &> /dev/null; then
         echo "Docker is not installed. Installing Docker..."
-        #apt update
         apt install -y docker.io
-        
-        # # Reload systemd daemon
         systemctl daemon-reload
-        
-        # # Start Docker service
-        # if ! systemctl start docker; then
-        #     echo "Failed to start Docker service. Please check the logs for more information."
-        #     exit 1
-        # fi
-        
-        # Enable Docker service to start at boot
         systemctl enable docker
         systemctl restart containerd
         systemctl restart docker
-        
-        # Add user to Docker group
-        usermod -aG docker $SUDO_USER_NAME
-        echo "Docker installed and user $SUDO_USER_NAME added to docker group. Please log out and log back in for the changes to take effect."
+    fi
+
+    # Always ensure the invoking user is in the docker group (idempotent).
+    # Group membership takes effect in new sessions; run-adb-26ai.sh handles
+    # the case where the current session predates the group add via sg docker.
+    if [ -n "$SUDO_USER_NAME" ] && ! id -nG "$SUDO_USER_NAME" | grep -qw docker; then
+        echo "Adding $SUDO_USER_NAME to the docker group..."
+        usermod -aG docker "$SUDO_USER_NAME"
+        echo "Done. Docker group will be active in new login sessions."
+        echo "run-adb-26ai.sh will apply it automatically in the current session."
+    else
+        echo "User $SUDO_USER_NAME is already in the docker group."
     fi
 }
 
@@ -231,32 +228,22 @@ create_ords_config_dir() {
     fi
 }
 
-# Function to login to Oracle Container Registry
+# Oracle Container Registry login — optional.
+# The database/free and database/ords images are publicly accessible without login.
+# Only needed if pulls start failing (rate limit or policy change).
+# Set ORACLE_REGISTRY_USER and ORACLE_REGISTRY_PASSWORD in config.ini to enable.
 oracle_registry_login() {
     if [ -z "$ORACLE_REGISTRY_USER" ] || [ -z "$ORACLE_REGISTRY_PASSWORD" ]; then
-        echo "Warning: ORACLE_REGISTRY_USER or ORACLE_REGISTRY_PASSWORD not set in config.ini."
-        echo "Skipping Oracle Container Registry login."
-        echo "Ensure you run 'docker login container-registry.oracle.com' manually before running run-adb-26ai.sh,"
-        echo "and that you have accepted the Database license at https://container-registry.oracle.com"
+        echo "Oracle Container Registry credentials not set — skipping login (not required for free-tier images)."
         return
     fi
-
     echo "Logging in to Oracle Container Registry as $ORACLE_REGISTRY_USER..."
     echo "$ORACLE_REGISTRY_PASSWORD" | docker login container-registry.oracle.com -u "$ORACLE_REGISTRY_USER" --password-stdin
     if [ $? -ne 0 ]; then
-        echo "Docker login to Oracle Container Registry failed."
-        echo "Check your credentials and ensure you have accepted the Database license at:"
-        echo "  https://container-registry.oracle.com"
+        echo "Docker login failed. Check credentials at https://container-registry.oracle.com"
         exit 1
     fi
-
-    echo "Pulling Docker image $DOCKER_IMAGE to verify access..."
-    docker pull "$DOCKER_IMAGE"
-    if [ $? -ne 0 ]; then
-        echo "Failed to pull image $DOCKER_IMAGE. Check that the tag exists and the license is accepted."
-        exit 1
-    fi
-    echo "Oracle Container Registry login and image pull successful."
+    echo "Oracle Container Registry login successful."
 }
 
 # Function to install Oracle Instant Client
@@ -403,8 +390,59 @@ read_config() {
     APEX_DIR=$(awk -F "=" '/^APEX_DIR/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
 
     if [ -z "$BASIC_ZIP" ] || [ -z "$SQLPLUS_ZIP" ] || [ -z "$BASIC_URL" ] || [ -z "$SQLPLUS_URL" ] || [ -z "$INSTANT_CLIENT" ]; then
-        echo "One or more configuration values are missing in config.ini. Exiting."
+        echo "One or more Instant Client configuration values are missing in config.ini. Exiting."
         exit 1
+    fi
+    if [ -z "$HOSTNAME" ]; then
+        echo "HOSTNAME is not set in config.ini. Exiting."
+        exit 1
+    fi
+    if [ -z "$DEFAULT_PASSWORD" ]; then
+        echo "DEFAULT_PASSWORD is not set in config.ini. Exiting."
+        exit 1
+    fi
+    if [ -z "$DOCKER_IMAGE" ]; then
+        echo "DOCKER_IMAGE is not set in config.ini. Exiting."
+        exit 1
+    fi
+}
+
+# Pre-flight checks — run before any system changes to catch problems early
+preflight_check() {
+    local warnings=0
+
+    echo "--- Pre-flight checks ---"
+
+    # Network reachability for Instant Client downloads
+    if ! curl -s --max-time 8 -o /dev/null "https://download.oracle.com" 2>/dev/null; then
+        echo "WARNING: Cannot reach download.oracle.com — Instant Client download may fail."
+        warnings=$((warnings + 1))
+    fi
+
+    # Network reachability for APEX download
+    if ! curl -s --max-time 8 -o /dev/null "https://download.oracle.com/otn_software/apex/" 2>/dev/null; then
+        echo "WARNING: Cannot reach Oracle APEX download URL — APEX download may fail."
+        warnings=$((warnings + 1))
+    fi
+
+    # Oracle Container Registry credentials are optional — images are publicly pullable.
+    if [ -n "$ORACLE_REGISTRY_USER" ] && [ -n "$ORACLE_REGISTRY_PASSWORD" ]; then
+        echo "Oracle Container Registry credentials configured — login will be attempted."
+    fi
+
+    # Disk space: need ~600MB for APEX zip + instant client ZIPs + unzipped content
+    local home_dir="${SUDO_USER_HOME_DIR:-$HOME}"
+    local avail_kb
+    avail_kb=$(df "$home_dir" --output=avail 2>/dev/null | tail -1)
+    if [ -n "$avail_kb" ] && [ "$avail_kb" -lt 2097152 ]; then  # 2 GB in KB
+        echo "WARNING: Less than 2 GB free in $home_dir — downloads may fail."
+        warnings=$((warnings + 1))
+    fi
+
+    if [ "$warnings" -gt 0 ]; then
+        echo "--- $warnings warning(s) noted above. Continuing... ---"
+    else
+        echo "--- Pre-flight checks passed ---"
     fi
 }
 
@@ -442,7 +480,8 @@ done
 # Call the functions to perform the checks
 check_root_user
 check_os
-check_and_install_packages "unzip" "curl" "git" 
+preflight_check
+check_and_install_packages "unzip" "curl" "git"
 check_and_add_hostname
 echo "sudo user is $SUDO_USER_NAME"
 check_docker_installed
@@ -453,6 +492,14 @@ oracle_registry_login
 check_docker_compose
 prepare_apex
 create_ords_config_dir
+
+# Fix ownership of any files in RUN_DIR that were created as root during this or
+# prior sudo runs, so the invoking user can write them without sudo going forward.
+if [ -n "$SUDO_USER_NAME" ]; then
+    for f in "$RUN_DIR/.env" "$RUN_DIR/ords_config" "$RUN_DIR/sql-scripts/create-users.sql"; do
+        [ -e "$f" ] && chown -R "$SUDO_USER_NAME:$SUDO_USER_NAME" "$f" 2>/dev/null || true
+    done
+fi
 
 echo
 echo "OS and Docker Setup for ADB 26ai completed"

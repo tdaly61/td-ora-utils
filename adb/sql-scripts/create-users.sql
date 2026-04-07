@@ -24,6 +24,7 @@ BEGIN
         p_developer_privs => 'ADMIN:CREATE:DATA_LOADER:EDIT:HELP:MONITOR:SQL',
         p_email_address => 'TRACKER1@withoracle.cloud',
         p_default_schema => 'TRACKER1',
+        p_account_expiry => SYSDATE + 36500,
         p_change_password_on_first_use => 'N');
     END;]';
     DBMS_OUTPUT.PUT_LINE('APEX workspace TRACKER1 created successfully.');
