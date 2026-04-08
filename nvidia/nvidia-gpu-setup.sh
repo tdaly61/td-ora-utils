@@ -9,6 +9,7 @@
 # Options:
 #   --check-only    Detect GPU/kernel info and show what would be installed
 #   --skip-reboot   Do not prompt to reboot after install
+#   --cleanup       Remove NVIDIA drivers, utils, and nvtop (reboot required)
 #   --help          Show this help message
 # ==============================================================================
 
@@ -35,6 +36,7 @@ header()  { echo -e "\n${BOLD}${CYAN}==> $*${NC}"; }
 # ------------------------------------------------------------------------------
 CHECK_ONLY=false
 SKIP_REBOOT=false
+DO_CLEANUP=false
 
 # ------------------------------------------------------------------------------
 # Parse arguments
@@ -43,6 +45,7 @@ for arg in "$@"; do
   case "$arg" in
     --check-only)   CHECK_ONLY=true ;;
     --skip-reboot)  SKIP_REBOOT=true ;;
+    --cleanup)      DO_CLEANUP=true ;;
     --help|-h)
       sed -n '/^# Usage/,/^# ====/p' "$0" | sed 's/^# \?//'
       exit 0
@@ -60,6 +63,45 @@ done
 if [[ $EUID -ne 0 ]]; then
   error "This script must be run as root (use sudo)."
   exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Cleanup — remove NVIDIA packages this script installs
+# ------------------------------------------------------------------------------
+if [[ "$DO_CLEANUP" == "true" ]]; then
+  header "Removing NVIDIA drivers and utilities"
+
+  # Find all installed nvidia/cuda packages
+  NVIDIA_PKGS=$(dpkg -l 2>/dev/null | grep -E 'nvidia-|cuda-|libnvidia-' | awk '{print $2}' || true)
+  if [[ -n "$NVIDIA_PKGS" ]]; then
+    info "Removing packages: $(echo "$NVIDIA_PKGS" | tr '\n' ' ')"
+    apt-get purge -y $NVIDIA_PKGS || warn "Some packages could not be purged"
+    apt-get autoremove -y
+  else
+    info "No NVIDIA packages found to remove."
+  fi
+
+  # Remove nvtop
+  if dpkg -l nvtop 2>/dev/null | grep -q '^ii'; then
+    info "Removing nvtop..."
+    apt-get purge -y nvtop
+  fi
+
+  # Remove modules-load config
+  if [[ -f /etc/modules-load.d/nvidia.conf ]]; then
+    info "Removing /etc/modules-load.d/nvidia.conf"
+    rm -f /etc/modules-load.d/nvidia.conf
+  fi
+
+  success "NVIDIA cleanup complete."
+  warn "A reboot is required to fully unload the kernel modules."
+  if ! $SKIP_REBOOT; then
+    read -r -t 30 -p "Reboot now? [y/N] " REBOOT_ANSWER || REBOOT_ANSWER="n"
+    if [[ "${REBOOT_ANSWER,,}" == "y" ]]; then
+      reboot
+    fi
+  fi
+  exit 0
 fi
 
 # ==============================================================================
@@ -303,7 +345,7 @@ if ! $INSTALL_SUCCESS && ! $SKIP_REBOOT; then
   echo
   warn "The NVIDIA driver is installed but the kernel module could not be loaded."
   warn "A reboot is required to activate the driver."
-  read -r -p "Reboot now? [y/N] " REBOOT_ANSWER
+  read -r -t 30 -p "Reboot now? [y/N] " REBOOT_ANSWER || REBOOT_ANSWER="n"
   if [[ "${REBOOT_ANSWER,,}" == "y" ]]; then
     info "Rebooting..."
     reboot

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
 # Function to clean up Docker resources
 # Respects $REMOVE_IMAGES — set via -r flag (default: false)
@@ -18,7 +19,7 @@ cleanup() {
     # Clearing it without also wiping the DB causes ORA-01017 (ORDS_PUBLIC_USER
     # password mismatch). Only clear when the DB data dir is also being removed.
     echo "Do you want to remove the database data directory $HOME/db_data_dir? (y/n): "
-    read choice
+    read -t 30 choice || choice="n"
     case "$choice" in
         y|Y )
             echo "Removing database data directory $HOME/db_data_dir..."
@@ -46,16 +47,26 @@ cleanup() {
 }
 
 
-# Function to check if Docker containers with the expected names already exist
-check_existing_container() {
-    if [ "$(docker ps -aq -f name=^${CONTAINER_NAME}$)" ]; then
-        echo "Container $CONTAINER_NAME already exists. Run ./run-adb-26ai.sh -c to clean up."
-        exit 1
+# Check if a container exists and is healthy/running. Returns:
+#   0 — container is running and healthy (reuse it)
+#   1 — container does not exist (create it)
+#   2 — container exists but is stopped/unhealthy (remove and recreate)
+check_container_state() {
+    local name="$1"
+    local cid
+    cid=$(docker ps -aq -f "name=^${name}$" 2>/dev/null || true)
+    if [ -z "$cid" ]; then
+        return 1  # does not exist
     fi
-    if [ "$(docker ps -aq -f name=^ords$)" ]; then
-        echo "Container ords already exists. Run ./run-adb-26ai.sh -c to clean up."
-        exit 1
+    local state
+    state=$(docker inspect --format='{{.State.Status}}' "$name" 2>/dev/null || echo "unknown")
+    if [ "$state" = "running" ]; then
+        return 0  # running
     fi
+    # Exists but stopped/dead — remove so we can recreate cleanly
+    echo "Container $name exists but is $state — removing stale container..."
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    return 1  # treat as not existing
 }
 
 # Function to display usage
@@ -114,7 +125,7 @@ wait_for_container_healthy() {
             exit 1
         fi
 
-        STATUS=$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER_NAME")
+        STATUS=$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "starting")
         if [ "$STATUS" == "healthy" ]; then
             echo "Container $CONTAINER_NAME is running and healthy."
             break
@@ -220,9 +231,9 @@ wait_for_ords() {
 get_model() {
     if [ ! -f "$MODEL_PATH" ]; then
         echo "Downloading ONNX model from $ONNX_MODEL_URL... to $MODEL_PATH"
-        curl -o "$MODEL_PATH" "$ONNX_MODEL_URL"
-        if [ $? -ne 0 ]; then
+        if ! curl -fL -C - -o "$MODEL_PATH" "$ONNX_MODEL_URL"; then
             echo "Failed to download the ONNX model. Exiting."
+            rm -f "$MODEL_PATH"  # remove partial download
             exit 1
         fi
         echo "ONNX model downloaded and saved to $MODEL_PATH."
@@ -243,7 +254,7 @@ configure_sql_access() {
         rm -rf "$AUTH_DIR"
     fi
     echo "Creating TNS config directory at $TNS_DIR."
-    mkdir -p $TNS_DIR
+    mkdir -p "$TNS_DIR"
 
     # Create tnsnames.ora for Oracle Database Free local connections
     cat > "$TNS_DIR/tnsnames.ora" << EOF
@@ -278,9 +289,8 @@ run_sql_file() {
         return 1
     fi
     echo "Running SQL file $sql_file..."
-    LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-        "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus" -s "$user/$DEFAULT_PASSWORD@$SERVICE_NAME" "@$sql_file"
-    if [ $? -ne 0 ]; then
+    if ! LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus" -s "$user/$DEFAULT_PASSWORD@$SERVICE_NAME" "@$sql_file"; then
         echo "Failed to execute SQL file $sql_file."
         return 1
     fi
@@ -313,6 +323,11 @@ read_config() {
     APEX_USER=${APEX_USER:-TRACKER1}
     APEX_PASSWORD=$(awk -F "=" '/^APEX_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' ' | tr -d '\n' | tr -d '\r')
     APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
+
+    OLLAMA_BASE_URL=$(awk -F "=" '/^OLLAMA_BASE_URL/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    OLLAMA_MODEL=$(awk -F "=" '/^OLLAMA_MODEL/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    OLLAMA_MODEL=${OLLAMA_MODEL:-llama3}
 
     local missing=""
     [ -z "$SQLPLUS_URL" ]      && missing="$missing SQLPLUS_URL"
@@ -388,12 +403,76 @@ preflight_check() {
         errors=$((errors + 1))
     fi
 
+    # Ollama must be reachable from the host (it listens on 0.0.0.0:11434)
+    local ollama_host_url="${OLLAMA_BASE_URL/host.docker.internal/localhost}"
+    if curl -s --max-time 5 -o /dev/null -w "%{http_code}" "$ollama_host_url/api/tags" 2>/dev/null | grep -q "200"; then
+        echo "Ollama is reachable on the host at $ollama_host_url"
+    else
+        echo "WARNING: Ollama not reachable at $ollama_host_url"
+        echo "         Ensure ollama is running with OLLAMA_HOST=0.0.0.0"
+        echo "         Run: sudo systemctl edit ollama  (add Environment=\"OLLAMA_HOST=0.0.0.0\")"
+        echo "         Then: sudo systemctl daemon-reload && sudo systemctl restart ollama"
+    fi
+
     if [ "$errors" -gt 0 ]; then
         echo "--- $errors pre-flight error(s). Fix the above before continuing. ---"
         exit 1
     fi
 
     echo "--- Pre-flight checks passed ---"
+}
+
+# Enable MAX_STRING_SIZE=EXTENDED so that VARCHAR2(32767) columns are supported.
+# This is required for APEX Supporting Objects that define wide VARCHAR2 columns.
+# The change is idempotent — safe to call on a DB that is already EXTENDED.
+# It requires a full DB restart in UPGRADE mode (runs utl32k.sql), which is the
+# standard Oracle procedure. The restart happens inside the container via docker exec.
+enable_extended_string_size() {
+    echo "=== Checking MAX_STRING_SIZE ==="
+
+    local current
+    current=$(docker exec -i "$CONTAINER_NAME" sqlplus -s / as sysdba << 'SQLEOF' 2>/dev/null
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT value FROM v$parameter WHERE name='max_string_size';
+EXIT;
+SQLEOF
+)
+    current=$(echo "$current" | tr -d '[:space:]')
+
+    if [ "${current^^}" = "EXTENDED" ]; then
+        echo "MAX_STRING_SIZE already EXTENDED — skipping."
+        return 0
+    fi
+
+    echo "MAX_STRING_SIZE=$current — enabling EXTENDED (DB will restart in UPGRADE mode)..."
+
+    # Step 1: Set parameter and restart CDB in UPGRADE mode
+    docker exec -i "$CONTAINER_NAME" sqlplus -s / as sysdba << 'SQLEOF'
+ALTER SYSTEM SET MAX_STRING_SIZE=EXTENDED SCOPE=SPFILE;
+SHUTDOWN IMMEDIATE;
+STARTUP UPGRADE;
+EXIT;
+SQLEOF
+
+    # Step 2: Run utl32k.sql in CDB root, then in each PDB (FREEPDB1)
+    docker exec -i "$CONTAINER_NAME" sqlplus -s / as sysdba << 'SQLEOF'
+-- Migrate CDB root
+@?/rdbms/admin/utl32k.sql
+-- Open PDB in UPGRADE mode and migrate it too
+ALTER PLUGGABLE DATABASE ALL OPEN UPGRADE;
+ALTER SESSION SET CONTAINER=FREEPDB1;
+@?/rdbms/admin/utl32k.sql
+-- Return to CDB root and restart normally
+ALTER SESSION SET CONTAINER=CDB$ROOT;
+SHUTDOWN IMMEDIATE;
+STARTUP;
+EXIT;
+SQLEOF
+
+    echo "MAX_STRING_SIZE=EXTENDED enabled — waiting for DB to stabilise..."
+    sleep 20
+    wait_for_container_healthy 300
+    echo "MAX_STRING_SIZE=EXTENDED configured successfully."
 }
 
 # Generate SQL files from templates, substituting config values
@@ -407,8 +486,86 @@ generate_sql_files() {
     sed -e "s/__APEX_USER__/$APEX_USER/g" \
         -e "s/__APEX_PASSWORD__/$APEX_PASSWORD/g" \
         "$TPL" > "$OUT"
+
+    # Ollama AI service SQL
+    local OLLAMA_TPL="$RUN_DIR/sql-scripts/setup-ollama-ai.sql.tpl"
+    local OLLAMA_OUT="$RUN_DIR/sql-scripts/setup-ollama-ai.sql"
+    if [ -f "$OLLAMA_TPL" ]; then
+        sed -e "s/__APEX_USER__/$APEX_USER/g" \
+            -e "s|__OLLAMA_BASE_URL__|$OLLAMA_BASE_URL|g" \
+            -e "s/__OLLAMA_MODEL__/$OLLAMA_MODEL/g" \
+            "$OLLAMA_TPL" > "$OLLAMA_OUT"
+    fi
 }
 
+
+# Validate that the DB can reach Ollama and generate text end-to-end.
+# Runs a real DBMS_VECTOR_CHAIN call via docker exec sqlplus inside the container.
+validate_ollama_from_db() {
+    echo ""
+    echo "=== Validating Ollama connectivity from inside the database ==="
+
+    # Test 1: HTTP connectivity from DB to Ollama via UTL_HTTP
+    echo "--- Test 1: UTL_HTTP connectivity to Ollama ---"
+    local http_result
+    http_result=$(docker exec -i "$CONTAINER_NAME" sqlplus -s "system/$DEFAULT_PASSWORD@localhost:1521/$SERVICE_NAME" << SQLEOF
+SET SERVEROUTPUT ON
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+DECLARE
+  v_req  UTL_HTTP.REQ;
+  v_resp UTL_HTTP.RESP;
+  v_body VARCHAR2(4000);
+BEGIN
+  UTL_HTTP.SET_TRANSFER_TIMEOUT(15);
+  v_req  := UTL_HTTP.BEGIN_REQUEST('${OLLAMA_BASE_URL}/api/tags', 'GET');
+  v_resp := UTL_HTTP.GET_RESPONSE(v_req);
+  UTL_HTTP.READ_TEXT(v_resp, v_body, 4000);
+  UTL_HTTP.END_RESPONSE(v_resp);
+  DBMS_OUTPUT.PUT_LINE('PASS: HTTP ' || v_resp.status_code || ' from Ollama');
+  DBMS_OUTPUT.PUT_LINE('Models: ' || SUBSTR(v_body, 1, 300));
+EXCEPTION
+  WHEN OTHERS THEN
+    DBMS_OUTPUT.PUT_LINE('FAIL: ' || SQLERRM);
+END;
+/
+EXIT;
+SQLEOF
+)
+    echo "$http_result"
+    if echo "$http_result" | grep -q "PASS:"; then
+        echo "--- Test 1: PASSED ---"
+    else
+        echo "--- Test 1: FAILED --- DB cannot reach Ollama at $OLLAMA_BASE_URL"
+        echo "    Check: ollama is running, OLLAMA_HOST=0.0.0.0, firewall allows 11434"
+        return 1
+    fi
+
+    # Test 2: Generative AI call via DBMS_VECTOR_CHAIN
+    echo ""
+    echo "--- Test 2: DBMS_VECTOR_CHAIN generative AI call (model: $OLLAMA_MODEL) ---"
+    local gen_result
+    gen_result=$(docker exec -i "$CONTAINER_NAME" sqlplus -s "system/$DEFAULT_PASSWORD@localhost:1521/$SERVICE_NAME" << SQLEOF
+SET SERVEROUTPUT ON SIZE UNLIMITED
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF LONG 10000 LINESIZE 200
+SELECT DBMS_VECTOR_CHAIN.UTL_TO_GENERATE_TEXT(
+  'Reply with exactly: OLLAMA_WORKS',
+  JSON('{"provider":"ollama","host":"${OLLAMA_BASE_URL}","model":"${OLLAMA_MODEL}"}')
+) AS response FROM dual;
+EXIT;
+SQLEOF
+)
+    echo "$gen_result"
+    if [ -n "$gen_result" ] && ! echo "$gen_result" | grep -qi "ORA-\|ERROR\|SP2-"; then
+        echo "--- Test 2: PASSED --- Generative AI is working end-to-end"
+    else
+        echo "--- Test 2: FAILED --- DBMS_VECTOR_CHAIN call did not succeed"
+        echo "    Ensure model '$OLLAMA_MODEL' is pulled: ollama pull $OLLAMA_MODEL"
+        return 1
+    fi
+
+    echo ""
+    echo "=== Ollama validation complete — all tests PASSED ==="
+}
 
 ####### main code #######
 WALLET_DIR=""
@@ -433,7 +590,9 @@ fi
 
 # sg disconnects stdin from the TTY. Reconnect so interactive prompts (e.g. cleanup read)
 # work correctly in the re-exec'd process. Suppress error if no controlling TTY (non-interactive).
-[ ! -t 0 ] && exec < /dev/tty 2>/dev/null || true
+if [ ! -t 0 ] && [ -e /dev/tty ]; then
+    exec < /dev/tty 2>/dev/null || true
+fi
 
 # Read configuration
 read_config
@@ -456,60 +615,69 @@ fi
 preflight_check
 
 # --- Phase 1: Start Oracle Database ---
-check_existing_container
 create_db_data_dir
 generate_env_file
 
-# Pull images from Oracle Container Registry.
-# The database/free and database/ords images are publicly accessible — no login required.
-# If already cached locally the pull will just confirm the digest; if the registry is
-# unreachable the cached image is used and the script continues.
-echo "Pulling Docker images (DB + ORDS) — login not required for Oracle free-tier images..."
-docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" pull || {
-    echo "Warning: image pull failed (registry unreachable or auth required)."
-    echo "Checking for locally cached images..."
-    if ! docker image inspect "$DOCKER_IMAGE" &>/dev/null || \
-       ! docker image inspect container-registry.oracle.com/database/ords:latest &>/dev/null; then
-        echo "ERROR: Required images not cached locally. Ensure you can reach container-registry.oracle.com"
-        echo "       or run: docker login container-registry.oracle.com"
-        exit 1
-    fi
-    echo "Using locally cached images."
-}
+DB_ALREADY_RUNNING=false
+if check_container_state "$CONTAINER_NAME"; then
+    echo "Container $CONTAINER_NAME is already running — reusing."
+    DB_ALREADY_RUNNING=true
+else
+    # Pull images from Oracle Container Registry.
+    # The database/free and database/ords images are publicly accessible — no login required.
+    echo "Pulling Docker images (DB + ORDS) — login not required for Oracle free-tier images..."
+    docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" pull || {
+        echo "Warning: image pull failed (registry unreachable or auth required)."
+        echo "Checking for locally cached images..."
+        if ! docker image inspect "$DOCKER_IMAGE" &>/dev/null || \
+           ! docker image inspect container-registry.oracle.com/database/ords:latest &>/dev/null; then
+            echo "ERROR: Required images not cached locally. Ensure you can reach container-registry.oracle.com"
+            echo "       or run: docker login container-registry.oracle.com"
+            exit 1
+        fi
+        echo "Using locally cached images."
+    }
 
-echo "Starting Oracle Database container..."
-docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" up -d oracle-db
-wait_for_container_healthy 1800
+    echo "Starting Oracle Database container..."
+    docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" up -d oracle-db
+    wait_for_container_healthy 1800
+fi
+
 get_model
 
-sleep 30
+if [ "$DB_ALREADY_RUNNING" = "false" ]; then
+    sleep 30
+fi
 
 configure_sql_access
 export TNS_ADMIN="$WALLET_DIR"
 echo "TNS_ADMIN is $TNS_ADMIN"
 
 # Discover DATA_PUMP_DIR path inside the container via SQL
-DATA_PUMP_DIR=$(docker exec $CONTAINER_NAME bash -c \
+DATA_PUMP_DIR=$(docker exec "$CONTAINER_NAME" bash -c \
     "echo \"SELECT directory_path FROM dba_directories WHERE directory_name='DATA_PUMP_DIR';\" | \
      sqlplus -s sys/$DEFAULT_PASSWORD@localhost:1521/$SERVICE_NAME as sysdba 2>/dev/null" \
-    | grep -E '^/' | head -1 | tr -d '[:space:]')
+    | grep -E '^/' | head -1 | tr -d '[:space:]') || true
 if [ -z "$DATA_PUMP_DIR" ]; then
     # fallback to known default path in database/free container
     DATA_PUMP_DIR="/opt/oracle/admin/FREE/dpdump"
     echo "Warning: could not query DATA_PUMP_DIR, using default: $DATA_PUMP_DIR"
 fi
 echo "DATA_PUMP_DIR is $DATA_PUMP_DIR"
-docker exec $CONTAINER_NAME ls -l $DATA_PUMP_DIR
+docker exec "$CONTAINER_NAME" ls -l "$DATA_PUMP_DIR"
 echo "===="
 
 # Copy ONNX model into the container
 docker cp "$MODEL_PATH" "$CONTAINER_NAME:/tmp/model.onnx"
-docker exec $CONTAINER_NAME cp "/tmp/model.onnx" "$DATA_PUMP_DIR/model.onnx"
+docker exec "$CONTAINER_NAME" cp "/tmp/model.onnx" "$DATA_PUMP_DIR/model.onnx"
+
+# Enable extended VARCHAR2 (32767) support — must run before any DDL that uses it
+enable_extended_string_size
 
 # Generate SQL files from templates
 generate_sql_files
 
-# Run DB setup SQL (APEX_USER + ONNX model load)
+# Run DB setup SQL (APEX_USER + ONNX model load) — idempotent, safe to re-run
 run_sql_file "$RUN_DIR/sql-scripts/create-users.sql" system
 run_sql_file "$RUN_DIR/sql-scripts/vector-setup.sql" system
 
@@ -522,18 +690,28 @@ if [ ! -d "$APEX_DIR" ] || [ -z "$(ls -A "$APEX_DIR" 2>/dev/null)" ]; then
 fi
 
 # Ensure ords_config directory exists (ORDS writes its config here on first run).
-# Do NOT pre-seed pool.xml — ORDS 25.x will fail to install if pool.xml exists
-# but has no wallet/credentials. pool.xml is patched automatically after APEX
-# install completes if ORDS returns HTTP 571 (see patch_ords_pool_config).
 mkdir -p "$RUN_DIR/ords_config" && chmod 777 "$RUN_DIR/ords_config"
 
-echo "Starting ORDS container (installs APEX on first run — allow 30-60 minutes)..."
-docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" up -d ords
+ORDS_ALREADY_RUNNING=false
+if check_container_state "ords"; then
+    echo "Container ords is already running — reusing."
+    ORDS_ALREADY_RUNNING=true
+else
+    echo "Starting ORDS container (installs APEX on first run — allow 30-60 minutes)..."
+    docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" up -d ords
+fi
 wait_for_ords 3600
 
 # Re-run user setup now that APEX is installed — creates APEX workspace for TRACKER1
 echo "Configuring APEX workspace for TRACKER1..."
 run_sql_file "$RUN_DIR/sql-scripts/create-users.sql" system
+
+# --- Phase 3: Configure Ollama generative AI service ---
+echo "Configuring network ACL and Ollama generative AI service..."
+run_sql_file "$RUN_DIR/sql-scripts/setup-ollama-ai.sql" system
+
+# Validate the full chain: DB → Docker network → host → Ollama → LLM response
+validate_ollama_from_db || true  # don't fail the whole setup if Ollama isn't running
 
 echo ""
 echo "=== Setup complete ==="
@@ -544,3 +722,5 @@ echo "4. APEX:       http://localhost:$APEX_PORT/ords/apex  (Workspace/User: $AP
 echo "5. EM Express: https://localhost:5500/em"
 echo "6. SQLplus:    $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus system/$DEFAULT_PASSWORD@$SERVICE_NAME"
 echo "7. SSH tunnel: ssh -L $APEX_PORT:localhost:$APEX_PORT -L 5500:localhost:5500 -N ubuntu@<server-ip>"
+echo "8. Ollama:     $OLLAMA_BASE_URL (model: $OLLAMA_MODEL)"
+echo "   Test SQL:   SELECT DBMS_VECTOR_CHAIN.UTL_TO_GENERATE_TEXT('Hello', JSON('{\"provider\":\"ollama\",\"host\":\"$OLLAMA_BASE_URL\",\"model\":\"$OLLAMA_MODEL\"}')) FROM dual;"

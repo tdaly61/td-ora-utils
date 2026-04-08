@@ -13,6 +13,7 @@
 #   --skip-models   Install tools only, do not pull any models
 #   --models-only   Skip tool install, only pull models (Ollama must be running)
 #   --check         Show what would be installed / pulled and exit
+#   --cleanup       Remove Ollama, models, Claude Code, OpenCode, uv
 #   --help          Show this help message
 #
 # Models pulled by default:
@@ -50,12 +51,14 @@ die() { error "$*"; exit 1; }
 SKIP_MODELS=false
 MODELS_ONLY=false
 CHECK_ONLY=false
+DO_CLEANUP=false
 
 for arg in "$@"; do
   case "$arg" in
     --skip-models)  SKIP_MODELS=true ;;
     --models-only)  MODELS_ONLY=true ;;
     --check)        CHECK_ONLY=true  ;;
+    --cleanup)      DO_CLEANUP=true  ;;
     --help|-h)
       sed -n '3,30p' "$0" | sed 's/^# \?//'
       exit 0
@@ -69,6 +72,77 @@ done
 # ------------------------------------------------------------------------------
 if [[ "$MODELS_ONLY" == "false" && "$CHECK_ONLY" == "false" ]]; then
   [[ $EUID -eq 0 ]] || die "Run with sudo for tool installation: sudo $0 $*"
+fi
+
+# ------------------------------------------------------------------------------
+# Cleanup — remove everything this script installs
+# ------------------------------------------------------------------------------
+if [[ "$DO_CLEANUP" == "true" ]]; then
+  [[ $EUID -eq 0 ]] || die "Run with sudo for cleanup: sudo $0 --cleanup"
+  header "Cleaning up AI tools"
+
+  # Remove Ollama models first (while service is still running)
+  if command -v ollama &>/dev/null; then
+    info "Removing all Ollama models..."
+    for model in $(ollama list 2>/dev/null | tail -n +2 | awk '{print $1}'); do
+      info "  Removing model: $model"
+      ollama rm "$model" 2>/dev/null || true
+    done
+  fi
+
+  # Stop and remove Ollama
+  if systemctl is-active --quiet ollama 2>/dev/null; then
+    info "Stopping Ollama service..."
+    systemctl stop ollama
+    systemctl disable ollama 2>/dev/null || true
+  fi
+  if [[ -f /etc/systemd/system/ollama.service.d/override.conf ]]; then
+    info "Removing Ollama systemd override..."
+    rm -f /etc/systemd/system/ollama.service.d/override.conf
+    rmdir /etc/systemd/system/ollama.service.d 2>/dev/null || true
+    systemctl daemon-reload
+  fi
+  if command -v ollama &>/dev/null; then
+    info "Removing Ollama binary and data..."
+    rm -f /usr/local/bin/ollama
+    rm -rf /usr/share/ollama 2>/dev/null || true
+    rm -rf /var/lib/ollama 2>/dev/null || true
+    rm -rf "${HOME}/.ollama" 2>/dev/null || true
+    # Also clean up for the sudo-invoking user
+    if [[ -n "${SUDO_USER:-}" ]]; then
+      local_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+      rm -rf "${local_home}/.ollama" 2>/dev/null || true
+    fi
+    userdel ollama 2>/dev/null || true
+    groupdel ollama 2>/dev/null || true
+  fi
+
+  # Remove Claude Code
+  if command -v claude &>/dev/null; then
+    info "Removing Claude Code..."
+    npm uninstall -g @anthropic-ai/claude-code 2>/dev/null || true
+  fi
+
+  # Remove OpenCode
+  if [[ -f /usr/local/bin/opencode ]]; then
+    info "Removing OpenCode..."
+    rm -f /usr/local/bin/opencode
+  fi
+
+  # Remove uv
+  if command -v uv &>/dev/null; then
+    info "Removing uv..."
+    rm -f "$(command -v uv)" 2>/dev/null || true
+    rm -rf "${HOME}/.cargo/bin/uv" 2>/dev/null || true
+    if [[ -n "${SUDO_USER:-}" ]]; then
+      local_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+      rm -f "${local_home}/.cargo/bin/uv" 2>/dev/null || true
+    fi
+  fi
+
+  success "Cleanup complete. Removed: Ollama (+ all models), Claude Code, OpenCode, uv."
+  info "Node.js was NOT removed (may be used by other tools)."
+  exit 0
 fi
 
 # ------------------------------------------------------------------------------

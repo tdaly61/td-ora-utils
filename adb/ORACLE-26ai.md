@@ -11,6 +11,7 @@ This guide covers how to set up and run Oracle Database Free (version 23.26.x, a
 - [Prerequisites](#prerequisites)
 - [One-Time Oracle Registry Setup](#one-time-oracle-registry-setup)
 - [Configuration](#configuration)
+- [Step 0 — Install Ollama](#step-0--install-ollama)
 - [Step 1 — OS and Docker Setup](#step-1--os-and-docker-setup)
 - [Step 2 — Run the Database Container](#step-2--run-the-database-container)
 - [Accessing the Database](#accessing-the-database)
@@ -31,6 +32,7 @@ This guide covers how to set up and run Oracle Database Free (version 23.26.x, a
 | **sudo** | Required — run setup script as root/sudo |
 | **Internet** | Required to pull the container image and Oracle Instant Client |
 | **Oracle account** | Free account at [container-registry.oracle.com](https://container-registry.oracle.com) |
+| **Ollama** | Running on host with `OLLAMA_HOST=0.0.0.0`. Install via `sudo ../nvidia/ai-tools-setup.sh` |
 
 ---
 
@@ -75,6 +77,23 @@ DOCKER_IMAGE=container-registry.oracle.com/database/free:23.26.1.0-amd64
 
 # ARM64 (Apple Silicon, Ampere, etc.)
 DOCKER_IMAGE=container-registry.oracle.com/database/free:23.26.1.0-arm64
+```
+
+---
+
+## Step 0 — Install Ollama
+
+Ollama must be running on the host before `run-adb-26ai.sh` can configure generative AI. The simplest way:
+
+```bash
+sudo ../nvidia/ai-tools-setup.sh     # installs Ollama, sets OLLAMA_HOST=0.0.0.0
+ollama pull llama3                    # pull the default model (or change OLLAMA_MODEL in config.ini)
+```
+
+Verify it's listening on all interfaces:
+```bash
+ss -tlnp | grep 11434
+# Should show *:11434 or 0.0.0.0:11434
 ```
 
 ---
@@ -334,9 +353,11 @@ Stop whatever process is listed, then retry.
 |---|---|
 | `config.ini` | All configurable settings — edit this before running |
 | `setup-for-adb-26ai.sh` | One-time host setup (Docker, Instant Client, registry login) |
-| `run-adb-26ai.sh` | Start the container, configure TNS, load model, run SQL setup |
-| `sql-scripts/create-users.sql` | Creates `TRACKER1` user with developer and vector grants |
+| `run-adb-26ai.sh` | Start the container, configure TNS, load model, run SQL setup, configure Ollama AI |
+| `sql-scripts/create-users.sql.tpl` | Template for user + APEX workspace SQL |
 | `sql-scripts/vector-setup.sql` | Loads ONNX model into Oracle as `ALL_MINILM` |
+| `sql-scripts/setup-ollama-ai.sql.tpl` | Template for network ACL + Ollama generative AI setup |
+| `../nvidia/ai-tools-setup.sh` | Installs Ollama + AI tools (run before database setup) |
 
 ---
 

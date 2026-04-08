@@ -6,6 +6,8 @@ services:
     image: ${DOCKER_IMAGE:-container-registry.oracle.com/database/free:latest}
     container_name: ${CONTAINER_NAME:-oracle-db}
     hostname: ${DB_HOSTNAME:-fu8.local}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - ORACLE_PWD=${ORACLE_PWD}
       - ORACLE_CHARACTERSET=AL32UTF8

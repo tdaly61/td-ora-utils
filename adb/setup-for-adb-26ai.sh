@@ -1,34 +1,57 @@
 #!/usr/bin/env bash
-
+set -euo pipefail
 
 cleanup() {
-    echo "Cleaning up Docker and related configurations..."
+    echo "Cleaning up Oracle ADB setup artifacts..."
 
-    # Remove Docker containers, images, volumes, and networks
-    docker system prune -a -f --volumes
+    # Stop and remove only the Oracle containers (not all Docker)
+    echo "Stopping Oracle containers..."
+    docker stop oracle-db ords 2>/dev/null || true
+    docker rm oracle-db ords 2>/dev/null || true
 
-    # Remove Docker package
-    sudo apt-get purge -y docker.io
-    sudo apt-get autoremove -y --purge docker.io
+    # Remove Oracle images only
+    echo "Removing Oracle container images..."
+    docker rmi container-registry.oracle.com/database/free:latest 2>/dev/null || true
+    docker rmi container-registry.oracle.com/database/ords:latest 2>/dev/null || true
 
-    # Remove Docker data
-    umount /var/lib/docker > /dev/null 2>&1
-    rm -rf /var/lib/docker
-
-    # Remove containerd socket file
-    rm -f /run/containerd/containerd.sock
-
-    # Remove Docker group
-    if getent group docker > /dev/null; then
-        sudo groupdel docker
+    # Remove Oracle Instant Client
+    local home_dir="${SUDO_USER_HOME_DIR:-${HOME}}"
+    if [[ -d "${home_dir}/oraclient" ]]; then
+        echo "Removing Oracle Instant Client from ${home_dir}/oraclient..."
+        rm -rf "${home_dir}/oraclient"
     fi
 
-    # Remove Docker user
-    if id -u docker > /dev/null 2>&1; then
-        sudo userdel -r docker
+    # Remove APEX download and extracted files
+    rm -f "${home_dir}/apex-latest.zip" 2>/dev/null || true
+    if [[ -d "${home_dir}/apex" ]]; then
+        echo "Removing APEX directory ${home_dir}/apex..."
+        rm -rf "${home_dir}/apex"
     fi
 
-    echo "Docker and related configurations have been removed."
+    # Remove ORDS config and generated files
+    if [[ -d "$RUN_DIR/ords_config" ]]; then
+        echo "Removing ORDS config..."
+        rm -rf "$RUN_DIR/ords_config"
+    fi
+    rm -f "$RUN_DIR/.env" 2>/dev/null || true
+    rm -f "$RUN_DIR/sql-scripts/create-users.sql" 2>/dev/null || true
+    rm -f "$RUN_DIR/sql-scripts/setup-ollama-ai.sql" 2>/dev/null || true
+
+    # Remove TNS and auth config
+    rm -rf "${home_dir}/auth" 2>/dev/null || true
+
+    # Clean environment from .bashrc (entries added by install_oracle_instant_client)
+    local bashrc="${home_dir}/.bashrc"
+    if [[ -f "$bashrc" ]]; then
+        echo "Removing Oracle environment variables from $bashrc..."
+        sed -i '/export TNS_ADMIN=/d; /export ORACLE_HOME=.*oraclient/d; /export LD_LIBRARY_PATH=.*oraclient/d; /export PATH=.*oraclient/d' "$bashrc"
+    fi
+
+    echo ""
+    echo "Cleanup complete. Removed: Oracle containers, images, Instant Client, APEX, ORDS config."
+    echo "Docker itself was NOT removed (may be used by other services)."
+    echo "Database data directory ~/db_data_dir was NOT removed. Delete manually if needed:"
+    echo "  rm -rf ${home_dir}/db_data_dir"
     exit 0
 }
 
@@ -46,9 +69,10 @@ ensure_docker_running() {
         fi
     done
 
-    echo "Failed to start Docker after 5 attempts. "
+    echo "Failed to start Docker after 5 attempts."
     echo "Please try sudo systemctl restart docker as this may resolve the issue"
-    echo " and then run this script again."
+    echo "and then run this script again."
+    exit 1
 }
 
 check_docker_installed() {
@@ -83,11 +107,11 @@ set_sudo_user() {
     fi
     echo "OS user is set to $OS_USER."
     
-    if [ -n "$SUDO_UID" ]; then
+    if [ -n "${SUDO_UID:-}" ]; then
         SUDO_USER_NAME=$(getent passwd "$SUDO_UID" | cut -d: -f1)
         echo "The UID of the user who invoked sudo is $SUDO_UID."
         echo "The username of the user who invoked sudo is $SUDO_USER_NAME."
-        SUDO_USER_HOME_DIR=$(eval echo ~$SUDO_USER_NAME)
+        SUDO_USER_HOME_DIR=$(getent passwd "$SUDO_USER_NAME" | cut -d: -f6)
     else
         echo "This script was not invoked using sudo."
     fi
@@ -123,7 +147,7 @@ check_and_install_packages() {
     for package in "$@"; do
         if ! dpkg -l | grep -q "ii  $package"; then
             echo "$package is not installed. Installing $package..."
-            apt install -y $package
+            apt install -y "$package"
         fi
     done
 }
@@ -146,8 +170,8 @@ oracle_os_user_setup() {
 
     # Check and add groups if they do not exist
     for group in "${!group_ids[@]}"; do
-        if ! getent group $group > /dev/null; then
-            groupadd -g ${group_ids[$group]} $group
+        if ! getent group "$group" > /dev/null; then
+            groupadd -g "${group_ids[$group]}" "$group"
         fi
     done
 
@@ -195,7 +219,7 @@ prepare_apex() {
 
     if [ ! -f "$APEX_ZIP" ]; then
         echo "Downloading Oracle APEX (~290MB)..."
-        curl -L -o "$APEX_ZIP" "https://download.oracle.com/otn_software/apex/apex-latest.zip"
+        curl -fL -C - -o "$APEX_ZIP" "https://download.oracle.com/otn_software/apex/apex-latest.zip"
         if [ $? -ne 0 ]; then
             echo "Failed to download APEX. Exiting."
             exit 1
@@ -307,7 +331,7 @@ install_oracle_instant_client() {
     fi
     # Ensure libaio.so.1 symlink exists and points to the correct target
     LIBAIO_LINK="/usr/lib/x86_64-linux-gnu/libaio.so.1"
-    if [ ! -e "$LIBAIO_LINK" ] || [ "$(readlink $LIBAIO_LINK)" != "$LIBAIO_TARGET" ]; then
+    if [ ! -e "$LIBAIO_LINK" ] || [ "$(readlink "$LIBAIO_LINK")" != "$LIBAIO_TARGET" ]; then
         echo "Creating/fixing libaio.so.1 symlink -> $LIBAIO_TARGET"
         ln -sf "$LIBAIO_TARGET" "$LIBAIO_LINK"
     fi
@@ -347,7 +371,7 @@ create_docker_volume() {
     echo "Creating Docker volume $VOL_NAME..."
     if docker volume inspect "$VOL_NAME" >/dev/null 2>&1; then
         echo "Warning: Volume '$VOL_NAME' already exists."
-        read -p "Do you want to use the existing volume? (y/n): " choice
+        read -t 30 -p "Do you want to use the existing volume? (y/n): " choice || choice="y"
         case "$choice" in 
             y|Y ) 
                 echo "Using existing volume '$VOL_NAME'."
@@ -363,7 +387,7 @@ create_docker_volume() {
         esac
     else
         # create a local volume
-        docker volume create $VOL_NAME
+        docker volume create "$VOL_NAME"
         change_volume_ownership
     fi
 }
@@ -456,13 +480,12 @@ ORACLE_CLIENT_DIR=""
 INSTANT_CLIENT=""
 
 ############# don't change these ############
-RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )" # the directory that this script is in 
+RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )" # the directory that this script is in
 
-# Read configuration
-read_config
-
+# Resolve the invoking user early (needed by cleanup)
 set_sudo_user
-# Parse arguments
+
+# Parse arguments before read_config so cleanup doesn't need a valid config
 while getopts "hc" opt; do
     case ${opt} in
         h )
@@ -476,6 +499,9 @@ while getopts "hc" opt; do
             ;;
     esac
 done
+
+# Read configuration (only reached if not cleanup/help)
+read_config
 
 # Call the functions to perform the checks
 check_root_user
