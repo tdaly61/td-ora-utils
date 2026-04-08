@@ -297,6 +297,20 @@ run_sql_file() {
     echo "SQL file $sql_file executed successfully."
 }
 
+# Grant SYS-owned packages to a user. These grants require SYS privileges
+# and must run inside the DB container (SYSTEM cannot grant SYS objects).
+grant_sys_packages() {
+    local grantee="$1"
+    echo "Granting SYS-owned packages to $grantee (via SYS inside container)..."
+    docker exec -i "$CONTAINER_NAME" sqlplus -s "/ as sysdba" <<SQLEOF
+ALTER SESSION SET CONTAINER=FREEPDB1;
+GRANT EXECUTE ON SYS.UTL_HTTP TO $grantee;
+GRANT EXECUTE ON CTXSYS.DBMS_VECTOR_CHAIN TO $grantee;
+EXIT;
+SQLEOF
+    echo "SYS package grants complete for $grantee."
+}
+
 # Function to read configuration from config.ini
 read_config() {
     CONFIG_FILE="$RUN_DIR/config.ini"
@@ -498,6 +512,47 @@ generate_sql_files() {
     fi
 }
 
+
+# Ensure the host firewall allows the DB container's Docker network to reach
+# Ollama on port 11434. On Linux the default iptables INPUT chain often ends
+# with a blanket REJECT rule that blocks container→host traffic.
+# This adds an ACCEPT rule (idempotent) for the container's subnet.
+ensure_ollama_firewall_rule() {
+    if ! command -v iptables &>/dev/null; then
+        echo "iptables not found — skipping firewall rule (may not be needed)."
+        return 0
+    fi
+
+    local container_ip
+    container_ip=$(docker inspect "$CONTAINER_NAME" \
+        --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
+    if [ -z "$container_ip" ]; then
+        echo "Warning: could not determine container IP — skipping firewall rule."
+        return 0
+    fi
+
+    # Derive /16 subnet from container IP (e.g. 172.18.0.2 → 172.18.0.0/16)
+    local subnet
+    subnet=$(echo "$container_ip" | awk -F. '{print $1"."$2".0.0/16"}')
+
+    # Check if a matching rule already exists
+    if sudo iptables -C INPUT -s "$subnet" -p tcp --dport 11434 -j ACCEPT 2>/dev/null; then
+        echo "Firewall rule already exists for $subnet → port 11434."
+        return 0
+    fi
+
+    echo "Adding iptables rule: allow $subnet → port 11434 (Ollama)..."
+    # Insert before the trailing REJECT rule (position 5 is typical for OCI/cloud images)
+    local reject_line
+    reject_line=$(sudo iptables -L INPUT --line-numbers -n 2>/dev/null \
+        | grep -i 'reject' | tail -1 | awk '{print $1}')
+    if [ -n "$reject_line" ]; then
+        sudo iptables -I INPUT "$reject_line" -s "$subnet" -p tcp --dport 11434 -j ACCEPT
+    else
+        sudo iptables -A INPUT -s "$subnet" -p tcp --dport 11434 -j ACCEPT
+    fi
+    echo "Firewall rule added. (Note: not persistent across reboots — use iptables-persistent to save.)"
+}
 
 # Validate that the DB can reach Ollama and generate text end-to-end.
 # Runs a real DBMS_VECTOR_CHAIN call via docker exec sqlplus inside the container.
@@ -707,6 +762,8 @@ echo "Configuring APEX workspace for TRACKER1..."
 run_sql_file "$RUN_DIR/sql-scripts/create-users.sql" system
 
 # --- Phase 3: Configure Ollama generative AI service ---
+ensure_ollama_firewall_rule
+grant_sys_packages "$APEX_USER"
 echo "Configuring network ACL and Ollama generative AI service..."
 run_sql_file "$RUN_DIR/sql-scripts/setup-ollama-ai.sql" system
 

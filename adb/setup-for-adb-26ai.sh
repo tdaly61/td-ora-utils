@@ -470,6 +470,39 @@ preflight_check() {
     fi
 }
 
+# Function to install Python packages needed by caseweave / weave32 utility scripts.
+# Includes: Oracle DB driver, image processing, face recognition, and their build deps.
+# LLM inference uses local Ollama via HTTP — no extra Python packages required.
+install_python_deps() {
+    echo "Installing Python build dependencies for caseweave utils..."
+
+    # System packages needed to compile dlib (required by face_recognition)
+    local BUILD_PKGS=(cmake libopenblas-dev liblapack-dev python3-dev)
+    for pkg in "${BUILD_PKGS[@]}"; do
+        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+            echo "  Installing $pkg..."
+            apt-get install -y "$pkg"
+        fi
+    done
+
+    # Determine pip flags — PEP 668 externally-managed envs (Ubuntu 24+)
+    local PIP_FLAGS=""
+    if "$PYTHON_BIN" -c "import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)" 2>/dev/null; then
+        PIP_FLAGS="--break-system-packages"
+    fi
+
+    echo "Installing Python packages (as $SUDO_USER_NAME)..."
+    su - "$SUDO_USER_NAME" -c "$PYTHON_BIN -m pip install $PIP_FLAGS \
+        oracledb \
+        Pillow \
+        geopy \
+        numpy \
+        opencv-python-headless \
+        face_recognition"
+
+    echo "Python dependencies installed."
+}
+
 ####### main code #######
 SUDO_USER_NAME=""
 SUDO_USER_HOME_DIR=""
@@ -478,6 +511,7 @@ TNS_ADMIN=""
 ORACLE_HOME=""
 ORACLE_CLIENT_DIR=""
 INSTANT_CLIENT=""
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 ############# don't change these ############
 RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )" # the directory that this script is in
@@ -518,6 +552,7 @@ oracle_registry_login
 check_docker_compose
 prepare_apex
 create_ords_config_dir
+install_python_deps
 
 # Fix ownership of any files in RUN_DIR that were created as root during this or
 # prior sudo runs, so the invoking user can write them without sudo going forward.

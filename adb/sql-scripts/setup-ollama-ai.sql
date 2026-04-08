@@ -6,14 +6,14 @@
 -- run-adb-26ai.sh (see run_sql_file_as_sysdba).
 --
 -- Substitution tokens (replaced by generate_sql_files in run-adb-26ai.sh):
---   __APEX_USER__      — the application schema (e.g. TRACKER1)
---   __OLLAMA_BASE_URL__— Ollama endpoint from inside Docker (e.g. http://host.docker.internal:11434)
---   __OLLAMA_MODEL__   — Ollama model name (e.g. llama3)
+--   TRACKER1      — the application schema (e.g. TRACKER1)
+--   http://host.docker.internal:11434— Ollama endpoint from inside Docker (e.g. http://host.docker.internal:11434)
+--   llama3   — Ollama model name (e.g. llama3)
 
 SET SERVEROUTPUT ON;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 1. Network ACL — allow the APEX schema owner and __APEX_USER__ to connect out
+-- 1. Network ACL — allow the APEX schema owner and TRACKER1 to connect out
 -- ─────────────────────────────────────────────────────────────────────────────
 DECLARE
   v_apex_installed NUMBER;
@@ -43,9 +43,9 @@ BEGIN
     host => '*',
     ace  => xs$ace_type(
               privilege_list => xs$name_list('connect', 'resolve'),
-              principal_name => '__APEX_USER__',
+              principal_name => 'TRACKER1',
               principal_type => xs_acl.ptype_db));
-  DBMS_OUTPUT.PUT_LINE('Network ACL granted to __APEX_USER__.');
+  DBMS_OUTPUT.PUT_LINE('Network ACL granted to TRACKER1.');
 END;
 /
 
@@ -62,14 +62,14 @@ END;
 /
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 2. Grant UTL_HTTP and DBMS_VECTOR_CHAIN to __APEX_USER__
+-- 2. Grant UTL_HTTP and DBMS_VECTOR_CHAIN to TRACKER1
 --    These are SYS-owned packages so we need to grant via SYS.
 --    SYSTEM can grant them using EXECUTE IMMEDIATE from the SYS context
 --    available through the DBA role granted to SYSTEM in Oracle Free.
 -- ─────────────────────────────────────────────────────────────────────────────
 BEGIN
-  EXECUTE IMMEDIATE 'GRANT EXECUTE ON SYS.UTL_HTTP TO __APEX_USER__';
-  DBMS_OUTPUT.PUT_LINE('GRANT EXECUTE ON UTL_HTTP to __APEX_USER__ succeeded.');
+  EXECUTE IMMEDIATE 'GRANT EXECUTE ON SYS.UTL_HTTP TO TRACKER1';
+  DBMS_OUTPUT.PUT_LINE('GRANT EXECUTE ON UTL_HTTP to TRACKER1 succeeded.');
 EXCEPTION
   WHEN OTHERS THEN
     DBMS_OUTPUT.PUT_LINE('UTL_HTTP grant note: ' || SQLERRM);
@@ -78,8 +78,8 @@ END;
 /
 
 BEGIN
-  EXECUTE IMMEDIATE 'GRANT EXECUTE ON CTXSYS.DBMS_VECTOR_CHAIN TO __APEX_USER__';
-  DBMS_OUTPUT.PUT_LINE('GRANT EXECUTE ON DBMS_VECTOR_CHAIN to __APEX_USER__ succeeded.');
+  EXECUTE IMMEDIATE 'GRANT EXECUTE ON CTXSYS.DBMS_VECTOR_CHAIN TO TRACKER1';
+  DBMS_OUTPUT.PUT_LINE('GRANT EXECUTE ON DBMS_VECTOR_CHAIN to TRACKER1 succeeded.');
 EXCEPTION
   WHEN OTHERS THEN
     DBMS_OUTPUT.PUT_LINE('DBMS_VECTOR_CHAIN grant note: ' || SQLERRM);
@@ -111,7 +111,7 @@ END;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 4. Connectivity test — skipped when running from host sqlplus because
---    __OLLAMA_BASE_URL__ (host.docker.internal) only resolves inside Docker.
+--    http://host.docker.internal:11434 (host.docker.internal) only resolves inside Docker.
 --    The validate_ollama_from_db() function in run-adb-26ai.sh performs the
 --    definitive test from inside the DB container.
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -119,7 +119,7 @@ PROMPT Note: Ollama connectivity is validated from inside the DB container by ru
 PROMPT       Skipping UTL_HTTP test here (host.docker.internal does not resolve on the host).
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 5. Register Ollama as an APEX Generative AI Service for the __APEX_USER__
+-- 5. Register Ollama as an APEX Generative AI Service for the TRACKER1
 --    workspace so it appears under Workspace Utilities > Generative AI.
 --    Uses the OpenAI-compatible endpoint (/v1) that Ollama exposes.
 --    Also creates an APEX workspace credential (HTTP_HEADER type with a
@@ -130,14 +130,14 @@ DECLARE
   v_srv_id     NUMBER;
   v_cred_id    NUMBER;
   v_apex_owner VARCHAR2(128);
-  v_static_id  VARCHAR2(100) := 'OLLAMA___OLLAMA_MODEL__';
-  v_cred_sid   VARCHAR2(100) := 'OLLAMA___OLLAMA_MODEL___CRED';
+  v_static_id  VARCHAR2(100) := 'OLLAMA_llama3';
+  v_cred_sid   VARCHAR2(100) := 'OLLAMA_llama3_CRED';
   v_sql        VARCHAR2(4000);
 BEGIN
-  -- Look up the workspace ID for __APEX_USER__
+  -- Look up the workspace ID for TRACKER1
   SELECT workspace_id INTO v_ws_id
     FROM apex_workspaces
-   WHERE workspace = '__APEX_USER__';
+   WHERE workspace = 'TRACKER1';
 
   -- Discover the current APEX schema owner (e.g. APEX_240200) so this
   -- script survives APEX upgrades without hard-coding the version.
@@ -170,7 +170,7 @@ BEGIN
             || '  ''Y'','
             || '  USER, SYSDATE, USER, SYSDATE)';
       EXECUTE IMMEDIATE v_sql USING v_cred_id, v_ws_id,
-        'Ollama __OLLAMA_MODEL__ Credential', v_cred_sid;
+        'Ollama llama3 Credential', v_cred_sid;
       DBMS_OUTPUT.PUT_LINE('APEX credential created: ' || v_cred_sid);
   END;
 
@@ -185,7 +185,7 @@ BEGIN
           || '     credential_id = :cid,'
           || '     last_updated_on = SYSDATE, last_updated_by = USER'
           || ' WHERE id = :id';
-    EXECUTE IMMEDIATE v_sql USING '__OLLAMA_BASE_URL__/v1', '__OLLAMA_MODEL__', v_cred_id, v_srv_id;
+    EXECUTE IMMEDIATE v_sql USING 'http://host.docker.internal:11434/v1', 'llama3', v_cred_id, v_srv_id;
   EXCEPTION
     WHEN NO_DATA_FOUND THEN
       v_sql := 'SELECT ' || v_apex_owner || '.wwv_seq.nextval FROM dual';
@@ -200,22 +200,22 @@ BEGIN
             || '  :mdl, :cid, ''Y'','
             || '  USER, SYSDATE, USER, SYSDATE)';
       EXECUTE IMMEDIATE v_sql USING v_srv_id, v_ws_id,
-        'Ollama __OLLAMA_MODEL__', v_static_id,
-        '__OLLAMA_BASE_URL__/v1', '__OLLAMA_MODEL__', v_cred_id;
-      DBMS_OUTPUT.PUT_LINE('APEX AI service created: ' || v_static_id || ' -> __OLLAMA_BASE_URL__/v1 (model: __OLLAMA_MODEL__)');
+        'Ollama llama3', v_static_id,
+        'http://host.docker.internal:11434/v1', 'llama3', v_cred_id;
+      DBMS_OUTPUT.PUT_LINE('APEX AI service created: ' || v_static_id || ' -> http://host.docker.internal:11434/v1 (model: llama3)');
   END;
   COMMIT;
 END;
 /
 
 PROMPT Ollama AI service setup complete.
-PROMPT Ollama endpoint: __OLLAMA_BASE_URL__
-PROMPT Ollama model:    __OLLAMA_MODEL__
+PROMPT Ollama endpoint: http://host.docker.internal:11434
+PROMPT Ollama model:    llama3
 PROMPT
 PROMPT Test from SQL:
 PROMPT   SELECT DBMS_VECTOR_CHAIN.UTL_TO_GENERATE_TEXT(
 PROMPT     'Hello, tell me a joke',
-PROMPT     JSON('{"provider":"ollama","host":"__OLLAMA_BASE_URL__","model":"__OLLAMA_MODEL__"}')
+PROMPT     JSON('{"provider":"ollama","host":"http://host.docker.internal:11434","model":"llama3"}')
 PROMPT   ) FROM dual;
 
 select sysdate from dual;
