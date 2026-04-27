@@ -1,8 +1,76 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Function to clean up Docker resources
-# Respects $REMOVE_IMAGES — set via -r flag (default: false)
+# ─────────────────────────────────────────────────────────────────
+# Platform detection — runs first; everything else dispatches on PLATFORM/ARCH
+# ─────────────────────────────────────────────────────────────────
+detect_platform() {
+    case "$(uname -s)" in
+        Linux*)  PLATFORM=linux ;;
+        Darwin*) PLATFORM=darwin ;;
+        *) echo "Unsupported platform: $(uname -s). Exiting."; exit 1 ;;
+    esac
+    ARCH=$(uname -m)   # x86_64 | arm64 | aarch64
+}
+
+# Read a single KEY=VALUE entry from CONFIG_FILE by exact key name.
+# Handles values containing '=' (e.g. URLs). Strips surrounding whitespace.
+ini_val() {
+    local key="$1"
+    grep -m1 "^${key}=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d ' \n\r'
+}
+
+# ─────────────────────────────────────────────────────────────────
+# Mac Docker environment fix — call once before any docker commands.
+# Handles two common Mac multi-runtime issues:
+#   1. Active context points to a missing socket (e.g. OrbStack uninstalled)
+#      → finds the first context whose socket exists and switches to it.
+#   2. Docker CLI is newer than the server (API version too new)
+#      → reads the max supported version from the error and exports
+#        DOCKER_API_VERSION so all subsequent docker calls use it.
+# ─────────────────────────────────────────────────────────────────
+_resolve_docker_mac() {
+    local err
+    err=$(docker info 2>&1)
+
+    # Fix 1: socket missing for the active context → find a working one
+    if echo "$err" | grep -qE "no such file or directory|cannot connect|connection refused"; then
+        local ctx
+        for ctx in desktop-linux default orbstack; do
+            if docker context use "$ctx" &>/dev/null 2>&1; then
+                err=$(docker info 2>&1)
+                if ! echo "$err" | grep -qE "no such file or directory|cannot connect|connection refused"; then
+                    echo "Switched Docker context to '$ctx' (previous context socket was missing)."
+                    break
+                fi
+            fi
+        done
+    fi
+
+    # Fix 2: CLI API version too new for the server → pin DOCKER_API_VERSION
+    if echo "$err" | grep -q "client version.*too new"; then
+        local max_ver
+        max_ver=$(echo "$err" | grep -oE "Maximum supported API version is [0-9.]+" | grep -oE "[0-9.]+$")
+        if [ -n "$max_ver" ]; then
+            echo "Docker CLI/server API version mismatch — pinning DOCKER_API_VERSION=$max_ver"
+            export DOCKER_API_VERSION="$max_ver"
+        fi
+    fi
+}
+
+# Available disk space in KB for a given path (cross-platform)
+avail_kb_for_dir() {
+    local dir="$1"
+    if [ "$PLATFORM" = "darwin" ]; then
+        df -k "$dir" 2>/dev/null | awk 'NR==2 {print $4}'
+    else
+        df "$dir" --output=avail 2>/dev/null | tail -1
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────
+# Cleanup
+# ─────────────────────────────────────────────────────────────────
 cleanup() {
     generate_env_file
 
@@ -46,17 +114,13 @@ cleanup() {
     exit 0
 }
 
-
-# Check if a container exists and is healthy/running. Returns:
-#   0 — container is running and healthy (reuse it)
-#   1 — container does not exist (create it)
-#   2 — container exists but is stopped/unhealthy (remove and recreate)
-check_container_state() {
-    local name="$1"
-    local cid
-    cid=$(docker ps -aq -f "name=^${name}$" 2>/dev/null || true)
-    if [ -z "$cid" ]; then
-        return 1  # does not exist
+# ─────────────────────────────────────────────────────────────────
+# Container helpers
+# ─────────────────────────────────────────────────────────────────
+check_existing_container() {
+    if [ "$(docker ps -aq -f name=^${CONTAINER_NAME}$)" ]; then
+        echo "Container $CONTAINER_NAME already exists. Run ./run-adb-26ai.sh -c to clean up."
+        exit 1
     fi
     local state
     state=$(docker inspect --format='{{.State.Status}}' "$name" 2>/dev/null || echo "unknown")
@@ -69,7 +133,6 @@ check_container_state() {
     return 1  # treat as not existing
 }
 
-# Function to display usage
 usage() {
     echo "Usage: $0 [-c [-r]] | -h"
     echo "Options:"
@@ -87,7 +150,6 @@ create_db_data_dir() {
     fi
 }
 
-# Generate .env file for docker compose from config.ini values
 generate_env_file() {
     cat > "$RUN_DIR/.env" << EOF
 ORACLE_PWD=${DEFAULT_PASSWORD}
@@ -101,7 +163,6 @@ APEX_DIR=${APEX_DIR}
 EOF
 }
 
-# Function to print the elapsed time in a human-readable format
 print_elapsed_time() {
     local SECONDS=$1
     local HOURS=$((SECONDS / 3600))
@@ -110,7 +171,6 @@ print_elapsed_time() {
     printf "%02d:%02d:%02d\n" $HOURS $MINUTES $SECONDS
 }
 
-# Function to wait for the DB container to be healthy
 wait_for_container_healthy() {
     TIMEOUT=$1
     echo "Waiting for [ $TIMEOUT ] secs the container $CONTAINER_NAME to be in a running and healthy state..."
@@ -143,7 +203,8 @@ wait_for_container_healthy() {
     echo "Total time taken: $(print_elapsed_time $TOTAL_TIME)"
 }
 
-# Function to patch ORDS pool.xml after APEX install completes.
+# ─────────────────────────────────────────────────────────────────
+# ORDS pool.xml patch
 #
 # ORDS 25.x behaviour in containers:
 #   - During install it uses DBHOST/ORACLE_PWD env vars to connect as SYS.
@@ -156,23 +217,18 @@ wait_for_container_healthy() {
 # Fix (repeatable):
 #   1. Reset ORDS_PUBLIC_USER password in the DB to DEFAULT_PASSWORD.
 #   2. Write pool.xml with hostname + ORDS_PUBLIC_USER + DEFAULT_PASSWORD.
-#   Both sides now agree on credentials every time.
+# ─────────────────────────────────────────────────────────────────
 patch_ords_pool_config() {
     local POOL_XML="$RUN_DIR/ords_config/databases/default/pool.xml"
 
     echo "Patching ORDS pool.xml (ORDS 25.x does not persist hostname or credentials)..."
 
-    # Step 1: Reset ORDS_PUBLIC_USER password in the DB to DEFAULT_PASSWORD so
-    # it matches what we will put in pool.xml.
     echo "  Resetting ORDS_PUBLIC_USER password in DB..."
     docker exec "$CONTAINER_NAME" bash -c \
         "echo \"ALTER USER ORDS_PUBLIC_USER IDENTIFIED BY \\\"$DEFAULT_PASSWORD\\\";\" | \
          sqlplus -s sys/$DEFAULT_PASSWORD@localhost:1521/$SERVICE_NAME as sysdba" \
         2>/dev/null | grep -v '^$' || echo "  Warning: could not reset ORDS_PUBLIC_USER password."
 
-    # Step 2: Write pool.xml with all required entries.
-    # pool.xml may be owned by oracle (uid 54321) inside the container — remove it
-    # via docker exec so we can create a fresh one (ords_config dir is chmod 777).
     docker exec ords rm -f /etc/ords/config/databases/default/pool.xml 2>/dev/null || true
     mkdir -p "$(dirname "$POOL_XML")"
     cat > "$POOL_XML" << EOF
@@ -194,7 +250,6 @@ EOF
     sleep 15
 }
 
-# Function to wait for ORDS/APEX HTTP endpoint to respond
 wait_for_ords() {
     local TIMEOUT=${1:-3600}
     echo "Waiting up to $(print_elapsed_time $TIMEOUT) for ORDS/APEX on port $APEX_PORT..."
@@ -214,8 +269,7 @@ wait_for_ords() {
             echo "ORDS/APEX is ready (HTTP $HTTP_CODE). Total time: $(print_elapsed_time $ELAPSED)"
             break
         fi
-        # HTTP 571: ORDS running but DB connection failed (pool.xml missing host).
-        # Patch once and restart.
+        # HTTP 571: ORDS running but DB connection failed (pool.xml missing host). Patch once.
         if [ "$HTTP_CODE" = "571" ] && [ "$POOL_PATCHED" = "false" ]; then
             echo "ORDS returned HTTP 571 (DB connection failed) — patching pool.xml..."
             patch_ords_pool_config
@@ -227,7 +281,6 @@ wait_for_ords() {
     done
 }
 
-# Function to download the ONNX model if not already downloaded
 get_model() {
     if [ ! -f "$MODEL_PATH" ]; then
         echo "Downloading ONNX model from $ONNX_MODEL_URL... to $MODEL_PATH"
@@ -256,7 +309,6 @@ configure_sql_access() {
     echo "Creating TNS config directory at $TNS_DIR."
     mkdir -p "$TNS_DIR"
 
-    # Create tnsnames.ora for Oracle Database Free local connections
     cat > "$TNS_DIR/tnsnames.ora" << EOF
 $SERVICE_NAME =
   (DESCRIPTION =
@@ -279,7 +331,6 @@ EOF
     echo "TNS configuration written to $TNS_DIR/tnsnames.ora"
 }
 
-# Function to run a SQL file
 run_sql_file() {
     local sql_file="$1"
     local user="$2"
@@ -289,59 +340,132 @@ run_sql_file() {
         return 1
     fi
     echo "Running SQL file $sql_file..."
-    if ! LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-        "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus" -s "$user/$DEFAULT_PASSWORD@$SERVICE_NAME" "@$sql_file"; then
+    # Set both LD_LIBRARY_PATH (Linux) and DYLD_LIBRARY_PATH (macOS) — harmless on either platform
+    LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    DYLD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
+        "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus" -s "$user/$DEFAULT_PASSWORD@$SERVICE_NAME" "@$sql_file"
+    if [ $? -ne 0 ]; then
         echo "Failed to execute SQL file $sql_file."
         return 1
     fi
     echo "SQL file $sql_file executed successfully."
 }
 
-# Grant SYS-owned packages to a user. These grants require SYS privileges
-# and must run inside the DB container (SYSTEM cannot grant SYS objects).
-grant_sys_packages() {
-    local grantee="$1"
-    echo "Granting SYS-owned packages to $grantee (via SYS inside container)..."
-    docker exec -i "$CONTAINER_NAME" sqlplus -s "/ as sysdba" <<SQLEOF
-ALTER SESSION SET CONTAINER=FREEPDB1;
-GRANT EXECUTE ON SYS.UTL_HTTP TO $grantee;
-GRANT EXECUTE ON CTXSYS.DBMS_VECTOR_CHAIN TO $grantee;
-EXIT;
-SQLEOF
-    echo "SYS package grants complete for $grantee."
+generate_sql_files() {
+    local TPL="$RUN_DIR/sql-scripts/create-users.sql.tpl"
+    local OUT="$RUN_DIR/sql-scripts/create-users.sql"
+    if [ ! -f "$TPL" ]; then
+        echo "Template $TPL not found. Exiting."
+        exit 1
+    fi
+    sed -e "s/__APEX_USER__/$APEX_USER/g" \
+        -e "s/__APEX_PASSWORD__/$APEX_PASSWORD/g" \
+        "$TPL" > "$OUT"
 }
 
-# Function to read configuration from config.ini
+# ─────────────────────────────────────────────────────────────────
+# Pre-flight checks
+# ─────────────────────────────────────────────────────────────────
+preflight_check() {
+    local errors=0
+    echo "--- Pre-flight checks ---"
+
+    if ! command -v docker &>/dev/null; then
+        if [ "$PLATFORM" = "darwin" ]; then
+            echo "ERROR: Docker not found. Install Docker Desktop: https://www.docker.com/products/docker-desktop/"
+        else
+            echo "ERROR: Docker is not installed. Run: sudo ./setup-for-adb-26ai.sh"
+        fi
+        errors=$((errors + 1))
+    elif ! docker info &>/dev/null 2>&1; then
+        if [ "$PLATFORM" = "darwin" ]; then
+            echo "ERROR: Docker Desktop is not running. Start Docker Desktop and try again."
+        elif sudo systemctl is-active --quiet docker 2>/dev/null; then
+            echo "ERROR: Docker is running but not accessible. Log out and back in, or re-run with sudo."
+        else
+            echo "ERROR: Docker is not running. Run: sudo systemctl start docker"
+        fi
+        errors=$((errors + 1))
+    fi
+
+    if ! docker compose version &>/dev/null 2>&1; then
+        echo "ERROR: Docker Compose plugin not found. Run: sudo ./setup-for-adb-26ai.sh"
+        errors=$((errors + 1))
+    fi
+
+    if [ ! -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
+        echo "ERROR: Instant Client not found at $ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
+        echo "       Run: sudo ./setup-for-adb-26ai.sh"  # sudo only needed on Linux
+        errors=$((errors + 1))
+    fi
+
+    local effective_apex_dir="${APEX_DIR:-$HOME/apex}"
+    if [ ! -d "$effective_apex_dir" ] || [ -z "$(ls -A "$effective_apex_dir" 2>/dev/null)" ]; then
+        echo "ERROR: APEX directory missing or empty: $effective_apex_dir"
+        echo "       Run: sudo ./setup-for-adb-26ai.sh"
+        errors=$((errors + 1))
+    fi
+
+    if ! docker image inspect "$DOCKER_IMAGE" &>/dev/null || \
+       ! docker image inspect container-registry.oracle.com/database/ords:latest &>/dev/null; then
+        echo "Note: Oracle images not cached locally — will pull from container-registry.oracle.com (no login required)."
+    fi
+
+    local avail_kb
+    avail_kb=$(avail_kb_for_dir "$HOME")
+    if [ -n "$avail_kb" ] && [ "$avail_kb" -lt 15728640 ]; then  # 15 GB
+        echo "WARNING: Less than 15 GB free in $HOME — Oracle Database container may run out of space."
+    fi
+
+    if [ ! -f "$RUN_DIR/docker-compose.yml" ]; then
+        echo "ERROR: docker-compose.yml not found in $RUN_DIR"
+        errors=$((errors + 1))
+    fi
+
+    if [ "$errors" -gt 0 ]; then
+        echo "--- $errors pre-flight error(s). Fix the above before continuing. ---"
+        exit 1
+    fi
+    echo "--- Pre-flight checks passed ---"
+}
+
+# ─────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────
 read_config() {
     CONFIG_FILE="$RUN_DIR/config.ini"
     if [ ! -f "$CONFIG_FILE" ]; then
         echo "Configuration file config.ini not found in $RUN_DIR. Exiting."
         exit 1
     fi
-    SQLPLUS_URL=$(awk -F "=" '/^SQLPLUS_URL/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    INSTANT_CLIENT=$(awk -F "=" '/^INSTANT_CLIENT/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    HOSTNAME=$(awk -F "=" '/^HOSTNAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    DEFAULT_PASSWORD=$(awk -F "=" '/^DEFAULT_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' '  | tr -d '\n' | tr -d '\r')
-    CONTAINER_NAME=$(awk -F "=" '/^CONTAINER_NAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    DOCKER_IMAGE=$(awk -F "=" '/^DOCKER_IMAGE/ {print $2}' "$CONFIG_FILE" | tr -d ' '  )
-    ONNX_MODEL_URL=$(awk -F "=" '/^ONNX_MODEL_URL/ {print $2}' "$CONFIG_FILE" | tr -d ' '  )
-    ORACLE_REGISTRY_USER=$(awk -F "=" '/^ORACLE_REGISTRY_USER/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    ORACLE_REGISTRY_PASSWORD=$(awk -F "=" '/^ORACLE_REGISTRY_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    SERVICE_NAME=$(awk -F "=" '/^SERVICE_NAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    APEX_PORT=$(awk -F "=" '/^APEX_PORT/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    APEX_PORT=${APEX_PORT:-8080}
-    APEX_DIR=$(awk -F "=" '/^APEX_DIR/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    APEX_DIR=${APEX_DIR:-$HOME/apex}
 
-    APEX_USER=$(awk -F "=" '/^APEX_USER/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    HOSTNAME=$(ini_val HOSTNAME)
+    DEFAULT_PASSWORD=$(ini_val DEFAULT_PASSWORD | tr -d '\n\r')
+    CONTAINER_NAME=$(ini_val CONTAINER_NAME)
+    DOCKER_IMAGE=$(ini_val DOCKER_IMAGE)
+    ONNX_MODEL_URL=$(ini_val ONNX_MODEL_URL)
+    ORACLE_REGISTRY_USER=$(ini_val ORACLE_REGISTRY_USER)
+    ORACLE_REGISTRY_PASSWORD=$(ini_val ORACLE_REGISTRY_PASSWORD)
+    SERVICE_NAME=$(ini_val SERVICE_NAME)
+    APEX_PORT=$(ini_val APEX_PORT)
+    APEX_PORT=${APEX_PORT:-8080}
+    APEX_DIR=$(ini_val APEX_DIR)
+    APEX_DIR=${APEX_DIR:-$HOME/apex}
+    APEX_USER=$(ini_val APEX_USER)
     APEX_USER=${APEX_USER:-TRACKER1}
-    APEX_PASSWORD=$(awk -F "=" '/^APEX_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' ' | tr -d '\n' | tr -d '\r')
+    APEX_PASSWORD=$(ini_val APEX_PASSWORD | tr -d '\n\r')
     APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
 
-    OLLAMA_BASE_URL=$(awk -F "=" '/^OLLAMA_BASE_URL/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-    OLLAMA_MODEL=$(awk -F "=" '/^OLLAMA_MODEL/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    OLLAMA_MODEL=${OLLAMA_MODEL:-llama3}
+    if [ "$PLATFORM" = "darwin" ]; then
+        # Mac: prefer *_MAC keys, fall back to generic keys if Mac-specific ones are absent
+        SQLPLUS_URL=$(ini_val SQLPLUS_URL_MAC)
+        INSTANT_CLIENT=$(ini_val INSTANT_CLIENT_MAC)
+        [ -z "$SQLPLUS_URL" ]    && SQLPLUS_URL=$(ini_val SQLPLUS_URL)
+        [ -z "$INSTANT_CLIENT" ] && INSTANT_CLIENT=$(ini_val INSTANT_CLIENT)
+    else
+        SQLPLUS_URL=$(ini_val SQLPLUS_URL)
+        INSTANT_CLIENT=$(ini_val INSTANT_CLIENT)
+    fi
 
     local missing=""
     [ -z "$SQLPLUS_URL" ]      && missing="$missing SQLPLUS_URL"
@@ -357,302 +481,39 @@ read_config() {
     fi
 }
 
-# Pre-flight checks — catch common environment problems before starting long operations
-preflight_check() {
-    local errors=0
-
-    echo "--- Pre-flight checks ---"
-
-    # Docker must be installed and running
-    if ! command -v docker &>/dev/null; then
-        echo "ERROR: Docker is not installed. Run: sudo ./setup-for-adb-26ai.sh"
-        errors=$((errors + 1))
-    elif ! docker info &>/dev/null 2>&1; then
-        if sudo systemctl is-active --quiet docker 2>/dev/null; then
-            echo "ERROR: Docker is running but not accessible. Log out and back in, or re-run with sudo."
-        else
-            echo "ERROR: Docker is not running. Run: sudo systemctl start docker"
-        fi
-        errors=$((errors + 1))
-    fi
-
-    # Docker Compose plugin
-    if ! docker compose version &>/dev/null 2>&1; then
-        echo "ERROR: Docker Compose plugin not found. Run: sudo ./setup-for-adb-26ai.sh"
-        errors=$((errors + 1))
-    fi
-
-    # Oracle Instant Client (sqlplus)
-    if [ ! -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
-        echo "ERROR: Instant Client not found at $ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
-        echo "       Run: sudo ./setup-for-adb-26ai.sh"
-        errors=$((errors + 1))
-    fi
-
-    # APEX directory must be populated (ORDS needs it on first run)
-    local effective_apex_dir="${APEX_DIR:-$HOME/apex}"
-    if [ ! -d "$effective_apex_dir" ] || [ -z "$(ls -A "$effective_apex_dir" 2>/dev/null)" ]; then
-        echo "ERROR: APEX directory missing or empty: $effective_apex_dir"
-        echo "       Run: sudo ./setup-for-adb-26ai.sh"
-        errors=$((errors + 1))
-    fi
-
-    # Oracle Container Registry — images are publicly pullable (no login required).
-    # Login is only needed if pulls start failing (e.g. rate limits or policy change).
-    if ! docker image inspect "$DOCKER_IMAGE" &>/dev/null || \
-       ! docker image inspect container-registry.oracle.com/database/ords:latest &>/dev/null; then
-        echo "Note: Oracle images not cached locally — will pull from container-registry.oracle.com (no login required)."
-    fi
-
-    # Disk space: Oracle Free container needs ~15 GB for oradata
-    local avail_kb
-    avail_kb=$(df "$HOME" --output=avail 2>/dev/null | tail -1)
-    if [ -n "$avail_kb" ] && [ "$avail_kb" -lt 15728640 ]; then  # 15 GB in KB
-        echo "WARNING: Less than 15 GB free in $HOME — Oracle Database container may run out of space."
-    fi
-
-    # docker-compose.yml must be present
-    if [ ! -f "$RUN_DIR/docker-compose.yml" ]; then
-        echo "ERROR: docker-compose.yml not found in $RUN_DIR"
-        errors=$((errors + 1))
-    fi
-
-    # Ollama must be reachable from the host (it listens on 0.0.0.0:11434)
-    local ollama_host_url="${OLLAMA_BASE_URL/host.docker.internal/localhost}"
-    if curl -s --max-time 5 -o /dev/null -w "%{http_code}" "$ollama_host_url/api/tags" 2>/dev/null | grep -q "200"; then
-        echo "Ollama is reachable on the host at $ollama_host_url"
-    else
-        echo "WARNING: Ollama not reachable at $ollama_host_url"
-        echo "         Ensure ollama is running with OLLAMA_HOST=0.0.0.0"
-        echo "         Run: sudo systemctl edit ollama  (add Environment=\"OLLAMA_HOST=0.0.0.0\")"
-        echo "         Then: sudo systemctl daemon-reload && sudo systemctl restart ollama"
-    fi
-
-    if [ "$errors" -gt 0 ]; then
-        echo "--- $errors pre-flight error(s). Fix the above before continuing. ---"
-        exit 1
-    fi
-
-    echo "--- Pre-flight checks passed ---"
-}
-
-# Enable MAX_STRING_SIZE=EXTENDED so that VARCHAR2(32767) columns are supported.
-# This is required for APEX Supporting Objects that define wide VARCHAR2 columns.
-# The change is idempotent — safe to call on a DB that is already EXTENDED.
-# It requires a full DB restart in UPGRADE mode (runs utl32k.sql), which is the
-# standard Oracle procedure. The restart happens inside the container via docker exec.
-enable_extended_string_size() {
-    echo "=== Checking MAX_STRING_SIZE ==="
-
-    local current
-    current=$(docker exec -i "$CONTAINER_NAME" sqlplus -s / as sysdba << 'SQLEOF' 2>/dev/null
-SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
-SELECT value FROM v$parameter WHERE name='max_string_size';
-EXIT;
-SQLEOF
-)
-    current=$(echo "$current" | tr -d '[:space:]')
-
-    if [ "${current^^}" = "EXTENDED" ]; then
-        echo "MAX_STRING_SIZE already EXTENDED — skipping."
-        return 0
-    fi
-
-    echo "MAX_STRING_SIZE=$current — enabling EXTENDED (DB will restart in UPGRADE mode)..."
-
-    # Step 1: Set parameter and restart CDB in UPGRADE mode
-    docker exec -i "$CONTAINER_NAME" sqlplus -s / as sysdba << 'SQLEOF'
-ALTER SYSTEM SET MAX_STRING_SIZE=EXTENDED SCOPE=SPFILE;
-SHUTDOWN IMMEDIATE;
-STARTUP UPGRADE;
-EXIT;
-SQLEOF
-
-    # Step 2: Run utl32k.sql in CDB root, then in each PDB (FREEPDB1)
-    docker exec -i "$CONTAINER_NAME" sqlplus -s / as sysdba << 'SQLEOF'
--- Migrate CDB root
-@?/rdbms/admin/utl32k.sql
--- Open PDB in UPGRADE mode and migrate it too
-ALTER PLUGGABLE DATABASE ALL OPEN UPGRADE;
-ALTER SESSION SET CONTAINER=FREEPDB1;
-@?/rdbms/admin/utl32k.sql
--- Return to CDB root and restart normally
-ALTER SESSION SET CONTAINER=CDB$ROOT;
-SHUTDOWN IMMEDIATE;
-STARTUP;
-EXIT;
-SQLEOF
-
-    echo "MAX_STRING_SIZE=EXTENDED enabled — waiting for DB to stabilise..."
-    sleep 20
-    wait_for_container_healthy 300
-    echo "MAX_STRING_SIZE=EXTENDED configured successfully."
-}
-
-# Generate SQL files from templates, substituting config values
-generate_sql_files() {
-    local TPL="$RUN_DIR/sql-scripts/create-users.sql.tpl"
-    local OUT="$RUN_DIR/sql-scripts/create-users.sql"
-    if [ ! -f "$TPL" ]; then
-        echo "Template $TPL not found. Exiting."
-        exit 1
-    fi
-    sed -e "s/__APEX_USER__/$APEX_USER/g" \
-        -e "s/__APEX_PASSWORD__/$APEX_PASSWORD/g" \
-        "$TPL" > "$OUT"
-
-    # Ollama AI service SQL
-    local OLLAMA_TPL="$RUN_DIR/sql-scripts/setup-ollama-ai.sql.tpl"
-    local OLLAMA_OUT="$RUN_DIR/sql-scripts/setup-ollama-ai.sql"
-    if [ -f "$OLLAMA_TPL" ]; then
-        sed -e "s/__APEX_USER__/$APEX_USER/g" \
-            -e "s|__OLLAMA_BASE_URL__|$OLLAMA_BASE_URL|g" \
-            -e "s/__OLLAMA_MODEL__/$OLLAMA_MODEL/g" \
-            "$OLLAMA_TPL" > "$OLLAMA_OUT"
-    fi
-}
-
-
-# Ensure the host firewall allows the DB container's Docker network to reach
-# Ollama on port 11434. On Linux the default iptables INPUT chain often ends
-# with a blanket REJECT rule that blocks container→host traffic.
-# This adds an ACCEPT rule (idempotent) for the container's subnet.
-ensure_ollama_firewall_rule() {
-    if ! command -v iptables &>/dev/null; then
-        echo "iptables not found — skipping firewall rule (may not be needed)."
-        return 0
-    fi
-
-    local container_ip
-    container_ip=$(docker inspect "$CONTAINER_NAME" \
-        --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
-    if [ -z "$container_ip" ]; then
-        echo "Warning: could not determine container IP — skipping firewall rule."
-        return 0
-    fi
-
-    # Derive /16 subnet from container IP (e.g. 172.18.0.2 → 172.18.0.0/16)
-    local subnet
-    subnet=$(echo "$container_ip" | awk -F. '{print $1"."$2".0.0/16"}')
-
-    # Check if a matching rule already exists
-    if sudo iptables -C INPUT -s "$subnet" -p tcp --dport 11434 -j ACCEPT 2>/dev/null; then
-        echo "Firewall rule already exists for $subnet → port 11434."
-        return 0
-    fi
-
-    echo "Adding iptables rule: allow $subnet → port 11434 (Ollama)..."
-    # Insert before the trailing REJECT rule (position 5 is typical for OCI/cloud images)
-    local reject_line
-    reject_line=$(sudo iptables -L INPUT --line-numbers -n 2>/dev/null \
-        | grep -i 'reject' | tail -1 | awk '{print $1}')
-    if [ -n "$reject_line" ]; then
-        sudo iptables -I INPUT "$reject_line" -s "$subnet" -p tcp --dport 11434 -j ACCEPT
-    else
-        sudo iptables -A INPUT -s "$subnet" -p tcp --dport 11434 -j ACCEPT
-    fi
-    echo "Firewall rule added. (Note: not persistent across reboots — use iptables-persistent to save.)"
-}
-
-# Validate that the DB can reach Ollama and generate text end-to-end.
-# Runs a real DBMS_VECTOR_CHAIN call via docker exec sqlplus inside the container.
-validate_ollama_from_db() {
-    echo ""
-    echo "=== Validating Ollama connectivity from inside the database ==="
-
-    # Test 1: HTTP connectivity from DB to Ollama via UTL_HTTP
-    echo "--- Test 1: UTL_HTTP connectivity to Ollama ---"
-    local http_result
-    http_result=$(docker exec -i "$CONTAINER_NAME" sqlplus -s "system/$DEFAULT_PASSWORD@localhost:1521/$SERVICE_NAME" << SQLEOF
-SET SERVEROUTPUT ON
-SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
-DECLARE
-  v_req  UTL_HTTP.REQ;
-  v_resp UTL_HTTP.RESP;
-  v_body VARCHAR2(4000);
-BEGIN
-  UTL_HTTP.SET_TRANSFER_TIMEOUT(15);
-  v_req  := UTL_HTTP.BEGIN_REQUEST('${OLLAMA_BASE_URL}/api/tags', 'GET');
-  v_resp := UTL_HTTP.GET_RESPONSE(v_req);
-  UTL_HTTP.READ_TEXT(v_resp, v_body, 4000);
-  UTL_HTTP.END_RESPONSE(v_resp);
-  DBMS_OUTPUT.PUT_LINE('PASS: HTTP ' || v_resp.status_code || ' from Ollama');
-  DBMS_OUTPUT.PUT_LINE('Models: ' || SUBSTR(v_body, 1, 300));
-EXCEPTION
-  WHEN OTHERS THEN
-    DBMS_OUTPUT.PUT_LINE('FAIL: ' || SQLERRM);
-END;
-/
-EXIT;
-SQLEOF
-)
-    echo "$http_result"
-    if echo "$http_result" | grep -q "PASS:"; then
-        echo "--- Test 1: PASSED ---"
-    else
-        echo "--- Test 1: FAILED --- DB cannot reach Ollama at $OLLAMA_BASE_URL"
-        echo "    Check: ollama is running, OLLAMA_HOST=0.0.0.0, firewall allows 11434"
-        return 1
-    fi
-
-    # Test 2: Generative AI call via DBMS_VECTOR_CHAIN
-    echo ""
-    echo "--- Test 2: DBMS_VECTOR_CHAIN generative AI call (model: $OLLAMA_MODEL) ---"
-    local gen_result
-    gen_result=$(docker exec -i "$CONTAINER_NAME" sqlplus -s "system/$DEFAULT_PASSWORD@localhost:1521/$SERVICE_NAME" << SQLEOF
-SET SERVEROUTPUT ON SIZE UNLIMITED
-SET PAGESIZE 0 FEEDBACK OFF HEADING OFF LONG 10000 LINESIZE 200
-SELECT DBMS_VECTOR_CHAIN.UTL_TO_GENERATE_TEXT(
-  'Reply with exactly: OLLAMA_WORKS',
-  JSON('{"provider":"ollama","host":"${OLLAMA_BASE_URL}","model":"${OLLAMA_MODEL}"}')
-) AS response FROM dual;
-EXIT;
-SQLEOF
-)
-    echo "$gen_result"
-    if [ -n "$gen_result" ] && ! echo "$gen_result" | grep -qi "ORA-\|ERROR\|SP2-"; then
-        echo "--- Test 2: PASSED --- Generative AI is working end-to-end"
-    else
-        echo "--- Test 2: FAILED --- DBMS_VECTOR_CHAIN call did not succeed"
-        echo "    Ensure model '$OLLAMA_MODEL' is pulled: ollama pull $OLLAMA_MODEL"
-        return 1
-    fi
-
-    echo ""
-    echo "=== Ollama validation complete — all tests PASSED ==="
-}
-
-####### main code #######
+####### main #######
+PLATFORM=""
+ARCH=""
 WALLET_DIR=""
 TNS_ADMIN=""
 ORACLE_CLIENT_DIR="$HOME/oraclient"
 MODEL_PATH="$HOME/model.onnx"
 REMOVE_IMAGES=false
-RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )" # the directory that this script is in
+RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-# If docker isn't accessible, try to apply the docker group without requiring a logout.
-# We check /etc/group (via id -nG <username>) rather than the current session's groups,
+detect_platform
+[ "$PLATFORM" = "darwin" ] && _resolve_docker_mac
+
+# On Linux: if docker isn't accessible, try to apply the docker group without requiring a logout.
+# We check /etc/group (via id -nG) rather than the current session's groups,
 # because this session may predate the docker group add done by setup-for-adb-26ai.sh.
-if ! docker info &>/dev/null 2>&1; then
-    _current_user="${SUDO_USER:-$USER}"
-    if id -nG "$_current_user" 2>/dev/null | grep -qw docker; then
-        echo "Docker group not active in this session — re-launching in docker group context..."
-        exec sg docker -c "bash $(printf '%q ' "$0" "$@")"
+# This is Linux-specific — Docker Desktop on Mac handles permissions without group membership.
+if [ "$PLATFORM" = "linux" ]; then
+    if ! docker info &>/dev/null 2>&1; then
+        _current_user="${SUDO_USER:-$USER}"
+        if id -nG "$_current_user" 2>/dev/null | grep -qw docker; then
+            echo "Docker group not active in this session — re-launching in docker group context..."
+            exec sg docker -c "bash $(printf '%q ' "$0" "$@")"
+        fi
+        unset _current_user
     fi
-    unset _current_user
-    # docker isn't installed/running — preflight_check will report this clearly
+
+    # sg disconnects stdin from the TTY. Reconnect so interactive prompts work correctly.
+    [ ! -t 0 ] && exec < /dev/tty 2>/dev/null || true
 fi
 
-# sg disconnects stdin from the TTY. Reconnect so interactive prompts (e.g. cleanup read)
-# work correctly in the re-exec'd process. Suppress error if no controlling TTY (non-interactive).
-if [ ! -t 0 ] && [ -e /dev/tty ]; then
-    exec < /dev/tty 2>/dev/null || true
-fi
-
-# Read configuration
 read_config
 
-# Parse arguments — collect all flags before acting
 DO_CLEANUP=false
 while getopts "hcr" opt; do
     case ${opt} in
@@ -673,30 +534,18 @@ preflight_check
 create_db_data_dir
 generate_env_file
 
-DB_ALREADY_RUNNING=false
-if check_container_state "$CONTAINER_NAME"; then
-    echo "Container $CONTAINER_NAME is already running — reusing."
-    DB_ALREADY_RUNNING=true
-else
-    # Pull images from Oracle Container Registry.
-    # The database/free and database/ords images are publicly accessible — no login required.
-    echo "Pulling Docker images (DB + ORDS) — login not required for Oracle free-tier images..."
-    docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" pull || {
-        echo "Warning: image pull failed (registry unreachable or auth required)."
-        echo "Checking for locally cached images..."
-        if ! docker image inspect "$DOCKER_IMAGE" &>/dev/null || \
-           ! docker image inspect container-registry.oracle.com/database/ords:latest &>/dev/null; then
-            echo "ERROR: Required images not cached locally. Ensure you can reach container-registry.oracle.com"
-            echo "       or run: docker login container-registry.oracle.com"
-            exit 1
-        fi
-        echo "Using locally cached images."
-    }
-
-    echo "Starting Oracle Database container..."
-    docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" up -d oracle-db
-    wait_for_container_healthy 1800
-fi
+echo "Pulling Docker images (DB + ORDS) — login not required for Oracle free-tier images..."
+docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" pull || {
+    echo "Warning: image pull failed (registry unreachable or auth required)."
+    echo "Checking for locally cached images..."
+    if ! docker image inspect "$DOCKER_IMAGE" &>/dev/null || \
+       ! docker image inspect container-registry.oracle.com/database/ords:latest &>/dev/null; then
+        echo "ERROR: Required images not cached locally. Ensure you can reach container-registry.oracle.com"
+        echo "       or run: docker login container-registry.oracle.com"
+        exit 1
+    fi
+    echo "Using locally cached images."
+}
 
 get_model
 
@@ -708,13 +557,11 @@ configure_sql_access
 export TNS_ADMIN="$WALLET_DIR"
 echo "TNS_ADMIN is $TNS_ADMIN"
 
-# Discover DATA_PUMP_DIR path inside the container via SQL
-DATA_PUMP_DIR=$(docker exec "$CONTAINER_NAME" bash -c \
+DATA_PUMP_DIR=$(docker exec $CONTAINER_NAME bash -c \
     "echo \"SELECT directory_path FROM dba_directories WHERE directory_name='DATA_PUMP_DIR';\" | \
      sqlplus -s sys/$DEFAULT_PASSWORD@localhost:1521/$SERVICE_NAME as sysdba 2>/dev/null" \
     | grep -E '^/' | head -1 | tr -d '[:space:]') || true
 if [ -z "$DATA_PUMP_DIR" ]; then
-    # fallback to known default path in database/free container
     DATA_PUMP_DIR="/opt/oracle/admin/FREE/dpdump"
     echo "Warning: could not query DATA_PUMP_DIR, using default: $DATA_PUMP_DIR"
 fi
@@ -722,29 +569,24 @@ echo "DATA_PUMP_DIR is $DATA_PUMP_DIR"
 docker exec "$CONTAINER_NAME" ls -l "$DATA_PUMP_DIR"
 echo "===="
 
-# Copy ONNX model into the container
 docker cp "$MODEL_PATH" "$CONTAINER_NAME:/tmp/model.onnx"
 docker exec "$CONTAINER_NAME" cp "/tmp/model.onnx" "$DATA_PUMP_DIR/model.onnx"
 
 # Enable extended VARCHAR2 (32767) support — must run before any DDL that uses it
 enable_extended_string_size
 
-# Generate SQL files from templates
 generate_sql_files
-
-# Run DB setup SQL (APEX_USER + ONNX model load) — idempotent, safe to re-run
 run_sql_file "$RUN_DIR/sql-scripts/create-users.sql" system
 run_sql_file "$RUN_DIR/sql-scripts/vector-setup.sql" system
 
 # --- Phase 2: Start ORDS (auto-installs APEX into DB, then serves it on port $APEX_PORT) ---
 if [ ! -d "$APEX_DIR" ] || [ -z "$(ls -A "$APEX_DIR" 2>/dev/null)" ]; then
     echo "Error: APEX directory $APEX_DIR is empty or missing."
-    echo "Run 'sudo ./setup-for-adb-26ai.sh' first to prepare APEX."
+    echo "Run './setup-for-adb-26ai.sh' first to prepare APEX."
     echo "Or set APEX_DIR in config.ini to the location of your APEX install files."
     exit 1
 fi
 
-# Ensure ords_config directory exists (ORDS writes its config here on first run).
 mkdir -p "$RUN_DIR/ords_config" && chmod 777 "$RUN_DIR/ords_config"
 
 ORDS_ALREADY_RUNNING=false
@@ -757,8 +599,7 @@ else
 fi
 wait_for_ords 3600
 
-# Re-run user setup now that APEX is installed — creates APEX workspace for TRACKER1
-echo "Configuring APEX workspace for TRACKER1..."
+echo "Configuring APEX workspace for $APEX_USER..."
 run_sql_file "$RUN_DIR/sql-scripts/create-users.sql" system
 
 # --- Phase 3: Configure Ollama generative AI service ---

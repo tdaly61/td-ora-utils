@@ -20,26 +20,31 @@ if [ ! -f "$CONFIG_FILE" ]; then
   exit 1
 fi
 
-DEFAULT_PASSWORD=$(awk -F "=" '/^DEFAULT_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' \n\r')
-SERVICE_NAME=$(awk -F "=" '/^SERVICE_NAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-INSTANT_CLIENT=$(awk -F "=" '/^INSTANT_CLIENT/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+ini_val() { grep -m1 "^${1}=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d ' \n\r'; }
+
+DEFAULT_PASSWORD=$(ini_val DEFAULT_PASSWORD)
+SERVICE_NAME=$(ini_val SERVICE_NAME)
 ORACLE_CLIENT_DIR="$HOME/oraclient"
-APEX_PORT=$(awk -F "=" '/^APEX_PORT/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-APEX_PORT=${APEX_PORT:-8080}
-APEX_USER=$(awk -F "=" '/^APEX_USER/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-APEX_USER=${APEX_USER:-TRACKER1}
-APEX_PASSWORD=$(awk -F "=" '/^APEX_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' \n\r')
-APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
+APEX_PORT=$(ini_val APEX_PORT); APEX_PORT=${APEX_PORT:-8080}
+APEX_USER=$(ini_val APEX_USER);  APEX_USER=${APEX_USER:-TRACKER1}
+APEX_PASSWORD=$(ini_val APEX_PASSWORD); APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
+
+# Pick Mac or Linux Instant Client directory name
+if [ "$(uname -s)" = "Darwin" ]; then
+  INSTANT_CLIENT=$(ini_val INSTANT_CLIENT_MAC)
+fi
+INSTANT_CLIENT=${INSTANT_CLIENT:-$(ini_val INSTANT_CLIENT)}
 
 SQLPLUS="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus"
 if [ ! -x "$SQLPLUS" ]; then
   echo "SQLPlus not found at $SQLPLUS."
-  echo "Run sudo ./setup-for-adb-26ai.sh first, or add Instant Client to PATH."
+  echo "Run ./setup-for-adb-26ai.sh first, or add Instant Client to PATH."
   exit 1
 fi
 
 export TNS_ADMIN="$HOME/auth/tns"
 export LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
+export DYLD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
 
 # ── Generate SQL from templates ──────────────────────────────────────────────
 generate_sql() {
