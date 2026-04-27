@@ -8,10 +8,16 @@ Scripts and configuration to run Oracle Database Free 23ai with APEX and ORDS lo
 
 ## Architecture
 
-Two containers managed by Docker Compose:
+Two containers managed by Docker Compose, with Ollama running on the host:
 
 ```
-┌─────────────────────────────┐     ┌──────────────────────────────┐
+                                  ┌─────────────────────────┐
+                                  │  Host                   │
+                                  │  Ollama :11434          │
+                                  │  (OLLAMA_HOST=0.0.0.0)  │
+                                  └────────▲────────────────┘
+                                           │ host.docker.internal
+┌─────────────────────────────┐     ┌──────┴───────────────────────┐
 │  oracle-db                  │     │  ords                        │
 │  database/free:latest       │◄────│  database/ords:latest        │
 │                             │     │                              │
@@ -19,10 +25,13 @@ Two containers managed by Docker Compose:
 │  port 5500  EM Express      │     │                              │
 │  ~/db_data_dir  (data)      │     │  auto-installs APEX 24.2     │
 │  ./apex      (APEX files)   │     │  ./ords_config  (config)     │
+│                             │     │                              │
+│  UTL_HTTP / DBMS_VECTOR_CHAIN    │                              │
+│  → Ollama via host.docker.internal                              │
 └─────────────────────────────┘     └──────────────────────────────┘
 ```
 
-`run-adb-26ai.sh` starts `oracle-db` first, waits for it to be healthy, runs SQL setup (users, ONNX model), then starts `ords` which auto-installs APEX 24.2 into the database on first run.
+`run-adb-26ai.sh` starts `oracle-db` first, waits for it to be healthy, runs SQL setup (users, ONNX model), then starts `ords` which auto-installs APEX 24.2 into the database on first run. Finally, it configures network ACLs and connects the database to Ollama for generative AI.
 
 ---
 
@@ -36,6 +45,7 @@ Two containers managed by Docker Compose:
 | `run-adb-26ai.sh` | Starts containers, loads ONNX model, runs SQL setup |
 | `sql-scripts/create-users.sql.tpl` | Template for user + APEX workspace SQL (edit this, not the generated file) |
 | `sql-scripts/vector-setup.sql` | Loads the `ALL_MINILM` ONNX model into the database |
+| `sql-scripts/setup-ollama-ai.sql.tpl` | Template for network ACL + Ollama AI service configuration |
 | `apex/` | APEX 24.2 install files (created by setup script) |
 | `ords_config/` | ORDS runtime config — written by ORDS on first start |
 
@@ -48,6 +58,17 @@ Two containers managed by Docker Compose:
 - **Minimum 16 GB RAM** (8 GB minimum; Oracle DB needs ~4 GB, ORDS/APEX needs ~2 GB)
 - **Minimum 30 GB free disk** (DB data dir ~10 GB, APEX install files ~1 GB, images ~8 GB)
 - Internet access to download Docker images, Instant Client, APEX zip, and the ONNX model
+
+### Ollama (required for generative AI features)
+
+Ollama must be installed and running on the host **before** running `run-adb-26ai.sh`. The easiest way is to run the AI tools setup script from the `nvidia/` directory:
+
+```bash
+sudo ../nvidia/ai-tools-setup.sh     # installs Ollama, configures OLLAMA_HOST=0.0.0.0
+ollama pull llama3                    # or whichever model you set in config.ini
+```
+
+This installs Ollama, sets it to listen on all interfaces (`0.0.0.0:11434`), and optionally pulls recommended models. See the [top-level README](../README.md) for the full setup order.
 
 ### Software installed automatically by `setup-for-adb-26ai.sh`
 - `curl`, `unzip`, `git`
@@ -115,6 +136,13 @@ Edit `config.ini` before running any scripts. `run-adb-26ai.sh` generates `.env`
 |-----|---------|-------|
 | `ONNX_MODEL_URL` | OCI Object Storage URL | `all_MiniLM_L12_v2.onnx` — the vector embedding model. Only change to use a different model. |
 
+### Ollama (Local LLM)
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `OLLAMA_BASE_URL` | `http://host.docker.internal:11434` | Ollama endpoint as seen from inside the Docker container |
+| `OLLAMA_MODEL` | `llama3` | Default model for generative AI. Must be pulled in Ollama first. |
+
 ---
 
 ## Quick Setup
@@ -126,13 +154,30 @@ git clone https://github.com/tdaly61/td-ora-utils.git
 cd td-ora-utils/adb
 ```
 
-### Step 2 — Edit `config.ini`
-
-At minimum set `ORACLE_REGISTRY_USER` and `ORACLE_REGISTRY_PASSWORD`. Review and adjust other values for your environment.
-
-### Step 3 — Run the OS setup script (once per machine, requires sudo)
+### Step 2 — Install Ollama (once per machine)
 
 ```bash
+sudo ../nvidia/ai-tools-setup.sh     # installs Ollama with OLLAMA_HOST=0.0.0.0
+ollama pull llama3                    # pull the model set in config.ini
+```
+
+Or if Ollama is already installed, just ensure it listens on all interfaces:
+
+```bash
+sudo systemctl edit ollama
+# Add:  [Service]
+#       Environment="OLLAMA_HOST=0.0.0.0"
+sudo systemctl daemon-reload && sudo systemctl restart ollama
+```
+
+### Step 3 — Edit `config.ini`
+
+At minimum set `ORACLE_REGISTRY_USER` and `ORACLE_REGISTRY_PASSWORD`. Set `OLLAMA_MODEL` to whichever model you pulled. Review and adjust other values for your environment.
+
+### Step 4 — Run the OS setup script (once per machine, requires sudo)
+
+```bash
+cd td-ora-utils/adb
 sudo ./setup-for-adb-26ai.sh
 ```
 
@@ -151,13 +196,13 @@ This script:
 
 > **After setup completes:** log out and back in (or run `newgrp docker`) so Docker group membership is active.
 
-### Step 4 — Start the database and APEX
+### Step 5 — Start the database, APEX, and Ollama AI
 
 ```bash
 ./run-adb-26ai.sh
 ```
 
-This script runs in two phases:
+This script runs in three phases:
 
 **Phase 1 — Oracle Database**
 - Generates `.env` from `config.ini`
@@ -177,6 +222,14 @@ This script runs in two phases:
 - Waits up to 60 minutes for APEX to be available on port `APEX_PORT`
 - **First-run APEX install typically takes 5–15 minutes**
 - Re-runs `create-users.sql` to create the APEX workspace for `APEX_USER` (now that APEX is installed)
+
+**Phase 3 — Ollama Generative AI**
+- Generates `setup-ollama-ai.sql` from template (substitutes `APEX_USER`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL`)
+- Grants network ACL (`DBMS_NETWORK_ACL_ADMIN`) so the DB can make outbound HTTP calls
+- Grants `UTL_HTTP` and `DBMS_VECTOR_CHAIN` execute privileges to the application user
+- Creates an `OLLAMA_CRED` credential (dummy — Ollama has no auth)
+- Tests HTTP connectivity from inside the DB to the Ollama API
+- Runs an end-to-end generative AI test via `DBMS_VECTOR_CHAIN.UTL_TO_GENERATE_TEXT`
 
 ---
 
@@ -241,6 +294,30 @@ docker ps                  # container status
 | `FREEPDB1` | Pluggable database — use for application connections |
 | `FREE` | Root container database |
 
+### Calling Ollama from SQL
+
+After setup, any user with network ACL and `DBMS_VECTOR_CHAIN` grants can call Ollama:
+
+```sql
+-- Generate text
+SELECT DBMS_VECTOR_CHAIN.UTL_TO_GENERATE_TEXT(
+  'Explain Oracle APEX in one sentence',
+  JSON('{"provider":"ollama","host":"http://host.docker.internal:11434","model":"llama3"}')
+) FROM dual;
+
+-- Test raw HTTP connectivity
+DECLARE
+  v_req  UTL_HTTP.REQ;
+  v_resp UTL_HTTP.RESP;
+BEGIN
+  v_req  := UTL_HTTP.BEGIN_REQUEST('http://host.docker.internal:11434/api/tags', 'GET');
+  v_resp := UTL_HTTP.GET_RESPONSE(v_req);
+  DBMS_OUTPUT.PUT_LINE('HTTP ' || v_resp.status_code);
+  UTL_HTTP.END_RESPONSE(v_resp);
+END;
+/
+```
+
 ---
 
 ## Database Users
@@ -273,15 +350,20 @@ ORDER BY model_name;
 Stop both containers (prompts whether to delete `~/db_data_dir`):
 
 ```bash
-./run-adb-26ai.sh -c
+./run-adb-26ai.sh -c            # stop containers, prompt to remove data dir
+./run-adb-26ai.sh -c -r         # also remove Docker images
 ```
 
-This runs `docker compose down` which stops and removes both `oracle-db` and `ords`. The `~/db_data_dir` data directory and `./ords_config/` are preserved unless you choose to delete them.
-
-To fully remove Docker and all Oracle tooling from the machine:
+Remove Oracle Instant Client, APEX files, container images, and generated configs (Docker itself is **not** removed):
 
 ```bash
 sudo ./setup-for-adb-26ai.sh -c
+```
+
+Remove Ollama and all AI tools:
+
+```bash
+sudo ../nvidia/ai-tools-setup.sh --cleanup
 ```
 
 ---
@@ -295,6 +377,9 @@ sudo ./setup-for-adb-26ai.sh -c
 | `docker compose pull` fails with auth error | Registry credentials missing or ORDS license not accepted | Accept both **Database → free** and **Database → ords** licenses at container-registry.oracle.com |
 | APEX install slow | Normal — first-run install | Check progress: `docker logs -f ords` |
 | `http://localhost:8080/apex` returns 404 | Wrong path | Use `/ords/apex` not `/apex` |
+| Ollama test FAILED: `ORA-24247` | Network ACL not granted | Re-run `./run-adb-26ai.sh` or manually run `setup-ollama-ai.sql` as SYSTEM |
+| Ollama test FAILED: `ORA-29273` (HTTP request failed) | Ollama not listening on `0.0.0.0` | Run `sudo systemctl edit ollama`, add `Environment="OLLAMA_HOST=0.0.0.0"`, then `sudo systemctl daemon-reload && sudo systemctl restart ollama` |
+| DBMS_VECTOR_CHAIN returns ORA error | Model not pulled or wrong name | Check `ollama list` on host, ensure `OLLAMA_MODEL` in `config.ini` matches |
 
 ---
 
