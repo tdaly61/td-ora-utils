@@ -204,6 +204,18 @@ BEGIN
         'http://host.docker.internal:11434/v1', 'llama3', v_cred_id;
       DBMS_OUTPUT.PUT_LINE('APEX AI service created: ' || v_static_id || ' -> http://host.docker.internal:11434/v1 (model: llama3)');
   END;
+  -- Step C: Encrypt the credential secret via the APEX API.
+  --  Direct SQL INSERT stores client_secret as plaintext; APEX decrypts it with
+  --  DBMS_CRYPTO and raises ORA-28817 if the value isn't properly encrypted.
+  --  set_persistent_credentials() encrypts the value before storing it.
+  apex_util.set_workspace(p_workspace => 'TRACKER1');
+  apex_credential.set_persistent_credentials(
+    p_credential_static_id => v_cred_sid,
+    p_key                  => 'Authorization',
+    p_value                => 'Bearer ollama-no-auth-needed'
+  );
+  DBMS_OUTPUT.PUT_LINE('Credential secret encrypted: ' || v_cred_sid);
+
   COMMIT;
 END;
 /

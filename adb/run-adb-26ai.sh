@@ -58,6 +58,27 @@ _resolve_docker_mac() {
     fi
 }
 
+# Check if a container exists and is healthy/running. Returns:
+#   0 — container is running (reuse it)
+#   1 — container does not exist or was removed (create it)
+check_container_state() {
+    local name="$1"
+    local cid
+    cid=$(docker ps -aq -f "name=^${name}$" 2>/dev/null || true)
+    if [ -z "$cid" ]; then
+        return 1  # does not exist
+    fi
+    local state
+    state=$(docker inspect --format='{{.State.Status}}' "$name" 2>/dev/null || echo "unknown")
+    if [ "$state" = "running" ]; then
+        return 0  # running
+    fi
+    # Exists but stopped/dead — remove so we can recreate cleanly
+    echo "Container $name exists but is $state — removing stale container..."
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    return 1  # treat as not existing
+}
+
 # Available disk space in KB for a given path (cross-platform)
 avail_kb_for_dir() {
     local dir="$1"
@@ -351,6 +372,58 @@ run_sql_file() {
     echo "SQL file $sql_file executed successfully."
 }
 
+# Enable MAX_STRING_SIZE=EXTENDED so that VARCHAR2(32767) columns are supported.
+# The change is idempotent — safe to call on a DB that is already EXTENDED.
+# It requires a full DB restart in UPGRADE mode (runs utl32k.sql), which is the
+# standard Oracle procedure. The restart happens inside the container via docker exec.
+enable_extended_string_size() {
+    echo "=== Checking MAX_STRING_SIZE ==="
+
+    local current
+    current=$(docker exec -i "$CONTAINER_NAME" sqlplus -s / as sysdba << 'SQLEOF' 2>/dev/null
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT value FROM v$parameter WHERE name='max_string_size';
+EXIT;
+SQLEOF
+)
+    current=$(echo "$current" | tr -d '[:space:]')
+
+    if [ "${current^^}" = "EXTENDED" ]; then
+        echo "MAX_STRING_SIZE already EXTENDED — skipping."
+        return 0
+    fi
+
+    echo "MAX_STRING_SIZE=$current — enabling EXTENDED (DB will restart in UPGRADE mode)..."
+
+    # Step 1: Set parameter and restart CDB in UPGRADE mode
+    docker exec -i "$CONTAINER_NAME" sqlplus -s / as sysdba << 'SQLEOF'
+ALTER SYSTEM SET MAX_STRING_SIZE=EXTENDED SCOPE=SPFILE;
+SHUTDOWN IMMEDIATE;
+STARTUP UPGRADE;
+EXIT;
+SQLEOF
+
+    # Step 2: Run utl32k.sql in CDB root, then in each PDB (FREEPDB1)
+    docker exec -i "$CONTAINER_NAME" sqlplus -s / as sysdba << 'SQLEOF'
+-- Migrate CDB root
+@?/rdbms/admin/utl32k.sql
+-- Open PDB in UPGRADE mode and migrate it too
+ALTER PLUGGABLE DATABASE ALL OPEN UPGRADE;
+ALTER SESSION SET CONTAINER=FREEPDB1;
+@?/rdbms/admin/utl32k.sql
+-- Return to CDB root and restart normally
+ALTER SESSION SET CONTAINER=CDB$ROOT;
+SHUTDOWN IMMEDIATE;
+STARTUP;
+EXIT;
+SQLEOF
+
+    echo "MAX_STRING_SIZE=EXTENDED enabled — waiting for DB to stabilise..."
+    sleep 20
+    wait_for_container_healthy 300
+    echo "MAX_STRING_SIZE=EXTENDED configured successfully."
+}
+
 generate_sql_files() {
     local TPL="$RUN_DIR/sql-scripts/create-users.sql.tpl"
     local OUT="$RUN_DIR/sql-scripts/create-users.sql"
@@ -534,18 +607,28 @@ preflight_check
 create_db_data_dir
 generate_env_file
 
-echo "Pulling Docker images (DB + ORDS) — login not required for Oracle free-tier images..."
-docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" pull || {
-    echo "Warning: image pull failed (registry unreachable or auth required)."
-    echo "Checking for locally cached images..."
-    if ! docker image inspect "$DOCKER_IMAGE" &>/dev/null || \
-       ! docker image inspect container-registry.oracle.com/database/ords:latest &>/dev/null; then
-        echo "ERROR: Required images not cached locally. Ensure you can reach container-registry.oracle.com"
-        echo "       or run: docker login container-registry.oracle.com"
-        exit 1
-    fi
-    echo "Using locally cached images."
-}
+DB_ALREADY_RUNNING=false
+if check_container_state "$CONTAINER_NAME"; then
+    echo "Container $CONTAINER_NAME is already running — reusing."
+    DB_ALREADY_RUNNING=true
+else
+    echo "Pulling Docker images (DB + ORDS) — login not required for Oracle free-tier images..."
+    docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" pull || {
+        echo "Warning: image pull failed (registry unreachable or auth required)."
+        echo "Checking for locally cached images..."
+        if ! docker image inspect "$DOCKER_IMAGE" &>/dev/null || \
+           ! docker image inspect container-registry.oracle.com/database/ords:latest &>/dev/null; then
+            echo "ERROR: Required images not cached locally. Ensure you can reach container-registry.oracle.com"
+            echo "       or run: docker login container-registry.oracle.com"
+            exit 1
+        fi
+        echo "Using locally cached images."
+    }
+
+    echo "Starting Oracle Database container..."
+    docker compose -f "$RUN_DIR/docker-compose.yml" --env-file "$RUN_DIR/.env" up -d oracle-db
+    wait_for_container_healthy 1800
+fi
 
 get_model
 

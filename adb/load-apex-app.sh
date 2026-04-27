@@ -94,6 +94,8 @@ INSTANT_CLIENT=$(cfg_val INSTANT_CLIENT)
 APEX_PORT=$(cfg_val APEX_PORT);     APEX_PORT=${APEX_PORT:-8080}
 APEX_USER=$(cfg_val APEX_USER);     APEX_USER=${APEX_USER:-TRACKER1}
 APEX_PASSWORD=$(cfg_val APEX_PASSWORD); APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
+OLLAMA_BASE_URL=$(cfg_val OLLAMA_BASE_URL)
+OLLAMA_MODEL=$(cfg_val OLLAMA_MODEL)
 
 # ── Parse options ─────────────────────────────────────────────────────────────
 APEX_SQL=""
@@ -330,7 +332,15 @@ BEGIN
 END;
 /
 
--- 2. Pre-supply base URLs for remote servers marked p_prompt_on_install=>true.
+-- 2. Enable automatic installation of Supporting Objects (tables, sequences, etc.)
+--    Without this, p_auto_install_sup_obj defaults to false and the schema DDL is skipped.
+BEGIN
+  apex_application_install.set_auto_install_sup_obj(p_auto_install_sup_obj => true);
+  DBMS_OUTPUT.PUT_LINE('Auto-install supporting objects: enabled.');
+END;
+/
+
+-- 3. Pre-supply base URLs for remote servers marked p_prompt_on_install=>true.
 --    Without this, wwv_imp_workspace.create_remote_server raises ORA-20001.
 --    The URLs below are extracted from the export file and match the source env;
 --    override with -r flags if the target uses a different OCI region/endpoint.
@@ -400,6 +410,120 @@ END;
 exit
 ACL_EOF
 echo "Role step complete."
+
+# ── Step 4: Configure Ollama AI service for the app workspace ─────────────────
+# Only runs when OLLAMA_BASE_URL is set in config.ini.
+# Creates (or updates) the APEX workspace credential and AI remote-server entry
+# for the local Ollama LLM.  The credential secret is stored via the APEX API so
+# it is properly encrypted — direct SQL INSERT leaves plaintext and causes ORA-28817.
+if [ -n "$OLLAMA_BASE_URL" ] && [ -n "$OLLAMA_MODEL" ]; then
+  echo ""
+  echo "=== Step 4: Configuring Ollama AI service for $SCHEMA_USER_UPPER ==="
+  # APEX requires the base URL to be the OpenAI-compatible root with /v1 path.
+  OLLAMA_API_URL="${OLLAMA_BASE_URL%/}/v1"
+
+  "$SQLPLUS" -s "system/$DEFAULT_PASSWORD@$SERVICE_NAME" << OLLAMA_EOF
+SET SERVEROUTPUT ON SIZE UNLIMITED
+WHENEVER SQLERROR CONTINUE
+
+DECLARE
+  v_ws_id      NUMBER;
+  v_apex_owner VARCHAR2(128);
+  v_cred_id    NUMBER;
+  v_srv_id     NUMBER;
+  v_static_id  VARCHAR2(100) := 'OLLAMA_LOCAL';
+  v_cred_sid   VARCHAR2(100) := 'OLLAMA_LOCAL_CRED';
+  v_base_url   VARCHAR2(500) := '$OLLAMA_API_URL';
+  v_model      VARCHAR2(100) := '$OLLAMA_MODEL';
+  v_sql        VARCHAR2(4000);
+BEGIN
+  -- Resolve workspace ID for this app
+  SELECT workspace_id INTO v_ws_id
+    FROM apex_workspaces
+   WHERE workspace = UPPER('$SCHEMA_USER_UPPER');
+
+  -- Discover APEX internal schema (e.g. APEX_240200)
+  SELECT username INTO v_apex_owner
+    FROM dba_users
+   WHERE username LIKE 'APEX_%'
+     AND oracle_maintained = 'Y'
+     AND username NOT IN ('APEX_PUBLIC_USER','APEX_LISTENER','APEX_REST_PUBLIC_USER','APEX_PUBLIC_ROUTER')
+     AND ROWNUM = 1;
+
+  -- Step A: Create or locate the workspace credential row (secret set in step B)
+  v_sql := 'SELECT id FROM ' || v_apex_owner || '.wwv_credentials'
+        || ' WHERE security_group_id = :ws AND static_id = :sid';
+  BEGIN
+    EXECUTE IMMEDIATE v_sql INTO v_cred_id USING v_ws_id, v_cred_sid;
+    DBMS_OUTPUT.PUT_LINE('Credential ' || v_cred_sid || ' exists (id=' || v_cred_id || ') — will re-encrypt.');
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      v_sql := 'SELECT ' || v_apex_owner || '.wwv_seq.nextval FROM dual';
+      EXECUTE IMMEDIATE v_sql INTO v_cred_id;
+      v_sql := 'INSERT INTO ' || v_apex_owner || '.wwv_credentials'
+            || ' (id, security_group_id, name, static_id,'
+            || '  authentication_type, client_id,'
+            || '  prompt_on_install,'
+            || '  created_by, created_on, last_updated_by, last_updated_on)'
+            || ' VALUES (:id, :ws, :nm, :sid,'
+            || '  ''HTTP_HEADER'', ''Authorization'','
+            || '  ''Y'','
+            || '  USER, SYSDATE, USER, SYSDATE)';
+      EXECUTE IMMEDIATE v_sql USING v_cred_id, v_ws_id, 'Ollama Local Credential', v_cred_sid;
+      DBMS_OUTPUT.PUT_LINE('Credential created: ' || v_cred_sid);
+  END;
+
+  -- Step B: Encrypt the secret via APEX API.
+  --   client_secret must be stored encrypted (DBMS_CRYPTO).  Direct INSERT of
+  --   plaintext raises ORA-28817 when APEX tries to decrypt it at runtime.
+  apex_util.set_workspace(p_workspace => '$SCHEMA_USER_UPPER');
+  apex_credential.set_persistent_credentials(
+    p_credential_static_id => v_cred_sid,
+    p_key                  => 'Authorization',
+    p_value                => 'Bearer ollama-no-auth-needed'
+  );
+  DBMS_OUTPUT.PUT_LINE('Credential secret encrypted.');
+
+  -- Step C: Create or update the Generative AI remote server entry
+  v_sql := 'SELECT id FROM ' || v_apex_owner || '.wwv_remote_servers'
+        || ' WHERE security_group_id = :ws AND static_id = :sid';
+  BEGIN
+    EXECUTE IMMEDIATE v_sql INTO v_srv_id USING v_ws_id, v_static_id;
+    v_sql := 'UPDATE ' || v_apex_owner || '.wwv_remote_servers'
+          || ' SET base_url = :url, ai_model_name = :mdl,'
+          || '     credential_id = :cid,'
+          || '     last_updated_on = SYSDATE, last_updated_by = USER'
+          || ' WHERE id = :id';
+    EXECUTE IMMEDIATE v_sql USING v_base_url, v_model, v_cred_id, v_srv_id;
+    DBMS_OUTPUT.PUT_LINE('AI service updated: ' || v_static_id || ' -> ' || v_base_url || ' (' || v_model || ')');
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      v_sql := 'SELECT ' || v_apex_owner || '.wwv_seq.nextval FROM dual';
+      EXECUTE IMMEDIATE v_sql INTO v_srv_id;
+      v_sql := 'INSERT INTO ' || v_apex_owner || '.wwv_remote_servers'
+            || ' (id, security_group_id, name, static_id, base_url,'
+            || '  server_type, ai_provider_type, ai_is_builder_service,'
+            || '  ai_model_name, credential_id, prompt_on_install,'
+            || '  created_by, created_on, last_updated_by, last_updated_on)'
+            || ' VALUES (:id, :ws, :nm, :sid, :url,'
+            || '  ''GENERATIVE_AI'', ''OPENAI'', ''N'','
+            || '  :mdl, :cid, ''Y'','
+            || '  USER, SYSDATE, USER, SYSDATE)';
+      EXECUTE IMMEDIATE v_sql USING v_srv_id, v_ws_id,
+        'Ollama Local', v_static_id, v_base_url, v_model, v_cred_id;
+      DBMS_OUTPUT.PUT_LINE('AI service created: ' || v_static_id || ' -> ' || v_base_url || ' (' || v_model || ')');
+  END;
+
+  COMMIT;
+END;
+/
+exit
+OLLAMA_EOF
+  echo "Ollama AI service step complete."
+else
+  echo ""
+  echo "=== Step 4: Skipped — OLLAMA_BASE_URL not set in config.ini ==="
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
