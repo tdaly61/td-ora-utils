@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-<<<<<<< HEAD
-set -euo pipefail
-=======
 
 # ─────────────────────────────────────────────────────────────────
 # Platform detection — runs first; everything else dispatches on PLATFORM/ARCH
@@ -15,7 +12,6 @@ detect_platform() {
     ARCH=$(uname -m)   # x86_64 | arm64 | aarch64
     echo "Detected platform: $PLATFORM / $ARCH"
 }
->>>>>>> 94f31f6 (now deploys DB container and ords/apex on m4 mac)
 
 # Read a single KEY=VALUE entry from CONFIG_FILE by exact key name.
 # Handles values containing '=' (e.g. URLs). Strips surrounding whitespace.
@@ -76,79 +72,6 @@ avail_kb_for_dir() {
 # Cleanup
 # ─────────────────────────────────────────────────────────────────
 cleanup() {
-<<<<<<< HEAD
-    echo "Cleaning up Oracle ADB setup artifacts..."
-
-    # Stop and remove only the Oracle containers (not all Docker)
-    echo "Stopping Oracle containers..."
-    docker stop oracle-db ords 2>/dev/null || true
-    docker rm oracle-db ords 2>/dev/null || true
-
-    # Remove Oracle images only
-    echo "Removing Oracle container images..."
-    docker rmi container-registry.oracle.com/database/free:latest 2>/dev/null || true
-    docker rmi container-registry.oracle.com/database/ords:latest 2>/dev/null || true
-
-    # Remove Oracle Instant Client
-    local home_dir="${SUDO_USER_HOME_DIR:-${HOME}}"
-    if [[ -d "${home_dir}/oraclient" ]]; then
-        echo "Removing Oracle Instant Client from ${home_dir}/oraclient..."
-        rm -rf "${home_dir}/oraclient"
-    fi
-
-    # Remove APEX download and extracted files
-    rm -f "${home_dir}/apex-latest.zip" 2>/dev/null || true
-    if [[ -d "${home_dir}/apex" ]]; then
-        echo "Removing APEX directory ${home_dir}/apex..."
-        rm -rf "${home_dir}/apex"
-    fi
-
-    # Remove ORDS config and generated files
-    if [[ -d "$RUN_DIR/ords_config" ]]; then
-        echo "Removing ORDS config..."
-        rm -rf "$RUN_DIR/ords_config"
-    fi
-    rm -f "$RUN_DIR/.env" 2>/dev/null || true
-    rm -f "$RUN_DIR/sql-scripts/create-users.sql" 2>/dev/null || true
-    rm -f "$RUN_DIR/sql-scripts/setup-ollama-ai.sql" 2>/dev/null || true
-
-    # Remove TNS and auth config
-    rm -rf "${home_dir}/auth" 2>/dev/null || true
-
-    # Clean environment from .bashrc (entries added by install_oracle_instant_client)
-    local bashrc="${home_dir}/.bashrc"
-    if [[ -f "$bashrc" ]]; then
-        echo "Removing Oracle environment variables from $bashrc..."
-        sed -i '/export TNS_ADMIN=/d; /export ORACLE_HOME=.*oraclient/d; /export LD_LIBRARY_PATH=.*oraclient/d; /export PATH=.*oraclient/d' "$bashrc"
-    fi
-
-    echo ""
-    echo "Cleanup complete. Removed: Oracle containers, images, Instant Client, APEX, ORDS config."
-    echo "Docker itself was NOT removed (may be used by other services)."
-    echo "Database data directory ~/db_data_dir was NOT removed. Delete manually if needed:"
-    echo "  rm -rf ${home_dir}/db_data_dir"
-    exit 0
-}
-
-# Function to ensure Docker is installed and started successfully
-ensure_docker_running() {
-    for i in {1..5}; do
-        if systemctl is-active --quiet docker; then
-            echo "Docker is running."
-            return
-        else
-            echo "Docker is not running yet. Starting Docker... (Attempt $i of 5)"
-            systemctl restart containerd > /dev/null 2>&1
-            systemctl restart docker > /dev/null 2>&1
-            sleep 30
-        fi
-    done
-
-    echo "Failed to start Docker after 5 attempts."
-    echo "Please try sudo systemctl restart docker as this may resolve the issue"
-    echo "and then run this script again."
-    exit 1
-=======
     echo "Cleaning up Docker and related configurations..."
     docker system prune -a -f --volumes
 
@@ -182,7 +105,6 @@ check_root_user() {
         echo "This script must be run as root. Please run as root or use sudo."
         exit 1
     fi
->>>>>>> 94f31f6 (now deploys DB container and ords/apex on m4 mac)
 }
 
 check_os() {
@@ -283,115 +205,31 @@ _check_docker_installed_mac() {
         echo "  https://www.docker.com/products/docker-desktop/"
         exit 1
     fi
-<<<<<<< HEAD
-    echo "OS user is set to $OS_USER."
-    
-    if [ -n "${SUDO_UID:-}" ]; then
-        SUDO_USER_NAME=$(getent passwd "$SUDO_UID" | cut -d: -f1)
-        echo "The UID of the user who invoked sudo is $SUDO_UID."
-        echo "The username of the user who invoked sudo is $SUDO_USER_NAME."
-        SUDO_USER_HOME_DIR=$(getent passwd "$SUDO_USER_NAME" | cut -d: -f6)
-=======
     echo "Docker found at $(command -v docker)"
 }
 
 check_docker_installed() {
     if [ "$PLATFORM" = "darwin" ]; then
         _check_docker_installed_mac
->>>>>>> 94f31f6 (now deploys DB container and ords/apex on m4 mac)
     else
         _check_docker_installed_linux
     fi
 }
 
-<<<<<<< HEAD
-
-# Function to check if the script is being run as root
-check_root_user() {
-    if [ "$EUID" -ne 0 ]; then
-        echo "This script must be run as root. Please run as root or use sudo."
-        exit 1
-    fi
-}
-
-# Function to check if the operating system is Ubuntu 22 or 24
-check_os() {
-    if ! lsb_release -a 2>/dev/null | grep -qE "Ubuntu (22|24)"; then
-        echo "This script is intended to run on Ubuntu 22 or 24. Exiting."
-        exit 1
-    fi
-}
-
-# Function to check if the hostname exists in /etc/hosts
-check_and_add_hostname() {
-    if ! grep -q "$HOSTNAME" /etc/hosts; then
-        echo "$HOSTNAME not found in /etc/hosts. Adding it."
-        sed -i "s/^\(127\.0\.0\.1\s.*\)/\1 $HOSTNAME/" /etc/hosts
-    fi
-}
-
-check_and_install_packages() {
-    # Check if the required packages are installed
-    for package in "$@"; do
-        if ! dpkg -l | grep -q "ii  $package"; then
-            echo "$package is not installed. Installing $package..."
-            apt install -y "$package"
-=======
 _ensure_docker_running_linux() {
     for i in {1..5}; do
         if systemctl is-active --quiet docker; then
             echo "Docker is running."
             return
->>>>>>> 94f31f6 (now deploys DB container and ords/apex on m4 mac)
         fi
         echo "Docker is not running yet. Starting Docker... (Attempt $i of 5)"
         systemctl restart containerd > /dev/null 2>&1
         systemctl restart docker > /dev/null 2>&1
         sleep 30
     done
-<<<<<<< HEAD
-}
-
-# Function to set up user and groups
-oracle_os_user_setup() {
-    echo "Setting up user and groups..."
-
-    # Define the group IDs
-    declare -A group_ids
-    group_ids=(
-        ["oinstall"]="54321"
-        ["dba"]="54322"
-        ["oper"]="54323"
-        ["backupdba"]="54324"
-        ["dginstall"]="54325"
-        ["kmdba"]="54326"
-        ["racdba"]="54330"
-    )
-
-    # Check and add groups if they do not exist
-    for group in "${!group_ids[@]}"; do
-        if ! getent group "$group" > /dev/null; then
-            groupadd -g "${group_ids[$group]}" "$group"
-        fi
-    done
-
-    # Check and add user if it does not exist
-    if ! id -u oracle > /dev/null 2>&1; then
-        useradd -u 54321 -g oinstall -G dba,oper,oinstall,backupdba,dginstall,kmdba,racdba oracle
-    fi
-}
-
-
-# Function to display usage
-usage() {
-    echo "Usage: $0 -c | -h"
-    echo "Options:"
-    echo "  -h  Display usage"
-=======
     echo "Failed to start Docker after 5 attempts."
     echo "Please try: sudo systemctl restart docker"
     echo "Then run this script again."
->>>>>>> 94f31f6 (now deploys DB container and ords/apex on m4 mac)
     exit 1
 }
 
@@ -718,99 +556,10 @@ oracle_registry_login() {
     echo "Oracle Container Registry login successful."
 }
 
-<<<<<<< HEAD
-# Function to install Oracle Instant Client
-
-install_oracle_instant_client() {
-    
-    ORACLE_CLIENT_DIR="$SUDO_USER_HOME_DIR/oraclient"
-    echo "oracle_client_dir is $ORACLE_CLIENT_DIR"
-
-    # BASIC_ZIP="instantclient-basic-linux.x64-23.6.0.24.10.zip"
-    # SQLPLUS_ZIP="instantclient-sqlplus-linux.x64-23.6.0.24.10.zip"
-    # BASIC_URL="https://download.oracle.com/otn_software/linux/instantclient/2360000/$BASIC_ZIP"
-    # SQLPLUS_URL="https://download.oracle.com/otn_software/linux/instantclient/2360000/$SQLPLUS_ZIP"
-    # INSTANT_CLIENT="instantclient_23_6"
-    BASHRC_FILE="$SUDO_USER_HOME_DIR/.bashrc"
-
-    # Ensure unzip is installed
-    if ! command -v unzip &> /dev/null; then
-        echo "Unzip is not installed. Installing unzip..."
-        sudo apt update
-        sudo apt install -y unzip
-    fi
-
-    # Install the client if not already installed
-    if [ -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
-        echo "Oracle Instant Client is already installed at $ORACLE_CLIENT_DIR/$INSTANT_CLIENT."
-    else 
-        # Create the oraclient directory
-        su - $SUDO_USER_NAME -c "mkdir -p $ORACLE_CLIENT_DIR"
-
-        # Download the zip files
-        su - $SUDO_USER_NAME -c "curl -o $ORACLE_CLIENT_DIR/$BASIC_ZIP $BASIC_URL" > /dev/null 2>&1
-        su - $SUDO_USER_NAME -c "curl -o $ORACLE_CLIENT_DIR/$SQLPLUS_ZIP $SQLPLUS_URL"  > /dev/null 2>&1
-
-        # Unzip the files
-        su - $SUDO_USER_NAME -c "unzip -o $ORACLE_CLIENT_DIR/$BASIC_ZIP -d $ORACLE_CLIENT_DIR"  > /dev/null 2>&1
-        su - $SUDO_USER_NAME -c "unzip -o $ORACLE_CLIENT_DIR/$SQLPLUS_ZIP -d $ORACLE_CLIENT_DIR"  > /dev/null 2>&1
-
-        # Check if the files are unzipped
-        if [ ! -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
-            echo " ** Error **  Oracle instant client is not correctly installed in $ORACLE_CLIENT_DIR."
-            exit 1  
-        fi
-    fi
-    echo "ok skipped insta-client-setup" 
-
-    # Set the environment variables
-    export ORACLE_HOME="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
-    export LD_LIBRARY_PATH="$ORACLE_HOME"
-
-    # libaio package and symlink differ between Ubuntu versions
-    UBUNTU_VER=$(lsb_release -rs | cut -d. -f1)
-    if [ "$UBUNTU_VER" -ge 24 ]; then
-        # Ubuntu 24+: library is libaio.so.1t64; instant client needs libaio.so.1 symlink
-        apt-get install -y libaio1t64
-        LIBAIO_TARGET="/usr/lib/x86_64-linux-gnu/libaio.so.1t64"
-    else
-        # Ubuntu 22: library is libaio.so.1.0.1; instant client needs libaio.so.1 symlink
-        apt-get install -y libaio1
-        LIBAIO_TARGET="/usr/lib/x86_64-linux-gnu/libaio.so.1.0.1"
-    fi
-    # Ensure libaio.so.1 symlink exists and points to the correct target
-    LIBAIO_LINK="/usr/lib/x86_64-linux-gnu/libaio.so.1"
-    if [ ! -e "$LIBAIO_LINK" ] || [ "$(readlink "$LIBAIO_LINK")" != "$LIBAIO_TARGET" ]; then
-        echo "Creating/fixing libaio.so.1 symlink -> $LIBAIO_TARGET"
-        ln -sf "$LIBAIO_TARGET" "$LIBAIO_LINK"
-    fi
-
-    # Add environment variables to .bashrc if not already present
-    if ! grep -q "export TNS_ADMIN=$WALLET_DIR" "$BASHRC_FILE"; then
-        echo "export TNS_ADMIN=$WALLET_DIR" >> "$BASHRC_FILE"
-    fi
-
-    if ! grep -q "export ORACLE_HOME=$ORACLE_HOME" "$BASHRC_FILE"; then
-        echo "export ORACLE_HOME=$ORACLE_HOME" >> "$BASHRC_FILE"
-    fi
-
-    if ! grep -q "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH" "$BASHRC_FILE"; then
-        echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$BASHRC_FILE"
-    fi
-
-    if ! grep -q "export PATH=$ORACLE_HOME:\$PATH" "$BASHRC_FILE"; then
-        echo "export PATH=$ORACLE_HOME:\$PATH" >> "$BASHRC_FILE"
-    fi
-
-}
-
-# Function to determine the volume path and change ownership
-=======
 # ─────────────────────────────────────────────────────────────────
 # Volume ownership — Linux only
 # Docker Desktop on Mac manages uid/gid mapping inside its VM.
 # ─────────────────────────────────────────────────────────────────
->>>>>>> 94f31f6 (now deploys DB container and ords/apex on m4 mac)
 change_volume_ownership() {
     if [ "$PLATFORM" = "darwin" ]; then
         return
@@ -828,25 +577,6 @@ create_docker_volume() {
     echo "Creating Docker volume $VOL_NAME..."
     if docker volume inspect "$VOL_NAME" >/dev/null 2>&1; then
         echo "Warning: Volume '$VOL_NAME' already exists."
-<<<<<<< HEAD
-        read -t 30 -p "Do you want to use the existing volume? (y/n): " choice || choice="y"
-        case "$choice" in 
-            y|Y ) 
-                echo "Using existing volume '$VOL_NAME'."
-                ;;
-            n|N ) 
-                echo "Exiting. Please remove the existing volume with 'docker volume rm $VOL_NAME' before trying again."
-                exit 1
-                ;;
-            * ) 
-                echo "Invalid choice. Exiting."
-                exit 1
-                ;;
-        esac
-    else
-        # create a local volume
-        docker volume create "$VOL_NAME"
-=======
         read -p "Do you want to use the existing volume? (y/n): " choice
         case "$choice" in
             y|Y ) echo "Using existing volume '$VOL_NAME'." ;;
@@ -855,8 +585,73 @@ create_docker_volume() {
         esac
     else
         docker volume create $VOL_NAME
->>>>>>> 94f31f6 (now deploys DB container and ords/apex on m4 mac)
         change_volume_ownership
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────
+# Ollama installation and model launch
+# ─────────────────────────────────────────────────────────────────
+_install_ollama_linux() {
+    if command -v ollama &>/dev/null; then
+        echo "Ollama already installed: $(ollama --version 2>/dev/null || echo 'unknown version')"
+        return
+    fi
+    echo "Installing Ollama..."
+    curl -fsSL https://ollama.com/install.sh | sh
+    sleep 3
+    if ! command -v ollama &>/dev/null; then
+        echo "** Error ** Ollama installation failed."
+        exit 1
+    fi
+    echo "Ollama installed: $(ollama --version 2>/dev/null)"
+}
+
+_install_ollama_mac() {
+    if command -v ollama &>/dev/null; then
+        echo "Ollama already installed: $(ollama --version 2>/dev/null || echo 'unknown version')"
+        return
+    fi
+    if command -v brew &>/dev/null; then
+        echo "Installing Ollama via Homebrew..."
+        brew install ollama
+    else
+        echo "Ollama not found. Install it from https://ollama.com/download or: brew install ollama"
+        exit 1
+    fi
+}
+
+install_ollama() {
+    if [ "$PLATFORM" = "darwin" ]; then
+        _install_ollama_mac
+    else
+        _install_ollama_linux
+    fi
+}
+
+launch_ollama_model() {
+    local model="${OLLAMA_MODEL:-qwen3-coder-cc:latest}"
+
+    if [ "$PLATFORM" = "linux" ]; then
+        # Ensure the systemd service is running (ollama install.sh creates it)
+        if ! systemctl is-active --quiet ollama 2>/dev/null; then
+            echo "Starting ollama service..."
+            systemctl enable ollama 2>/dev/null || true
+            systemctl start ollama 2>/dev/null || true
+            sleep 3
+        fi
+        local run_as="${SUDO_USER_NAME:-$(id -un)}"
+        echo "Launching ollama model $model as $run_as..."
+        su - "$run_as" -c "OLLAMA_KEEP_ALIVE=1h ollama launch claude --model $model"
+    else
+        # macOS: start ollama serve in the background if not already running
+        if ! pgrep -x ollama &>/dev/null; then
+            echo "Starting ollama server in background..."
+            OLLAMA_KEEP_ALIVE=1h ollama serve &>/dev/null &
+            sleep 3
+        fi
+        echo "Launching ollama model $model..."
+        OLLAMA_KEEP_ALIVE=1h ollama launch claude --model "$model"
     fi
 }
 
@@ -896,42 +691,6 @@ preflight_check() {
     fi
 }
 
-<<<<<<< HEAD
-# Function to install Python packages needed by caseweave / weave32 utility scripts.
-# Includes: Oracle DB driver, image processing, face recognition, and their build deps.
-# LLM inference uses local Ollama via HTTP — no extra Python packages required.
-install_python_deps() {
-    echo "Installing Python build dependencies for caseweave utils..."
-
-    # System packages needed to compile dlib (required by face_recognition)
-    local BUILD_PKGS=(cmake libopenblas-dev liblapack-dev python3-dev)
-    for pkg in "${BUILD_PKGS[@]}"; do
-        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
-            echo "  Installing $pkg..."
-            apt-get install -y "$pkg"
-        fi
-    done
-
-    # Determine pip flags — PEP 668 externally-managed envs (Ubuntu 24+)
-    local PIP_FLAGS=""
-    if "$PYTHON_BIN" -c "import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)" 2>/dev/null; then
-        PIP_FLAGS="--break-system-packages"
-    fi
-
-    echo "Installing Python packages (as $SUDO_USER_NAME)..."
-    su - "$SUDO_USER_NAME" -c "$PYTHON_BIN -m pip install $PIP_FLAGS \
-        oracledb \
-        Pillow \
-        geopy \
-        numpy \
-        opencv-python-headless \
-        face_recognition"
-
-    echo "Python dependencies installed."
-}
-
-####### main code #######
-=======
 # ─────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────
@@ -956,6 +715,7 @@ read_config() {
     ORACLE_REGISTRY_PASSWORD=$(ini_val ORACLE_REGISTRY_PASSWORD)
     DOCKER_IMAGE=$(ini_val DOCKER_IMAGE)
     APEX_DIR=$(ini_val APEX_DIR)
+    OLLAMA_MODEL=$(ini_val OLLAMA_MODEL)   # optional; defaults to qwen3-coder-cc:latest
 
     if [ "$PLATFORM" = "darwin" ]; then
         # Mac: prefer *_MAC keys, fall back to generic keys if Mac-specific ones are absent
@@ -996,7 +756,6 @@ read_config() {
 ####### main #######
 PLATFORM=""
 ARCH=""
->>>>>>> 94f31f6 (now deploys DB container and ords/apex on m4 mac)
 SUDO_USER_NAME=""
 SUDO_USER_HOME_DIR=""
 TNS_ADMIN=""
@@ -1005,15 +764,6 @@ ORACLE_CLIENT_DIR=""
 INSTANT_CLIENT=""
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-<<<<<<< HEAD
-############# don't change these ############
-RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )" # the directory that this script is in
-
-# Resolve the invoking user early (needed by cleanup)
-set_sudo_user
-
-# Parse arguments before read_config so cleanup doesn't need a valid config
-=======
 RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 detect_platform
@@ -1021,7 +771,6 @@ detect_platform
 read_config
 set_sudo_user
 
->>>>>>> 94f31f6 (now deploys DB container and ords/apex on m4 mac)
 while getopts "hc" opt; do
     case ${opt} in
         h ) usage ;;
@@ -1030,13 +779,6 @@ while getopts "hc" opt; do
     esac
 done
 
-<<<<<<< HEAD
-# Read configuration (only reached if not cleanup/help)
-read_config
-
-# Call the functions to perform the checks
-=======
->>>>>>> 94f31f6 (now deploys DB container and ords/apex on m4 mac)
 check_root_user
 check_os
 preflight_check
@@ -1052,6 +794,8 @@ check_docker_compose
 prepare_apex
 create_ords_config_dir
 install_python_deps
+install_ollama
+launch_ollama_model
 
 # Fix ownership of files created as root during this or prior sudo runs (Linux only).
 if [ "$PLATFORM" = "linux" ] && [ -n "$SUDO_USER_NAME" ]; then

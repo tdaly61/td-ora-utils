@@ -4,7 +4,7 @@ BEGIN
    DBMS_VECTOR.LOAD_ONNX_MODEL(
         directory => 'DATA_PUMP_DIR',
         file_name => 'model.onnx',
-        model_name => 'ALL_MINILM');
+        model_name => 'DOC_MODEL');
 END;
 /
 
