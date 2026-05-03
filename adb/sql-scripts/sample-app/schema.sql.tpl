@@ -1,5 +1,5 @@
 -- sample-app-schema.sql
--- Creates the NOTES table (with 23ai VECTOR column) and loads sample data
+-- Creates the NOTES table (with 26ai VECTOR column) and loads sample data
 -- with semantic embeddings generated from the ALL_MINILM ONNX model.
 -- Run as __APEX_USER__ (generated from sample-app-schema.sql.tpl)
 
@@ -17,18 +17,18 @@ CREATE TABLE notes (
     body         VARCHAR2(4000) NOT NULL,
     category     VARCHAR2(50)   DEFAULT 'General',
     created_date DATE           DEFAULT SYSDATE,
-    embedding    VECTOR         -- 23ai: semantic embedding of title || ' ' || body
+    embedding    VECTOR         -- 26ai: semantic embedding of title || ' ' || body
 );
 
 -- ── Sample data ─────────────────────────────────────────────────────────────
 INSERT INTO notes (title, body, category) VALUES (
-  'Setting up Oracle Database Free 23ai',
-  'Oracle Database Free 23ai runs in a Docker container. Use docker compose to start it alongside ORDS and APEX. The database supports JSON Relational Duality, True Cache, and native vector search.',
+  'Setting up Oracle Database Free 26ai',
+  'Oracle Database Free 26ai runs in a Docker container. Use docker compose to start it alongside ORDS and APEX. The database supports JSON Relational Duality, True Cache, and native vector search.',
   'Database'
 );
 INSERT INTO notes (title, body, category) VALUES (
   'What is vector search?',
-  'Vector search finds semantically similar content by comparing high-dimensional embeddings rather than exact keywords. Oracle 23ai stores vectors natively in the VECTOR datatype and supports approximate nearest-neighbour (ANN) search with HNSW and IVF indexes.',
+  'Vector search finds semantically similar content by comparing high-dimensional embeddings rather than exact keywords. Oracle 26ai stores vectors natively in the VECTOR datatype and supports approximate nearest-neighbour (ANN) search with HNSW and IVF indexes.',
   'AI'
 );
 INSERT INTO notes (title, body, category) VALUES (
@@ -57,7 +57,7 @@ INSERT INTO notes (title, body, category) VALUES (
   'APEX'
 );
 INSERT INTO notes (title, body, category) VALUES (
-  'JSON Relational Duality in 23ai',
+  'JSON Relational Duality in 26ai',
   'Duality Views expose relational tables as JSON documents. Applications can read and write JSON while the database stores it relationally. Changes via the JSON interface are immediately visible in relational queries and vice versa.',
   'Database'
 );

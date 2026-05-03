@@ -36,7 +36,7 @@ _resolve_docker_mac() {
     # Fix 1: socket missing for the active context → find a working one
     if echo "$err" | grep -qE "no such file or directory|cannot connect|connection refused"; then
         local ctx
-        for ctx in desktop-linux default orbstack; do
+        for ctx in rancher-desktop desktop-linux default orbstack; do
             if docker context use "$ctx" &>/dev/null 2>&1; then
                 err=$(docker info 2>&1)
                 if ! echo "$err" | grep -qE "no such file or directory|cannot connect|connection refused"; then
@@ -565,7 +565,18 @@ REMOVE_IMAGES=false
 RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 detect_platform
-[ "$PLATFORM" = "darwin" ] && _resolve_docker_mac
+if [ "$PLATFORM" = "darwin" ]; then
+    # Read CONTAINER_RUNTIME early (before full read_config) so we can set the right
+    # docker context before any docker command runs.
+    _early_runtime=$(grep -m1 "^CONTAINER_RUNTIME=" "$RUN_DIR/config.ini" 2>/dev/null | cut -d'=' -f2- | tr -d ' \n\r')
+    _early_runtime="${_early_runtime:-auto}"
+    if [ "$_early_runtime" = "rancher" ]; then
+        [[ ":$PATH:" != *":$HOME/.rd/bin:"* ]] && export PATH="$HOME/.rd/bin:$PATH"
+        docker context use rancher-desktop &>/dev/null 2>&1 || true
+    fi
+    unset _early_runtime
+    _resolve_docker_mac
+fi
 
 # On Linux: if docker isn't accessible, try to apply the docker group without requiring a logout.
 # We check /etc/group (via id -nG) rather than the current session's groups,
@@ -703,5 +714,8 @@ echo "4. APEX:       http://localhost:$APEX_PORT/ords/apex  (Workspace/User: $AP
 echo "5. EM Express: https://localhost:5500/em"
 echo "6. SQLplus:    $ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus system/$DEFAULT_PASSWORD@$SERVICE_NAME"
 echo "7. SSH tunnel: ssh -L $APEX_PORT:localhost:$APEX_PORT -L 5500:localhost:5500 -N ubuntu@<server-ip>"
+_ollama_cfg=$(ini_val LLM_OLLAMA_LOCAL)
+OLLAMA_BASE_URL="${_ollama_cfg%%|*}"
+OLLAMA_MODEL="$(echo "$_ollama_cfg" | awk -F'|' '{print $2}')"
 echo "8. Ollama:     $OLLAMA_BASE_URL (model: $OLLAMA_MODEL)"
 echo "   Test SQL:   SELECT DBMS_VECTOR_CHAIN.UTL_TO_GENERATE_TEXT('Hello', JSON('{\"provider\":\"ollama\",\"host\":\"$OLLAMA_BASE_URL\",\"model\":\"$OLLAMA_MODEL\"}')) FROM dual;"

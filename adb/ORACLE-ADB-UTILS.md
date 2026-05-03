@@ -1,6 +1,6 @@
 # Oracle Autonomous Database (ADB) 26ai Container Setup
 
-Scripts and configuration to run Oracle Database Free 23ai with APEX and ORDS locally using Docker Compose. Includes an ONNX embedding model for vector search. Intended for **demo and POC use only** — not hardened for production.
+Scripts and configuration to run Oracle Database Free 26ai with APEX and ORDS locally using Docker Compose. Includes an ONNX embedding model for vector search. Intended for **demo and POC use only** — not hardened for production.
 
 > Reference: [Oracle ADB Container Free docs](https://docs.oracle.com/en-us/iaas/autonomous-database-serverless/doc/autonomous-database-container-free.html#GUID-B2E52334-2171-47F0-B951-B8007DD1B63C)
 

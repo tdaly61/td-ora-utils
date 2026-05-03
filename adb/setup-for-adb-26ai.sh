@@ -36,7 +36,7 @@ _resolve_docker_mac() {
     # Fix 1: socket missing for the active context → find a working one
     if echo "$err" | grep -qE "no such file or directory|cannot connect|connection refused"; then
         local ctx
-        for ctx in desktop-linux default orbstack; do
+        for ctx in rancher-desktop desktop-linux default orbstack; do
             if docker context use "$ctx" &>/dev/null 2>&1; then
                 err=$(docker info 2>&1)
                 if ! echo "$err" | grep -qE "no such file or directory|cannot connect|connection refused"; then
@@ -200,12 +200,63 @@ _check_docker_installed_linux() {
 }
 
 _check_docker_installed_mac() {
-    if ! command -v docker &>/dev/null; then
-        echo "Docker not found. Please install Docker Desktop for Mac:"
-        echo "  https://www.docker.com/products/docker-desktop/"
+    local runtime="${CONTAINER_RUNTIME:-auto}"
+
+    # Rancher Desktop: docker lives at ~/.rd/bin/docker (may not be on PATH under sudo)
+    if [ "$runtime" = "rancher" ]; then
+        # Docker Desktop must not be installed — it hijacks ~/.docker/cli-plugins/ and
+        # breaks docker compose / buildx even when its daemon is not running.
+        if [ -d "/Applications/Docker.app" ]; then
+            echo ""
+            echo "** Error: Docker Desktop is installed but CONTAINER_RUNTIME=rancher is set."
+            echo "   Docker Desktop hijacks ~/.docker/cli-plugins/ and breaks Rancher Desktop's"
+            echo "   docker compose and buildx plugins even when Docker Desktop is not running."
+            echo ""
+            echo "   Remove Docker Desktop before running this script again:"
+            echo ""
+            echo "   Option 1 — built-in uninstaller then remove the app bundle (DMG install):"
+            echo "     sudo /Applications/Docker.app/Contents/MacOS/uninstall"
+            echo "     rm -rf /Applications/Docker.app"
+            echo ""
+            echo "   Option 2 — Homebrew (if installed via brew):"
+            echo "     brew uninstall --cask docker"
+            echo ""
+            echo "   Rancher Desktop provides docker, docker-compose, buildx, kubectl and helm"
+            echo "   — Docker Desktop is not needed."
+            echo ""
+            exit 1
+        fi
+
+        local rd_docker="$HOME/.rd/bin/docker"
+        if [ -x "$rd_docker" ]; then
+            [[ ":$PATH:" != *":$HOME/.rd/bin:"* ]] && export PATH="$HOME/.rd/bin:$PATH"
+            echo "Rancher Desktop docker found at $rd_docker"
+            return
+        fi
+        if [ -d "/Applications/Rancher Desktop.app" ]; then
+            # App installed but not yet started — docker binary appears after first start
+            return
+        fi
+        echo "Rancher Desktop not found. Install from https://rancherdesktop.io/"
+        echo "Or change CONTAINER_RUNTIME to docker_desktop or auto in config.ini."
         exit 1
     fi
-    echo "Docker found at $(command -v docker)"
+
+    # For all other runtimes: add ~/.rd/bin to PATH if Rancher Desktop is installed
+    [ -d "/Applications/Rancher Desktop.app" ] && \
+        [[ ":$PATH:" != *":$HOME/.rd/bin:"* ]] && \
+        export PATH="$HOME/.rd/bin:$PATH"
+
+    if command -v docker &>/dev/null; then
+        echo "Docker found at $(command -v docker)"
+        return
+    fi
+
+    echo "Docker not found. Install one of:"
+    echo "  Rancher Desktop (set CONTAINER_RUNTIME=rancher): https://rancherdesktop.io/"
+    echo "  Docker Desktop:  https://www.docker.com/products/docker-desktop/"
+    echo "  OrbStack:        https://orbstack.dev/"
+    exit 1
 }
 
 check_docker_installed() {
@@ -234,40 +285,92 @@ _ensure_docker_running_linux() {
 }
 
 _ensure_docker_running_mac() {
-    # Fix context/API issues before checking if Docker is up
-    _resolve_docker_mac
+    # Ensure ~/.rd/bin is on PATH whenever Rancher Desktop is installed
+    [ -d "/Applications/Rancher Desktop.app" ] && \
+        [[ ":$PATH:" != *":$HOME/.rd/bin:"* ]] && \
+        export PATH="$HOME/.rd/bin:$PATH"
 
+    # When rancher runtime is requested, force the rancher-desktop context before
+    # checking docker — otherwise a running Docker Desktop satisfies docker info
+    # and the script never configures Rancher Desktop.
+    if [ "${CONTAINER_RUNTIME:-auto}" = "rancher" ]; then
+        docker context use rancher-desktop &>/dev/null 2>&1 || true
+    fi
+
+    _resolve_docker_mac
     if docker info &>/dev/null 2>&1; then
         echo "Docker is running."
         return
     fi
 
-    # Identify which app to launch: prefer whichever is installed
-    local docker_app=""
-    [ -d "/Applications/OrbStack.app" ]      && docker_app="OrbStack"
-    [ -z "$docker_app" ] && [ -d "/Applications/Docker.app" ] && docker_app="Docker"
-    if [ -z "$docker_app" ]; then
-        echo "No Docker runtime found. Install Docker Desktop or OrbStack:"
-        echo "  https://www.docker.com/products/docker-desktop/"
-        exit 1
-    fi
+    local runtime="${CONTAINER_RUNTIME:-auto}"
 
-    echo "Docker is not running. Launching $docker_app..."
-    open -a "$docker_app" || { echo "Could not launch $docker_app."; exit 1; }
+    # Build try-order: preferred runtime first, then fall back to others that are installed
+    local -a try_order=()
+    case "$runtime" in
+        rancher)        try_order=(rancher docker_desktop orbstack) ;;
+        docker_desktop) try_order=(docker_desktop orbstack rancher) ;;
+        orbstack)       try_order=(orbstack docker_desktop rancher) ;;
+        *)              try_order=(orbstack docker_desktop rancher) ;;  # auto
+    esac
 
-    echo "Waiting for Docker to start (up to 60 seconds)..."
-    for i in {1..12}; do
-        sleep 5
-        _resolve_docker_mac
-        if docker info &>/dev/null 2>&1; then
-            echo "Docker is running."
-            return
-        fi
-        echo "  Still waiting... ($((i * 5))s)"
+    for rt in "${try_order[@]}"; do
+        case "$rt" in
+            rancher)
+                [ -d "/Applications/Rancher Desktop.app" ] || continue
+                local rdctl=""
+                for candidate in \
+                    "$HOME/.rd/bin/rdctl" \
+                    "/Applications/Rancher Desktop.app/Contents/Resources/resources/darwin/bin/rdctl" \
+                    "/usr/local/bin/rdctl" "/opt/homebrew/bin/rdctl"; do
+                    [ -x "$candidate" ] && rdctl="$candidate" && break
+                done
+                [ -z "$rdctl" ] && continue
+                echo "Starting Rancher Desktop..."
+                "$rdctl" start --application.start-in-background
+                echo "Waiting for Rancher Desktop to become ready (up to 120 seconds)..."
+                for i in {1..24}; do
+                    sleep 5
+                    [[ ":$PATH:" != *":$HOME/.rd/bin:"* ]] && export PATH="$HOME/.rd/bin:$PATH"
+                    _resolve_docker_mac
+                    if docker info &>/dev/null 2>&1; then echo "Docker is running."; return; fi
+                    echo "  Still waiting... ($((i * 5))s)"
+                done
+                echo "  Rancher Desktop did not become ready within 120 seconds."
+                ;;
+            docker_desktop)
+                [ -d "/Applications/Docker.app" ] || continue
+                echo "Starting Docker Desktop..."
+                open -a "Docker" || continue
+                echo "Waiting for Docker Desktop to start (up to 60 seconds)..."
+                for i in {1..12}; do
+                    sleep 5
+                    _resolve_docker_mac
+                    if docker info &>/dev/null 2>&1; then echo "Docker is running."; return; fi
+                    echo "  Still waiting... ($((i * 5))s)"
+                done
+                echo "  Docker Desktop did not start within 60 seconds."
+                ;;
+            orbstack)
+                [ -d "/Applications/OrbStack.app" ] || continue
+                echo "Starting OrbStack..."
+                open -a "OrbStack" || continue
+                echo "Waiting for OrbStack to start (up to 60 seconds)..."
+                for i in {1..12}; do
+                    sleep 5
+                    _resolve_docker_mac
+                    if docker info &>/dev/null 2>&1; then echo "Docker is running."; return; fi
+                    echo "  Still waiting... ($((i * 5))s)"
+                done
+                echo "  OrbStack did not start within 60 seconds."
+                ;;
+        esac
     done
 
-    echo "$docker_app did not start within 60 seconds."
-    echo "Try starting it manually from Applications and run this script again."
+    echo "No Docker runtime could be started. Install one of:"
+    echo "  Rancher Desktop: https://rancherdesktop.io/"
+    echo "  Docker Desktop:  https://www.docker.com/products/docker-desktop/"
+    echo "  OrbStack:        https://orbstack.dev/"
     exit 1
 }
 
@@ -716,6 +819,8 @@ read_config() {
     DOCKER_IMAGE=$(ini_val DOCKER_IMAGE)
     APEX_DIR=$(ini_val APEX_DIR)
     OLLAMA_MODEL=$(ini_val OLLAMA_MODEL)   # optional; defaults to qwen3-coder-cc:latest
+    CONTAINER_RUNTIME=$(ini_val CONTAINER_RUNTIME)
+    CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-auto}"
 
     if [ "$PLATFORM" = "darwin" ]; then
         # Mac: prefer *_MAC keys, fall back to generic keys if Mac-specific ones are absent
@@ -794,8 +899,8 @@ check_docker_compose
 prepare_apex
 create_ords_config_dir
 install_python_deps
-install_ollama
-launch_ollama_model
+# install_ollama
+# launch_ollama_model
 
 # Fix ownership of files created as root during this or prior sudo runs (Linux only).
 if [ "$PLATFORM" = "linux" ] && [ -n "$SUDO_USER_NAME" ]; then

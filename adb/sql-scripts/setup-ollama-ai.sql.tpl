@@ -1,6 +1,6 @@
 -- setup-ollama-ai.sql
 -- Configures outbound network access and registers Ollama as a generative AI
--- provider so the Oracle 23ai Free database can call a local LLM.
+-- provider so the Oracle 26ai Free database can call a local LLM.
 -- Run as: SYSTEM (connected via sqlplus from the host) against FREEPDB1.
 -- Grants that require SYS are executed inside the DB container by
 -- run-adb-26ai.sh (see run_sql_file_as_sysdba).

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # load-sample-app.sh
 # Loads the sample Notes & Vector Search APEX application into the running
-# Oracle 23ai + APEX environment.
+# Oracle 26ai + APEX environment.
 #
 # Prerequisites:
 #   - run-adb-26ai.sh has already completed successfully

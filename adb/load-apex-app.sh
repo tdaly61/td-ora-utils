@@ -50,11 +50,9 @@ Options:
                       (default: APEX_PASSWORD from config.ini, else DEFAULT_PASSWORD)
   -s <service_name>   Oracle service name
                       (default: SERVICE_NAME from config.ini)
-  -r STATIC_ID=URL    Override base URL for a remote server marked prompt_on_install
-                      in the export file.  Repeat the flag for multiple servers.
-                      Supported IDs:
-                        OCI_GROK_BIG
-                        META_LLAMA_33_70B_INSTRUCT
+  -r STATIC_ID=URL    Override the base URL for a remote server at install time.
+                      Repeat the flag for multiple servers.
+                      Default URLs come from LLM_<STATIC_ID> entries in config.ini.
                       Example: -r OCI_GROK_BIG=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com
   -h                  Show this help message and exit
 
@@ -94,15 +92,23 @@ INSTANT_CLIENT=$(cfg_val INSTANT_CLIENT)
 APEX_PORT=$(cfg_val APEX_PORT);     APEX_PORT=${APEX_PORT:-8080}
 APEX_USER=$(cfg_val APEX_USER);     APEX_USER=${APEX_USER:-TRACKER1}
 APEX_PASSWORD=$(cfg_val APEX_PASSWORD); APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
-OLLAMA_BASE_URL=$(cfg_val OLLAMA_BASE_URL)
-OLLAMA_MODEL=$(cfg_val OLLAMA_MODEL)
+# Read LLM_<STATIC_ID>=<url>|<model>|<type> entries from config.ini
+declare -A LLM_URL=()
+declare -A LLM_MODEL=()
+declare -A LLM_TYPE=()
+while IFS= read -r _cfg_line; do
+  if [[ "$_cfg_line" =~ ^LLM_([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*([^|]+)\|([^|]+)\|([^|[:space:]]+) ]]; then
+    LLM_URL["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+    LLM_MODEL["${BASH_REMATCH[1]}"]="${BASH_REMATCH[3]}"
+    LLM_TYPE["${BASH_REMATCH[1]}"]="${BASH_REMATCH[4]}"
+  fi
+done < "$CONFIG_FILE"
 
 # ── Parse options ─────────────────────────────────────────────────────────────
 APEX_SQL=""
 OVERRIDE_USER=""
 OVERRIDE_PASS=""
-RS_OCI_GROK_BIG=""
-RS_META_LLAMA=""
+declare -A RS_OVERRIDES=()
 
 while getopts ":f:u:p:s:r:h" opt; do
   case $opt in
@@ -113,17 +119,29 @@ while getopts ":f:u:p:s:r:h" opt; do
     r) # FORMAT:  STATIC_ID=https://...
        _rs_id="${OPTARG%%=*}"
        _rs_url="${OPTARG#*=}"
-       case "$_rs_id" in
-         OCI_GROK_BIG)           RS_OCI_GROK_BIG="$_rs_url" ;;
-         META_LLAMA_33_70B_INSTRUCT) RS_META_LLAMA="$_rs_url" ;;
-         *) echo "WARN: Unknown remote server static ID '$_rs_id' — ignored." ;;
-       esac ;;
+       RS_OVERRIDES["$_rs_id"]="$_rs_url" ;;
     h) usage ;;
     :) echo "ERROR: -$OPTARG requires an argument."; exit 1 ;;
     \?) echo "ERROR: Unknown option -$OPTARG"; exit 1 ;;
   esac
 done
 shift $((OPTIND - 1))
+
+# Merge LLM config URLs with any -r overrides (overrides win), then build Step 2 PL/SQL
+declare -A RS_FINAL=()
+for _rs_key in "${!LLM_URL[@]}"; do
+  RS_FINAL["$_rs_key"]="${RS_OVERRIDES[$_rs_key]:-${LLM_URL[$_rs_key]}}"
+done
+for _rs_key in "${!RS_OVERRIDES[@]}"; do
+  RS_FINAL["$_rs_key"]="${RS_OVERRIDES[$_rs_key]}"
+done
+
+_RS_BLOCK=""
+for _rs_key in "${!RS_FINAL[@]}"; do
+  [ -z "$_RS_BLOCK" ] && _RS_BLOCK="BEGIN"$'\n'
+  _RS_BLOCK+="  apex_application_install.set_remote_server(p_static_id => '${_rs_key}', p_base_url => '${RS_FINAL[$_rs_key]}');"$'\n'
+done
+[ -n "$_RS_BLOCK" ] && _RS_BLOCK+="  DBMS_OUTPUT.PUT_LINE('Remote server base URLs set.');"$'\n'"END;"$'\n'"/"
 
 # ── Resolve APEX export file ──────────────────────────────────────────────────
 if [ -z "$APEX_SQL" ]; then
@@ -342,20 +360,8 @@ END;
 
 -- 3. Pre-supply base URLs for remote servers marked p_prompt_on_install=>true.
 --    Without this, wwv_imp_workspace.create_remote_server raises ORA-20001.
---    The URLs below are extracted from the export file and match the source env;
---    override with -r flags if the target uses a different OCI region/endpoint.
-BEGIN
-  apex_application_install.set_remote_server(
-    p_static_id => 'OCI_GROK_BIG',
-    p_base_url  => nvl('$RS_OCI_GROK_BIG', 'https://inference.generativeai.us-chicago-1.oci.oraclecloud.com')
-  );
-  apex_application_install.set_remote_server(
-    p_static_id => 'META_LLAMA_33_70B_INSTRUCT',
-    p_base_url  => nvl('$RS_META_LLAMA', 'https://inference.generativeai.us-chicago-1.oci.oraclecloud.com')
-  );
-  DBMS_OUTPUT.PUT_LINE('Remote server base URLs set.');
-END;
-/
+--    Entries are read from LLM_* keys in config.ini; override with -r flags.
+$_RS_BLOCK
 
 @$APEX_SQL
 exit
@@ -411,16 +417,20 @@ exit
 ACL_EOF
 echo "Role step complete."
 
-# ── Step 4: Configure Ollama AI service for the app workspace ─────────────────
-# Only runs when OLLAMA_BASE_URL is set in config.ini.
-# Creates (or updates) the APEX workspace credential and AI remote-server entry
-# for the local Ollama LLM.  The credential secret is stored via the APEX API so
-# it is properly encrypted — direct SQL INSERT leaves plaintext and causes ORA-28817.
-if [ -n "$OLLAMA_BASE_URL" ] && [ -n "$OLLAMA_MODEL" ]; then
+# ── Step 4: Configure local LLM AI services for the app workspace ──────────────
+# Runs for each LLM_* entry with type=local in config.ini.
+# Creates (or updates) an encrypted APEX workspace credential and Generative AI
+# remote server entry.  The credential secret is stored via the APEX API so it
+# is properly encrypted — direct SQL INSERT leaves plaintext and causes ORA-28817.
+_local_llm_count=0
+for _LLM_ID in "${!LLM_TYPE[@]}"; do
+  [ "${LLM_TYPE[$_LLM_ID]}" != "local" ] && continue
+  _local_llm_count=$((_local_llm_count + 1))
+  _LLM_API_URL="${LLM_URL[$_LLM_ID]%/}/v1"
+  _LLM_MODEL="${LLM_MODEL[$_LLM_ID]}"
+  _LLM_CRED_SID="${_LLM_ID}_CRED"
   echo ""
-  echo "=== Step 4: Configuring Ollama AI service for $SCHEMA_USER_UPPER ==="
-  # APEX requires the base URL to be the OpenAI-compatible root with /v1 path.
-  OLLAMA_API_URL="${OLLAMA_BASE_URL%/}/v1"
+  echo "=== Step 4: Configuring local LLM '${_LLM_ID}' for $SCHEMA_USER_UPPER ==="
 
   "$SQLPLUS" -s "system/$DEFAULT_PASSWORD@$SERVICE_NAME" << OLLAMA_EOF
 SET SERVEROUTPUT ON SIZE UNLIMITED
@@ -431,18 +441,16 @@ DECLARE
   v_apex_owner VARCHAR2(128);
   v_cred_id    NUMBER;
   v_srv_id     NUMBER;
-  v_static_id  VARCHAR2(100) := 'OLLAMA_LOCAL';
-  v_cred_sid   VARCHAR2(100) := 'OLLAMA_LOCAL_CRED';
-  v_base_url   VARCHAR2(500) := '$OLLAMA_API_URL';
-  v_model      VARCHAR2(100) := '$OLLAMA_MODEL';
+  v_static_id  VARCHAR2(100) := '$_LLM_ID';
+  v_cred_sid   VARCHAR2(100) := '$_LLM_CRED_SID';
+  v_base_url   VARCHAR2(500) := '$_LLM_API_URL';
+  v_model      VARCHAR2(100) := '$_LLM_MODEL';
   v_sql        VARCHAR2(4000);
 BEGIN
-  -- Resolve workspace ID for this app
   SELECT workspace_id INTO v_ws_id
     FROM apex_workspaces
    WHERE workspace = UPPER('$SCHEMA_USER_UPPER');
 
-  -- Discover APEX internal schema (e.g. APEX_240200)
   SELECT username INTO v_apex_owner
     FROM dba_users
    WHERE username LIKE 'APEX_%'
@@ -469,13 +477,12 @@ BEGIN
             || '  ''HTTP_HEADER'', ''Authorization'','
             || '  ''Y'','
             || '  USER, SYSDATE, USER, SYSDATE)';
-      EXECUTE IMMEDIATE v_sql USING v_cred_id, v_ws_id, 'Ollama Local Credential', v_cred_sid;
+      EXECUTE IMMEDIATE v_sql USING v_cred_id, v_ws_id, v_static_id || ' Credential', v_cred_sid;
       DBMS_OUTPUT.PUT_LINE('Credential created: ' || v_cred_sid);
   END;
 
   -- Step B: Encrypt the secret via APEX API.
-  --   client_secret must be stored encrypted (DBMS_CRYPTO).  Direct INSERT of
-  --   plaintext raises ORA-28817 when APEX tries to decrypt it at runtime.
+  --   Direct INSERT of plaintext raises ORA-28817 at runtime.
   apex_util.set_workspace(p_workspace => '$SCHEMA_USER_UPPER');
   apex_credential.set_persistent_credentials(
     p_credential_static_id => v_cred_sid,
@@ -510,7 +517,7 @@ BEGIN
             || '  :mdl, :cid, ''Y'','
             || '  USER, SYSDATE, USER, SYSDATE)';
       EXECUTE IMMEDIATE v_sql USING v_srv_id, v_ws_id,
-        'Ollama Local', v_static_id, v_base_url, v_model, v_cred_id;
+        v_static_id, v_static_id, v_base_url, v_model, v_cred_id;
       DBMS_OUTPUT.PUT_LINE('AI service created: ' || v_static_id || ' -> ' || v_base_url || ' (' || v_model || ')');
   END;
 
@@ -519,10 +526,11 @@ END;
 /
 exit
 OLLAMA_EOF
-  echo "Ollama AI service step complete."
-else
+  echo "Local LLM service step complete: $_LLM_ID"
+done
+if [ "$_local_llm_count" -eq 0 ]; then
   echo ""
-  echo "=== Step 4: Skipped — OLLAMA_BASE_URL not set in config.ini ==="
+  echo "=== Step 4: Skipped — no local LLM entries (type=local) in config.ini ==="
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
