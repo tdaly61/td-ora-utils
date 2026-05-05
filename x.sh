@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-brew install docker-credential-helper
+#brew install docker-credential-helper
 
 docker run -d \
 -p 1521:1522 \
