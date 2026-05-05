@@ -257,7 +257,9 @@ BEGIN
   -- ── 1b. Create APEX workspace + admin user if APEX is installed ────────────
   SELECT COUNT(*) INTO v_apex_installed
   FROM   dba_users
-  WHERE  username = 'APEX_PUBLIC_USER';
+  WHERE  username LIKE 'APEX_%'
+  AND    oracle_maintained = 'Y'
+  AND    username NOT IN ('APEX_PUBLIC_USER','APEX_LISTENER','APEX_REST_PUBLIC_USER','APEX_PUBLIC_ROUTER');
 
   IF v_apex_installed = 0 THEN
     DBMS_OUTPUT.PUT_LINE('APEX not installed — skipping workspace setup.');
@@ -536,7 +538,7 @@ fi
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== APEX application loaded successfully ==="
-echo "  Browse to : http://localhost:$APEX_PORT/ords/f"
+echo "  Browse to : http://localhost:$APEX_PORT/ords/r/${SCHEMA_USER_UPPER,,}/$DETECTED_APP_ID"
 echo ""
 echo "  APEX Login:"
 echo "    Workspace : $SCHEMA_USER_UPPER"

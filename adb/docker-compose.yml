@@ -16,7 +16,6 @@ services:
       - "5500:5500"
     volumes:
       - ${DB_DATA_DIR:-/home/ubuntu/db_data_dir}:/opt/oracle/oradata
-      - ${APEX_DIR}:/opt/oracle/apex
     healthcheck:
       test: ["CMD", "/opt/oracle/checkDBStatus.sh"]
       interval: 30s
@@ -31,6 +30,7 @@ services:
       - DBPORT=1521
       - DBSERVICENAME=${SERVICE_NAME:-FREEPDB1}
       - ORACLE_PWD=${ORACLE_PWD}  # used by ORDS to install itself as SYS
+      - APEX_PWD=${ORACLE_PWD}    # password for APEX_PUBLIC_USER (required to complete ORDS setup)
     ports:
       - "${APEX_PORT:-8080}:8080"
     volumes:
