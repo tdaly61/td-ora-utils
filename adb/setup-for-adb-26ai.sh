@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────
 # Platform detection — runs first; everything else dispatches on PLATFORM/ARCH
@@ -18,44 +19,6 @@ detect_platform() {
 ini_val() {
     local key="$1"
     grep -m1 "^${key}=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d ' \n\r'
-}
-
-# ─────────────────────────────────────────────────────────────────
-# Mac Docker environment fix — call once before any docker commands.
-# Handles two common Mac multi-runtime issues:
-#   1. Active context points to a missing socket (e.g. OrbStack uninstalled)
-#      → finds the first context whose socket exists and switches to it.
-#   2. Docker CLI is newer than the server (API version too new)
-#      → reads the max supported version from the error and exports
-#        DOCKER_API_VERSION so all subsequent docker calls use it.
-# ─────────────────────────────────────────────────────────────────
-_resolve_docker_mac() {
-    local err
-    err=$(docker info 2>&1)
-
-    # Fix 1: socket missing for the active context → find a working one
-    if echo "$err" | grep -qE "no such file or directory|cannot connect|connection refused"; then
-        local ctx
-        for ctx in rancher-desktop desktop-linux default orbstack; do
-            if docker context use "$ctx" &>/dev/null 2>&1; then
-                err=$(docker info 2>&1)
-                if ! echo "$err" | grep -qE "no such file or directory|cannot connect|connection refused"; then
-                    echo "Switched Docker context to '$ctx' (previous context socket was missing)."
-                    break
-                fi
-            fi
-        done
-    fi
-
-    # Fix 2: CLI API version too new for the server → pin DOCKER_API_VERSION
-    if echo "$err" | grep -q "client version.*too new"; then
-        local max_ver
-        max_ver=$(echo "$err" | grep -oE "Maximum supported API version is [0-9.]+" | grep -oE "[0-9.]+$")
-        if [ -n "$max_ver" ]; then
-            echo "Docker CLI/server API version mismatch — pinning DOCKER_API_VERSION=$max_ver"
-            export DOCKER_API_VERSION="$max_ver"
-        fi
-    fi
 }
 
 # Available disk space in KB for a given path (cross-platform)
@@ -78,7 +41,7 @@ cleanup() {
     if [ "$PLATFORM" = "linux" ]; then
         sudo apt-get purge -y docker.io
         sudo apt-get autoremove -y --purge docker.io
-        umount /var/lib/docker > /dev/null 2>&1
+        umount /var/lib/docker > /dev/null 2>&1 || true
         rm -rf /var/lib/docker
         rm -f /run/containerd/containerd.sock
         if getent group docker > /dev/null; then
@@ -89,7 +52,7 @@ cleanup() {
         fi
         echo "Docker and related configurations have been removed."
     else
-        echo "Docker resources cleaned. To fully remove Docker Desktop, uninstall it manually via Applications."
+        echo "Docker resources cleaned. Remove Colima VM with: colima delete"
     fi
     exit 0
 }
@@ -99,7 +62,7 @@ cleanup() {
 # ─────────────────────────────────────────────────────────────────
 check_root_user() {
     if [ "$PLATFORM" = "darwin" ]; then
-        return   # Docker Desktop on Mac runs as the current user; no root required
+        return   # macOS: run as normal user (no sudo needed)
     fi
     if [ "$EUID" -ne 0 ]; then
         echo "This script must be run as root. Please run as root or use sudo."
@@ -114,7 +77,6 @@ check_os() {
             exit 1
         fi
     fi
-    # macOS: any version that supports Docker Desktop is accepted
 }
 
 set_sudo_user() {
@@ -136,7 +98,7 @@ set_sudo_user() {
         SUDO_USER_NAME=$(getent passwd "$SUDO_UID" | cut -d: -f1)
         echo "The UID of the user who invoked sudo is $SUDO_UID."
         echo "The username of the user who invoked sudo is $SUDO_USER_NAME."
-        SUDO_USER_HOME_DIR=$(eval echo ~$SUDO_USER_NAME)
+        SUDO_USER_HOME_DIR=$(eval echo ~"$SUDO_USER_NAME")
     else
         echo "This script was not invoked using sudo."
     fi
@@ -174,7 +136,8 @@ check_and_install_packages() {
 }
 
 # ─────────────────────────────────────────────────────────────────
-# Docker installation and startup — platform-specific
+# Docker — Linux-specific install and start functions.
+# macOS equivalents live in mac_helpers.sh (sourced below on Darwin).
 # ─────────────────────────────────────────────────────────────────
 _check_docker_installed_linux() {
     if ! command -v docker &>/dev/null; then
@@ -186,9 +149,6 @@ _check_docker_installed_linux() {
         systemctl restart docker
     fi
 
-    # Always ensure the invoking user is in the docker group (idempotent).
-    # Group membership takes effect in new sessions; run-adb-26ai.sh handles
-    # the case where the current session predates the group add via sg docker.
     if [ -n "$SUDO_USER_NAME" ] && ! id -nG "$SUDO_USER_NAME" | grep -qw docker; then
         echo "Adding $SUDO_USER_NAME to the docker group..."
         usermod -aG docker "$SUDO_USER_NAME"
@@ -196,74 +156,6 @@ _check_docker_installed_linux() {
         echo "run-adb-26ai.sh will apply it automatically in the current session."
     else
         echo "User $SUDO_USER_NAME is already in the docker group."
-    fi
-}
-
-_check_docker_installed_mac() {
-    local runtime="${CONTAINER_RUNTIME:-auto}"
-
-    # Rancher Desktop: docker lives at ~/.rd/bin/docker (may not be on PATH under sudo)
-    if [ "$runtime" = "rancher" ]; then
-        # Docker Desktop must not be installed — it hijacks ~/.docker/cli-plugins/ and
-        # breaks docker compose / buildx even when its daemon is not running.
-        if [ -d "/Applications/Docker.app" ]; then
-            echo ""
-            echo "** Error: Docker Desktop is installed but CONTAINER_RUNTIME=rancher is set."
-            echo "   Docker Desktop hijacks ~/.docker/cli-plugins/ and breaks Rancher Desktop's"
-            echo "   docker compose and buildx plugins even when Docker Desktop is not running."
-            echo ""
-            echo "   Remove Docker Desktop before running this script again:"
-            echo ""
-            echo "   Option 1 — built-in uninstaller then remove the app bundle (DMG install):"
-            echo "     sudo /Applications/Docker.app/Contents/MacOS/uninstall"
-            echo "     rm -rf /Applications/Docker.app"
-            echo ""
-            echo "   Option 2 — Homebrew (if installed via brew):"
-            echo "     brew uninstall --cask docker"
-            echo ""
-            echo "   Rancher Desktop provides docker, docker-compose, buildx, kubectl and helm"
-            echo "   — Docker Desktop is not needed."
-            echo ""
-            exit 1
-        fi
-
-        local rd_docker="$HOME/.rd/bin/docker"
-        if [ -x "$rd_docker" ]; then
-            [[ ":$PATH:" != *":$HOME/.rd/bin:"* ]] && export PATH="$HOME/.rd/bin:$PATH"
-            echo "Rancher Desktop docker found at $rd_docker"
-            return
-        fi
-        if [ -d "/Applications/Rancher Desktop.app" ]; then
-            # App installed but not yet started — docker binary appears after first start
-            return
-        fi
-        echo "Rancher Desktop not found. Install from https://rancherdesktop.io/"
-        echo "Or change CONTAINER_RUNTIME to docker_desktop or auto in config.ini."
-        exit 1
-    fi
-
-    # For all other runtimes: add ~/.rd/bin to PATH if Rancher Desktop is installed
-    [ -d "/Applications/Rancher Desktop.app" ] && \
-        [[ ":$PATH:" != *":$HOME/.rd/bin:"* ]] && \
-        export PATH="$HOME/.rd/bin:$PATH"
-
-    if command -v docker &>/dev/null; then
-        echo "Docker found at $(command -v docker)"
-        return
-    fi
-
-    echo "Docker not found. Install one of:"
-    echo "  Rancher Desktop (set CONTAINER_RUNTIME=rancher): https://rancherdesktop.io/"
-    echo "  Docker Desktop:  https://www.docker.com/products/docker-desktop/"
-    echo "  OrbStack:        https://orbstack.dev/"
-    exit 1
-}
-
-check_docker_installed() {
-    if [ "$PLATFORM" = "darwin" ]; then
-        _check_docker_installed_mac
-    else
-        _check_docker_installed_linux
     fi
 }
 
@@ -284,138 +176,24 @@ _ensure_docker_running_linux() {
     exit 1
 }
 
-_ensure_docker_running_mac() {
-    # Ensure ~/.rd/bin is on PATH whenever Rancher Desktop is installed
-    [ -d "/Applications/Rancher Desktop.app" ] && \
-        [[ ":$PATH:" != *":$HOME/.rd/bin:"* ]] && \
-        export PATH="$HOME/.rd/bin:$PATH"
+# Platform-dispatch wrappers — macOS implementations are in mac_helpers.sh
+install_docker() {
+    [ "$PLATFORM" = "darwin" ] && install_docker_mac && return
+    _check_docker_installed_linux   # Linux: install doubles as 'ensure installed'
+}
 
-    # When rancher runtime is requested, force the rancher-desktop context before
-    # checking docker — otherwise a running Docker Desktop satisfies docker info
-    # and the script never configures Rancher Desktop.
-    if [ "${CONTAINER_RUNTIME:-auto}" = "rancher" ]; then
-        docker context use rancher-desktop &>/dev/null 2>&1 || true
-    fi
-
-    _resolve_docker_mac
-    if docker info &>/dev/null 2>&1; then
-        echo "Docker is running."
-        return
-    fi
-
-    local runtime="${CONTAINER_RUNTIME:-auto}"
-
-    # Build try-order: preferred runtime first, then fall back to others that are installed
-    local -a try_order=()
-    case "$runtime" in
-        rancher)        try_order=(rancher docker_desktop orbstack) ;;
-        docker_desktop) try_order=(docker_desktop orbstack rancher) ;;
-        orbstack)       try_order=(orbstack docker_desktop rancher) ;;
-        *)              try_order=(orbstack docker_desktop rancher) ;;  # auto
-    esac
-
-    for rt in "${try_order[@]}"; do
-        case "$rt" in
-            rancher)
-                [ -d "/Applications/Rancher Desktop.app" ] || continue
-                local rdctl=""
-                for candidate in \
-                    "$HOME/.rd/bin/rdctl" \
-                    "/Applications/Rancher Desktop.app/Contents/Resources/resources/darwin/bin/rdctl" \
-                    "/usr/local/bin/rdctl" "/opt/homebrew/bin/rdctl"; do
-                    [ -x "$candidate" ] && rdctl="$candidate" && break
-                done
-                [ -z "$rdctl" ] && continue
-                echo "Starting Rancher Desktop..."
-                "$rdctl" start --application.start-in-background
-                echo "Waiting for Rancher Desktop to become ready (up to 120 seconds)..."
-                for i in {1..24}; do
-                    sleep 5
-                    [[ ":$PATH:" != *":$HOME/.rd/bin:"* ]] && export PATH="$HOME/.rd/bin:$PATH"
-                    _resolve_docker_mac
-                    if docker info &>/dev/null 2>&1; then echo "Docker is running."; return; fi
-                    echo "  Still waiting... ($((i * 5))s)"
-                done
-                echo "  Rancher Desktop did not become ready within 120 seconds."
-                ;;
-            docker_desktop)
-                [ -d "/Applications/Docker.app" ] || continue
-                echo "Starting Docker Desktop..."
-                open -a "Docker" || continue
-                echo "Waiting for Docker Desktop to start (up to 60 seconds)..."
-                for i in {1..12}; do
-                    sleep 5
-                    _resolve_docker_mac
-                    if docker info &>/dev/null 2>&1; then echo "Docker is running."; return; fi
-                    echo "  Still waiting... ($((i * 5))s)"
-                done
-                echo "  Docker Desktop did not start within 60 seconds."
-                ;;
-            orbstack)
-                [ -d "/Applications/OrbStack.app" ] || continue
-                echo "Starting OrbStack..."
-                open -a "OrbStack" || continue
-                echo "Waiting for OrbStack to start (up to 60 seconds)..."
-                for i in {1..12}; do
-                    sleep 5
-                    _resolve_docker_mac
-                    if docker info &>/dev/null 2>&1; then echo "Docker is running."; return; fi
-                    echo "  Still waiting... ($((i * 5))s)"
-                done
-                echo "  OrbStack did not start within 60 seconds."
-                ;;
-        esac
-    done
-
-    echo "No Docker runtime could be started. Install one of:"
-    echo "  Rancher Desktop: https://rancherdesktop.io/"
-    echo "  Docker Desktop:  https://www.docker.com/products/docker-desktop/"
-    echo "  OrbStack:        https://orbstack.dev/"
-    exit 1
+check_docker_installed() {
+    [ "$PLATFORM" = "darwin" ] && check_docker_installed_mac && return
+    _check_docker_installed_linux
 }
 
 ensure_docker_running() {
-    if [ "$PLATFORM" = "darwin" ]; then
-        _ensure_docker_running_mac
-    else
-        _ensure_docker_running_linux
-    fi
-}
-
-_check_docker_compose_linux() {
-    if docker compose version >/dev/null 2>&1; then
-        echo "Docker Compose plugin available: $(docker compose version)"
-        return
-    fi
-    echo "Docker Compose plugin not found. Installing docker-compose-plugin..."
-    apt-get install -y docker-compose-v2
-    if ! docker compose version >/dev/null 2>&1; then
-        echo "Failed to install Docker Compose plugin. Exiting."
-        exit 1
-    fi
-    echo "Docker Compose plugin installed: $(docker compose version)"
-}
-
-_check_docker_compose_mac() {
-    if docker compose version >/dev/null 2>&1; then
-        echo "Docker Compose plugin available: $(docker compose version)"
-        return
-    fi
-    echo "Docker Compose plugin not available. Ensure Docker Desktop is up to date."
-    exit 1
-}
-
-check_docker_compose() {
-    if [ "$PLATFORM" = "darwin" ]; then
-        _check_docker_compose_mac
-    else
-        _check_docker_compose_linux
-    fi
+    [ "$PLATFORM" = "darwin" ] && ensure_docker_running_mac && return
+    _ensure_docker_running_linux
 }
 
 # ─────────────────────────────────────────────────────────────────
 # Oracle OS user/group setup — Linux only
-# On Mac, Docker Desktop's Linux VM handles uid/gid mapping internally.
 # ─────────────────────────────────────────────────────────────────
 oracle_os_user_setup() {
     if [ "$PLATFORM" = "darwin" ]; then
@@ -436,8 +214,8 @@ oracle_os_user_setup() {
     )
 
     for group in "${!group_ids[@]}"; do
-        if ! getent group $group > /dev/null; then
-            groupadd -g ${group_ids[$group]} $group
+        if ! getent group "$group" > /dev/null; then
+            groupadd -g "${group_ids[$group]}" "$group"
         fi
     done
 
@@ -461,11 +239,11 @@ _install_oc_linux() {
     if [ -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
         echo "Oracle Instant Client already installed at $ORACLE_CLIENT_DIR/$INSTANT_CLIENT."
     else
-        su - $SUDO_USER_NAME -c "mkdir -p $ORACLE_CLIENT_DIR"
-        su - $SUDO_USER_NAME -c "curl -o $ORACLE_CLIENT_DIR/$BASIC_ZIP $BASIC_URL" > /dev/null 2>&1
-        su - $SUDO_USER_NAME -c "curl -o $ORACLE_CLIENT_DIR/$SQLPLUS_ZIP $SQLPLUS_URL" > /dev/null 2>&1
-        su - $SUDO_USER_NAME -c "unzip -o $ORACLE_CLIENT_DIR/$BASIC_ZIP -d $ORACLE_CLIENT_DIR" > /dev/null 2>&1
-        su - $SUDO_USER_NAME -c "unzip -o $ORACLE_CLIENT_DIR/$SQLPLUS_ZIP -d $ORACLE_CLIENT_DIR" > /dev/null 2>&1
+        su - "$SUDO_USER_NAME" -c "mkdir -p $ORACLE_CLIENT_DIR"
+        su - "$SUDO_USER_NAME" -c "curl -o $ORACLE_CLIENT_DIR/$BASIC_ZIP $BASIC_URL" > /dev/null 2>&1
+        su - "$SUDO_USER_NAME" -c "curl -o $ORACLE_CLIENT_DIR/$SQLPLUS_ZIP $SQLPLUS_URL" > /dev/null 2>&1
+        su - "$SUDO_USER_NAME" -c "unzip -o $ORACLE_CLIENT_DIR/$BASIC_ZIP -d $ORACLE_CLIENT_DIR" > /dev/null 2>&1
+        su - "$SUDO_USER_NAME" -c "unzip -o $ORACLE_CLIENT_DIR/$SQLPLUS_ZIP -d $ORACLE_CLIENT_DIR" > /dev/null 2>&1
 
         if [ ! -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
             echo "** Error ** Oracle Instant Client not correctly installed in $ORACLE_CLIENT_DIR."
@@ -476,7 +254,6 @@ _install_oc_linux() {
     export ORACLE_HOME="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
     export LD_LIBRARY_PATH="$ORACLE_HOME"
 
-    # libaio package and symlink differ between Ubuntu versions
     UBUNTU_VER=$(lsb_release -rs | cut -d. -f1)
     if [ "$UBUNTU_VER" -ge 24 ]; then
         apt-get install -y libaio1t64
@@ -486,13 +263,14 @@ _install_oc_linux() {
         LIBAIO_TARGET="/usr/lib/x86_64-linux-gnu/libaio.so.1.0.1"
     fi
     LIBAIO_LINK="/usr/lib/x86_64-linux-gnu/libaio.so.1"
-    if [ ! -e "$LIBAIO_LINK" ] || [ "$(readlink $LIBAIO_LINK)" != "$LIBAIO_TARGET" ]; then
+    if [ ! -e "$LIBAIO_LINK" ] || [ "$(readlink "$LIBAIO_LINK")" != "$LIBAIO_TARGET" ]; then
         echo "Creating/fixing libaio.so.1 symlink -> $LIBAIO_TARGET"
         ln -sf "$LIBAIO_TARGET" "$LIBAIO_LINK"
     fi
 
-    if ! grep -q "export TNS_ADMIN=$WALLET_DIR" "$BASHRC_FILE"; then
-        echo "export TNS_ADMIN=$WALLET_DIR" >> "$BASHRC_FILE"
+    local tns_admin_path="$SUDO_USER_HOME_DIR/auth/tls_wallet"
+    if ! grep -q "export TNS_ADMIN=" "$BASHRC_FILE"; then
+        echo "export TNS_ADMIN=$tns_admin_path" >> "$BASHRC_FILE"
     fi
     if ! grep -q "export ORACLE_HOME=$ORACLE_HOME" "$BASHRC_FILE"; then
         echo "export ORACLE_HOME=$ORACLE_HOME" >> "$BASHRC_FILE"
@@ -505,8 +283,6 @@ _install_oc_linux() {
     fi
 }
 
-# Mount a DMG, run Oracle's install_ic.sh from the volume, then unmount.
-# install_ic.sh installs files into ~/Downloads/instantclient_XX_XX by default.
 _install_dmg_mac() {
     local dmg="$1"
     local label
@@ -533,7 +309,6 @@ _install_dmg_mac() {
 _install_oc_mac() {
     local ORACLE_CLIENT_DIR="$SUDO_USER_HOME_DIR/oraclient"
     local SHELL_RC="$SUDO_USER_HOME_DIR/.zshrc"
-    # Oracle's install_ic.sh puts files here by default
     local DEFAULT_IC_DIR="$SUDO_USER_HOME_DIR/Downloads/$INSTANT_CLIENT"
 
     if [ -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
@@ -549,10 +324,7 @@ _install_oc_mac() {
         echo "Downloading Oracle Instant Client SQL*Plus DMG for macOS ($ARCH)..."
         curl -L -o "$sqlplus_dmg" "$SQLPLUS_URL"
 
-        # Clear any leftover default install dir from a prior attempt
         [ -d "$DEFAULT_IC_DIR" ] && rm -rf "$DEFAULT_IC_DIR"
-
-        # install_ic.sh creates ~/Downloads/instantclient_XX_XX and copies files there
         _install_dmg_mac "$basic_dmg"
         _install_dmg_mac "$sqlplus_dmg"
 
@@ -561,7 +333,6 @@ _install_oc_mac() {
             exit 1
         fi
 
-        # Move from the default ~/Downloads location to our oraclient dir
         mkdir -p "$ORACLE_CLIENT_DIR"
         mv "$DEFAULT_IC_DIR" "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
 
@@ -595,63 +366,16 @@ install_oracle_instant_client() {
 }
 
 # ─────────────────────────────────────────────────────────────────
-# APEX preparation and ORDS config dir
+# Oracle Container Registry login — optional (free-tier images accessible without login)
 # ─────────────────────────────────────────────────────────────────
-prepare_apex() {
-    local EFFECTIVE_APEX_DIR="${APEX_DIR:-$SUDO_USER_HOME_DIR/apex}"
-    local APEX_ZIP="$SUDO_USER_HOME_DIR/apex-latest.zip"
-    local APEX_PARENT
-    APEX_PARENT=$(dirname "$EFFECTIVE_APEX_DIR")
-
-    if [ -d "$EFFECTIVE_APEX_DIR" ] && [ "$(ls -A "$EFFECTIVE_APEX_DIR" 2>/dev/null)" ]; then
-        echo "APEX directory already prepared at $EFFECTIVE_APEX_DIR. Skipping."
-        return
-    fi
-
-    if [ ! -f "$APEX_ZIP" ]; then
-        echo "Downloading Oracle APEX (~290MB)..."
-        curl -fL -C - -o "$APEX_ZIP" "https://download.oracle.com/otn_software/apex/apex-latest.zip"
-        if [ $? -ne 0 ]; then
-            echo "Failed to download APEX. Exiting."
-            exit 1
-        fi
-        [ "$PLATFORM" = "linux" ] && chown "$SUDO_USER_NAME" "$APEX_ZIP" 2>/dev/null || true
-    else
-        echo "Using existing APEX zip at $APEX_ZIP."
-    fi
-
-    echo "Unzipping APEX to $APEX_PARENT (will create $EFFECTIVE_APEX_DIR)..."
-    mkdir -p "$APEX_PARENT"
-    unzip -q -o "$APEX_ZIP" -d "$APEX_PARENT"
-    if [ $? -ne 0 ] || [ ! -d "$EFFECTIVE_APEX_DIR" ]; then
-        echo "Failed to unzip APEX. Exiting."
-        exit 1
-    fi
-    [ "$PLATFORM" = "linux" ] && chown -R "$SUDO_USER_NAME" "$EFFECTIVE_APEX_DIR" 2>/dev/null || true
-    echo "APEX prepared at $EFFECTIVE_APEX_DIR."
-}
-
-create_ords_config_dir() {
-    local ORDS_CONFIG_DIR="$RUN_DIR/ords_config"
-    if [ ! -d "$ORDS_CONFIG_DIR" ]; then
-        echo "Creating ORDS config directory at $ORDS_CONFIG_DIR..."
-        mkdir -p "$ORDS_CONFIG_DIR"
-        chmod 777 "$ORDS_CONFIG_DIR"  # ORDS container runs as oracle (uid 54321), needs write access
-    else
-        echo "ORDS config directory already exists at $ORDS_CONFIG_DIR."
-    fi
-}
-
-# Oracle Container Registry login — optional.
-# The database/free and database/ords images are publicly accessible without login.
-# Set ORACLE_REGISTRY_USER and ORACLE_REGISTRY_PASSWORD in config.ini to enable.
 oracle_registry_login() {
     if [ -z "$ORACLE_REGISTRY_USER" ] || [ -z "$ORACLE_REGISTRY_PASSWORD" ]; then
-        echo "Oracle Container Registry credentials not set — skipping login (not required for free-tier images)."
+        echo "Oracle Container Registry credentials not set — skipping login."
         return
     fi
     echo "Logging in to Oracle Container Registry as $ORACLE_REGISTRY_USER..."
-    echo "$ORACLE_REGISTRY_PASSWORD" | docker login container-registry.oracle.com -u "$ORACLE_REGISTRY_USER" --password-stdin
+    echo "$ORACLE_REGISTRY_PASSWORD" | docker login container-registry.oracle.com \
+        -u "$ORACLE_REGISTRY_USER" --password-stdin
     if [ $? -ne 0 ]; then
         echo "Docker login failed. Check credentials at https://container-registry.oracle.com"
         exit 1
@@ -660,40 +384,7 @@ oracle_registry_login() {
 }
 
 # ─────────────────────────────────────────────────────────────────
-# Volume ownership — Linux only
-# Docker Desktop on Mac manages uid/gid mapping inside its VM.
-# ─────────────────────────────────────────────────────────────────
-change_volume_ownership() {
-    if [ "$PLATFORM" = "darwin" ]; then
-        return
-    fi
-    VOL_PATH=$(docker volume inspect "$VOL_NAME" --format '{{ .Mountpoint }}')
-    if [ -z "$VOL_PATH" ]; then
-        echo "Failed to determine the volume path for $VOL_NAME. Exiting."
-        exit 1
-    fi
-    echo "Changing ownership of volume path $VOL_PATH to user oracle and group oinstall."
-    sudo chown -R oracle:oinstall "$VOL_PATH"
-}
-
-create_docker_volume() {
-    echo "Creating Docker volume $VOL_NAME..."
-    if docker volume inspect "$VOL_NAME" >/dev/null 2>&1; then
-        echo "Warning: Volume '$VOL_NAME' already exists."
-        read -p "Do you want to use the existing volume? (y/n): " choice
-        case "$choice" in
-            y|Y ) echo "Using existing volume '$VOL_NAME'." ;;
-            n|N ) echo "Exiting. Remove the volume with: docker volume rm $VOL_NAME"; exit 1 ;;
-            *   ) echo "Invalid choice. Exiting."; exit 1 ;;
-        esac
-    else
-        docker volume create $VOL_NAME
-        change_volume_ownership
-    fi
-}
-
-# ─────────────────────────────────────────────────────────────────
-# Ollama installation and model launch
+# Ollama (optional — commented out in main by default)
 # ─────────────────────────────────────────────────────────────────
 _install_ollama_linux() {
     if command -v ollama &>/dev/null; then
@@ -732,32 +423,6 @@ install_ollama() {
     fi
 }
 
-launch_ollama_model() {
-    local model="${OLLAMA_MODEL:-qwen3-coder-cc:latest}"
-
-    if [ "$PLATFORM" = "linux" ]; then
-        # Ensure the systemd service is running (ollama install.sh creates it)
-        if ! systemctl is-active --quiet ollama 2>/dev/null; then
-            echo "Starting ollama service..."
-            systemctl enable ollama 2>/dev/null || true
-            systemctl start ollama 2>/dev/null || true
-            sleep 3
-        fi
-        local run_as="${SUDO_USER_NAME:-$(id -un)}"
-        echo "Launching ollama model $model as $run_as..."
-        su - "$run_as" -c "OLLAMA_KEEP_ALIVE=1h ollama launch claude --model $model"
-    else
-        # macOS: start ollama serve in the background if not already running
-        if ! pgrep -x ollama &>/dev/null; then
-            echo "Starting ollama server in background..."
-            OLLAMA_KEEP_ALIVE=1h ollama serve &>/dev/null &
-            sleep 3
-        fi
-        echo "Launching ollama model $model..."
-        OLLAMA_KEEP_ALIVE=1h ollama launch claude --model "$model"
-    fi
-}
-
 # ─────────────────────────────────────────────────────────────────
 # Pre-flight checks
 # ─────────────────────────────────────────────────────────────────
@@ -767,11 +432,6 @@ preflight_check() {
 
     if ! curl -s --max-time 8 -o /dev/null "https://download.oracle.com" 2>/dev/null; then
         echo "WARNING: Cannot reach download.oracle.com — Instant Client download may fail."
-        warnings=$((warnings + 1))
-    fi
-
-    if ! curl -s --max-time 8 -o /dev/null "https://download.oracle.com/otn_software/apex/" 2>/dev/null; then
-        echo "WARNING: Cannot reach Oracle APEX download URL — APEX download may fail."
         warnings=$((warnings + 1))
     fi
 
@@ -798,11 +458,113 @@ preflight_check() {
 # Configuration
 # ─────────────────────────────────────────────────────────────────
 usage() {
-    echo "Usage: $0 [-c] [-h]"
+    echo "Usage: $0 [-n] [-c] [-h]"
     echo "Options:"
+    echo "  -n  Dry-run: print what would be done without making any changes"
     echo "  -c  Cleanup Docker and related configurations"
     echo "  -h  Display this help"
     exit 1
+}
+
+# Print a summary of what setup would do on this machine, then exit.
+# Call after read_config and set_sudo_user so all variables are populated.
+show_dry_run_plan() {
+    local home_dir="${SUDO_USER_HOME_DIR:-$HOME}"
+    local client_dir="$home_dir/oraclient/$INSTANT_CLIENT"
+
+    echo ""
+    echo "=== DRY-RUN plan for setup-for-adb-26ai.sh ==="
+    echo ""
+    echo "  Platform  : $PLATFORM / $ARCH"
+    echo "  Config    : $CONFIG_FILE"
+    echo "  Image     : $DOCKER_IMAGE"
+    echo "  Container : $(ini_val CONTAINER_NAME 2>/dev/null)"
+    echo "  User home : $home_dir"
+    echo ""
+
+    # Step 1: /etc/hosts
+    if grep -q "${HOSTNAME}" /etc/hosts 2>/dev/null; then
+        echo "1. /etc/hosts — '$HOSTNAME' already present, no change needed"
+    else
+        echo "1. /etc/hosts — add '$HOSTNAME' to 127.0.0.1 line"
+    fi
+
+    # Step 2: Docker / Colima
+    echo ""
+    if [ "$PLATFORM" = "darwin" ]; then
+        echo "2. Docker runtime: Colima"
+        if command -v colima &>/dev/null && command -v docker &>/dev/null; then
+            echo "   colima + docker CLI already installed — skip brew install"
+        else
+            echo "   brew install colima docker"
+        fi
+        if colima status 2>/dev/null | grep -q "Running"; then
+            echo "   Colima already running — reuse existing VM"
+        elif colima list 2>/dev/null | grep -q "default"; then
+            echo "   Colima VM exists but stopped — colima start (existing VM, sizing flags ignored)"
+        else
+            local rosetta_flag=""
+            [ "$COLIMA_VM_TYPE" = "vz" ] && [ "$COLIMA_VZ_ROSETTA" = "true" ] && rosetta_flag=" --vz-rosetta"
+            echo "   No Colima VM detected — would create:"
+            echo "   colima start --arch $COLIMA_ARCH --memory $COLIMA_MEMORY --disk $COLIMA_DISK"
+            echo "                --runtime docker --vm-type $COLIMA_VM_TYPE${rosetta_flag}"
+        fi
+    else
+        echo "2. Docker (Linux)"
+        if command -v docker &>/dev/null; then
+            echo "   docker already installed at $(command -v docker) — skip apt install"
+        else
+            echo "   apt install -y docker.io"
+            echo "   systemctl enable docker && systemctl restart docker"
+        fi
+        if [ -n "$SUDO_USER_NAME" ] && id -nG "$SUDO_USER_NAME" 2>/dev/null | grep -qw docker; then
+            echo "   $SUDO_USER_NAME already in docker group — skip usermod"
+        else
+            echo "   usermod -aG docker $SUDO_USER_NAME"
+        fi
+        echo ""
+        echo "3. Oracle OS groups/user (linux)"
+        if id -u oracle &>/dev/null 2>&1; then
+            echo "   oracle user already exists — skip groupadd/useradd"
+        else
+            echo "   groupadd: oinstall dba oper backupdba dginstall kmdba racdba"
+            echo "   useradd -u 54321 oracle"
+        fi
+    fi
+
+    # Step 3/4: Oracle Instant Client
+    echo ""
+    local step_ic=3
+    [ "$PLATFORM" = "linux" ] && step_ic=4
+    echo "$step_ic. Oracle Instant Client"
+    if [ -d "$client_dir" ]; then
+        echo "   Already installed at $client_dir — skip download/install"
+    else
+        echo "   Download: $BASIC_URL"
+        echo "   Download: $SQLPLUS_URL"
+        if [ "$PLATFORM" = "darwin" ]; then
+            echo "   Mount DMG → install_ic.sh → move to $client_dir"
+        else
+            echo "   unzip to $home_dir/oraclient/$INSTANT_CLIENT"
+            echo "   apt install libaio1(t64) + symlink libaio.so.1"
+        fi
+        echo "   Append ORACLE_HOME / LD/DYLD_LIBRARY_PATH / PATH to shell RC"
+    fi
+
+    # Step N: Registry login
+    echo ""
+    local step_reg=$((step_ic + 1))
+    if [[ "${DOCKER_IMAGE:-}" == ghcr.io/* ]]; then
+        echo "$step_reg. Docker registry login — not required for GHCR image (ghcr.io)"
+    elif [ -n "${ORACLE_REGISTRY_USER:-}" ] && [ -n "${ORACLE_REGISTRY_PASSWORD:-}" ]; then
+        echo "$step_reg. docker login container-registry.oracle.com -u $ORACLE_REGISTRY_USER"
+    else
+        echo "$step_reg. Docker registry login — skip (no credentials in config.ini)"
+    fi
+
+    echo ""
+    echo "=== No changes made (dry-run). Run without -n to execute. ==="
+    exit 0
 }
 
 read_config() {
@@ -817,19 +579,20 @@ read_config() {
     ORACLE_REGISTRY_USER=$(ini_val ORACLE_REGISTRY_USER)
     ORACLE_REGISTRY_PASSWORD=$(ini_val ORACLE_REGISTRY_PASSWORD)
     DOCKER_IMAGE=$(ini_val DOCKER_IMAGE)
-    APEX_DIR=$(ini_val APEX_DIR)
-    OLLAMA_MODEL=$(ini_val OLLAMA_MODEL)   # optional; defaults to qwen3-coder-cc:latest
     CONTAINER_RUNTIME=$(ini_val CONTAINER_RUNTIME)
     CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-auto}"
+    COLIMA_ARCH=$(ini_val COLIMA_ARCH);           COLIMA_ARCH="${COLIMA_ARCH:-x86_64}"
+    COLIMA_VM_TYPE=$(ini_val COLIMA_VM_TYPE);     COLIMA_VM_TYPE="${COLIMA_VM_TYPE:-vz}"
+    COLIMA_VZ_ROSETTA=$(ini_val COLIMA_VZ_ROSETTA); COLIMA_VZ_ROSETTA="${COLIMA_VZ_ROSETTA:-true}"
+    COLIMA_MEMORY=$(ini_val COLIMA_MEMORY);       COLIMA_MEMORY="${COLIMA_MEMORY:-8}"
+    COLIMA_DISK=$(ini_val COLIMA_DISK);           COLIMA_DISK="${COLIMA_DISK:-100}"
 
     if [ "$PLATFORM" = "darwin" ]; then
-        # Mac: prefer *_MAC keys, fall back to generic keys if Mac-specific ones are absent
         BASIC_ZIP=$(ini_val BASIC_ZIP_MAC)
         SQLPLUS_ZIP=$(ini_val SQLPLUS_ZIP_MAC)
         BASIC_URL=$(ini_val BASIC_URL_MAC)
         SQLPLUS_URL=$(ini_val SQLPLUS_URL_MAC)
         INSTANT_CLIENT=$(ini_val INSTANT_CLIENT_MAC)
-        # Fall back to generic keys if Mac-specific entries are missing
         [ -z "$BASIC_ZIP" ]      && BASIC_ZIP=$(ini_val BASIC_ZIP)
         [ -z "$SQLPLUS_ZIP" ]    && SQLPLUS_ZIP=$(ini_val SQLPLUS_ZIP)
         [ -z "$BASIC_URL" ]      && BASIC_URL=$(ini_val BASIC_URL)
@@ -844,14 +607,14 @@ read_config() {
     fi
 
     local missing=""
-    [ -z "$BASIC_ZIP" ]      && missing="$missing BASIC_ZIP"
-    [ -z "$SQLPLUS_ZIP" ]    && missing="$missing SQLPLUS_ZIP"
-    [ -z "$BASIC_URL" ]      && missing="$missing BASIC_URL"
-    [ -z "$SQLPLUS_URL" ]    && missing="$missing SQLPLUS_URL"
-    [ -z "$INSTANT_CLIENT" ] && missing="$missing INSTANT_CLIENT"
-    [ -z "$HOSTNAME" ]       && missing="$missing HOSTNAME"
+    [ -z "$BASIC_ZIP" ]        && missing="$missing BASIC_ZIP"
+    [ -z "$SQLPLUS_ZIP" ]      && missing="$missing SQLPLUS_ZIP"
+    [ -z "$BASIC_URL" ]        && missing="$missing BASIC_URL"
+    [ -z "$SQLPLUS_URL" ]      && missing="$missing SQLPLUS_URL"
+    [ -z "$INSTANT_CLIENT" ]   && missing="$missing INSTANT_CLIENT"
+    [ -z "$HOSTNAME" ]         && missing="$missing HOSTNAME"
     [ -z "$DEFAULT_PASSWORD" ] && missing="$missing DEFAULT_PASSWORD"
-    [ -z "$DOCKER_IMAGE" ]   && missing="$missing DOCKER_IMAGE"
+    [ -z "$DOCKER_IMAGE" ]     && missing="$missing DOCKER_IMAGE"
     if [ -n "$missing" ]; then
         echo "Missing required config.ini values:$missing. Exiting."
         exit 1
@@ -867,22 +630,39 @@ TNS_ADMIN=""
 ORACLE_HOME=""
 ORACLE_CLIENT_DIR=""
 INSTANT_CLIENT=""
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+WALLET_DIR=""
+DRY_RUN=false
+COLIMA_ARCH=""
+COLIMA_VM_TYPE=""
+COLIMA_VZ_ROSETTA=""
+COLIMA_MEMORY=""
+COLIMA_DISK=""
 
 RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 detect_platform
-[ "$PLATFORM" = "darwin" ] && _resolve_docker_mac
+
+# Source macOS helpers before read_config so CONTAINER_RUNTIME is available to them.
+if [ "$PLATFORM" = "darwin" ]; then
+    # shellcheck source=mac_helpers.sh
+    source "$RUN_DIR/mac_helpers.sh"
+fi
+
 read_config
 set_sudo_user
 
-while getopts "hc" opt; do
+while getopts "hcn" opt; do
     case ${opt} in
         h ) usage ;;
         c ) cleanup ;;
+        n ) DRY_RUN=true ;;
         \? ) usage ;;
     esac
 done
+
+if [ "$DRY_RUN" = "true" ]; then
+    show_dry_run_plan
+fi
 
 check_root_user
 check_os
@@ -890,25 +670,21 @@ preflight_check
 check_and_install_packages "unzip" "curl" "git"
 check_and_add_hostname
 echo "User: $SUDO_USER_NAME"
+
+# Docker lifecycle:
+#  1. install_docker  — brew install colima docker  (macOS) / apt install docker.io  (Linux)
+#  2. check_docker_installed  — verify binaries present
+#  3. ensure_docker_running   — start runtime (creates Colima VM if needed)
+install_docker
 check_docker_installed
 ensure_docker_running
+
 oracle_os_user_setup
 install_oracle_instant_client
 oracle_registry_login
-check_docker_compose
-prepare_apex
-create_ords_config_dir
-install_python_deps
 # install_ollama
 # launch_ollama_model
 
-# Fix ownership of files created as root during this or prior sudo runs (Linux only).
-if [ "$PLATFORM" = "linux" ] && [ -n "$SUDO_USER_NAME" ]; then
-    for f in "$RUN_DIR/.env" "$RUN_DIR/ords_config" "$RUN_DIR/sql-scripts/create-users.sql"; do
-        [ -e "$f" ] && chown -R "$SUDO_USER_NAME:$SUDO_USER_NAME" "$f" 2>/dev/null || true
-    done
-fi
-
 echo
-echo "OS and Docker Setup for ADB 26ai completed"
-echo "Next step: run ./run-adb-26ai.sh to start the database and ORDS/APEX"
+echo "Setup for Oracle ADB-Free 26ai completed."
+echo "Next step: run ./run-adb-26ai.sh to start the database"

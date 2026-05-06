@@ -87,9 +87,16 @@ cfg_val() {
 }
 
 DEFAULT_PASSWORD=$(cfg_val DEFAULT_PASSWORD)
-SERVICE_NAME=$(cfg_val SERVICE_NAME)
-INSTANT_CLIENT=$(cfg_val INSTANT_CLIENT)
-APEX_PORT=$(cfg_val APEX_PORT);     APEX_PORT=${APEX_PORT:-8080}
+SERVICE_NAME=$(cfg_val SERVICE_NAME); SERVICE_NAME=${SERVICE_NAME:-myatp_high}
+
+# Platform-aware Instant Client selection
+case "$(uname -s)" in
+  Darwin*) INSTANT_CLIENT=$(cfg_val INSTANT_CLIENT_MAC) ;;
+  *)       INSTANT_CLIENT=$(cfg_val INSTANT_CLIENT) ;;
+esac
+[ -z "$INSTANT_CLIENT" ] && INSTANT_CLIENT=$(cfg_val INSTANT_CLIENT)
+
+APEX_PORT=$(cfg_val APEX_PORT);     APEX_PORT=${APEX_PORT:-8443}
 APEX_USER=$(cfg_val APEX_USER);     APEX_USER=${APEX_USER:-TRACKER1}
 APEX_PASSWORD=$(cfg_val APEX_PASSWORD); APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
 # Read LLM_<STATIC_ID>=<url>|<model>|<type> entries from config.ini
@@ -201,8 +208,9 @@ if [ ! -x "$SQLPLUS" ]; then
   fi
 fi
 
-export TNS_ADMIN="$HOME/auth/tns"
+export TNS_ADMIN="$HOME/auth/tls_wallet"
 export LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
+export DYLD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
@@ -223,7 +231,7 @@ echo ""
 # already exist. Safe to re-run — all operations are guarded by existence checks.
 echo "=== Step 1: Bootstrapping schema and APEX workspace for $SCHEMA_USER_UPPER ==="
 
-"$SQLPLUS" -s "sys/$DEFAULT_PASSWORD@$SERVICE_NAME as sysdba" << SYSDBA_EOF
+"$SQLPLUS" -s "admin/$DEFAULT_PASSWORD@$SERVICE_NAME" << SYSDBA_EOF
 SET SERVEROUTPUT ON SIZE UNLIMITED
 WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK
 
@@ -434,7 +442,7 @@ for _LLM_ID in "${!LLM_TYPE[@]}"; do
   echo ""
   echo "=== Step 4: Configuring local LLM '${_LLM_ID}' for $SCHEMA_USER_UPPER ==="
 
-  "$SQLPLUS" -s "system/$DEFAULT_PASSWORD@$SERVICE_NAME" << OLLAMA_EOF
+  "$SQLPLUS" -s "admin/$DEFAULT_PASSWORD@$SERVICE_NAME" << OLLAMA_EOF
 SET SERVEROUTPUT ON SIZE UNLIMITED
 WHENEVER SQLERROR CONTINUE
 
@@ -538,7 +546,7 @@ fi
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== APEX application loaded successfully ==="
-echo "  Browse to : http://localhost:$APEX_PORT/ords/r/${SCHEMA_USER_UPPER,,}/$DETECTED_APP_ID"
+echo "  Browse to : https://localhost:$APEX_PORT/ords/r/${SCHEMA_USER_UPPER,,}/$DETECTED_APP_ID  (accept self-signed cert)"
 echo ""
 echo "  APEX Login:"
 echo "    Workspace : $SCHEMA_USER_UPPER"
