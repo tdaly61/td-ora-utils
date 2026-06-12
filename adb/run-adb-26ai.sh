@@ -286,7 +286,7 @@ run_sql_file() {
 
     if [ ! -f "$sql_file" ]; then
         echo "SQL file $sql_file does not exist. Skipping."
-        return 1
+        return 0
     fi
     echo "Running SQL file $sql_file..."
     if ! LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
@@ -318,29 +318,30 @@ read_config() {
         echo "Configuration file config.ini not found in $RUN_DIR. Exiting."
         exit 1
     fi
-    SQLPLUS_URL=$(awk -F "=" '/^SQLPLUS_URL/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    INSTANT_CLIENT=$(awk -F "=" '/^INSTANT_CLIENT/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    HOSTNAME=$(awk -F "=" '/^HOSTNAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    DEFAULT_PASSWORD=$(awk -F "=" '/^DEFAULT_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' '  | tr -d '\n' | tr -d '\r')
-    CONTAINER_NAME=$(awk -F "=" '/^CONTAINER_NAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    DOCKER_IMAGE=$(awk -F "=" '/^DOCKER_IMAGE/ {print $2}' "$CONFIG_FILE" | tr -d ' '  )
-    ONNX_MODEL_URL=$(awk -F "=" '/^ONNX_MODEL_URL/ {print $2}' "$CONFIG_FILE" | tr -d ' '  )
-    ORACLE_REGISTRY_USER=$(awk -F "=" '/^ORACLE_REGISTRY_USER/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    ORACLE_REGISTRY_PASSWORD=$(awk -F "=" '/^ORACLE_REGISTRY_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    SERVICE_NAME=$(awk -F "=" '/^SERVICE_NAME/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
-    APEX_PORT=$(awk -F "=" '/^APEX_PORT/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    # Use sed 's/^KEY=//' so values containing '=' (e.g. base64 passwords) are not truncated.
+    SQLPLUS_URL=$(sed -n 's/^SQLPLUS_URL=//p' "$CONFIG_FILE" | tr -d ' \r')
+    INSTANT_CLIENT=$(sed -n 's/^INSTANT_CLIENT=//p' "$CONFIG_FILE" | tr -d ' \r')
+    HOSTNAME=$(sed -n 's/^HOSTNAME=//p' "$CONFIG_FILE" | tr -d ' \r')
+    DEFAULT_PASSWORD=$(sed -n 's/^DEFAULT_PASSWORD=//p' "$CONFIG_FILE" | tr -d ' \n\r')
+    CONTAINER_NAME=$(sed -n 's/^CONTAINER_NAME=//p' "$CONFIG_FILE" | tr -d ' \r')
+    DOCKER_IMAGE=$(sed -n 's/^DOCKER_IMAGE=//p' "$CONFIG_FILE" | tr -d ' \r')
+    ONNX_MODEL_URL=$(sed -n 's/^ONNX_MODEL_URL=//p' "$CONFIG_FILE" | tr -d ' \r')
+    ORACLE_REGISTRY_USER=$(sed -n 's/^ORACLE_REGISTRY_USER=//p' "$CONFIG_FILE" | tr -d ' \r')
+    ORACLE_REGISTRY_PASSWORD=$(sed -n 's/^ORACLE_REGISTRY_PASSWORD=//p' "$CONFIG_FILE" | tr -d ' \r')
+    SERVICE_NAME=$(sed -n 's/^SERVICE_NAME=//p' "$CONFIG_FILE" | tr -d ' \r')
+    APEX_PORT=$(sed -n 's/^APEX_PORT=//p' "$CONFIG_FILE" | tr -d ' \r')
     APEX_PORT=${APEX_PORT:-8080}
-    APEX_DIR=$(awk -F "=" '/^APEX_DIR/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    APEX_DIR=$(sed -n 's/^APEX_DIR=//p' "$CONFIG_FILE" | tr -d ' \r')
     APEX_DIR=${APEX_DIR:-$HOME/apex}
 
-    APEX_USER=$(awk -F "=" '/^APEX_USER/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    APEX_USER=$(sed -n 's/^APEX_USER=//p' "$CONFIG_FILE" | tr -d ' \r')
     APEX_USER=${APEX_USER:-TRACKER1}
-    APEX_PASSWORD=$(awk -F "=" '/^APEX_PASSWORD/ {print $2}' "$CONFIG_FILE" | tr -d ' ' | tr -d '\n' | tr -d '\r')
+    APEX_PASSWORD=$(sed -n 's/^APEX_PASSWORD=//p' "$CONFIG_FILE" | tr -d ' \n\r')
     APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
 
-    OLLAMA_BASE_URL=$(awk -F "=" '/^OLLAMA_BASE_URL/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    OLLAMA_BASE_URL=$(sed -n 's/^OLLAMA_BASE_URL=//p' "$CONFIG_FILE" | tr -d ' \r')
     OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-    OLLAMA_MODEL=$(awk -F "=" '/^OLLAMA_MODEL/ {print $2}' "$CONFIG_FILE" | tr -d ' ')
+    OLLAMA_MODEL=$(sed -n 's/^OLLAMA_MODEL=//p' "$CONFIG_FILE" | tr -d ' \r')
     OLLAMA_MODEL=${OLLAMA_MODEL:-llama3}
 
     local missing=""
@@ -644,9 +645,10 @@ if ! docker info &>/dev/null 2>&1; then
 fi
 
 # sg disconnects stdin from the TTY. Reconnect so interactive prompts (e.g. cleanup read)
-# work correctly in the re-exec'd process. Suppress error if no controlling TTY (non-interactive).
-if [ ! -t 0 ] && [ -e /dev/tty ]; then
-    exec < /dev/tty 2>/dev/null || true
+# work correctly in the re-exec'd process. /dev/tty always exists on Linux but is inaccessible
+# (ENXIO) when there is no controlling terminal, so test silently before exec'ing.
+if [ ! -t 0 ] && ( true < /dev/tty ) 2>/dev/null; then
+    exec < /dev/tty
 fi
 
 # Read configuration

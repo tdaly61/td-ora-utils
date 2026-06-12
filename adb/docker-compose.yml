@@ -18,7 +18,10 @@ services:
       - ${DB_DATA_DIR:-/home/ubuntu/db_data_dir}:/opt/oracle/oradata
       - ${APEX_DIR}:/opt/oracle/apex
     healthcheck:
-      test: ["CMD", "/opt/oracle/checkDBStatus.sh"]
+      # checkDBStatus.sh exits 5 whenever PDB$SEED is MOUNTED (it always is).
+      # Override to check only that FREEPDB1 is READ WRITE.
+      # Use $$ so Docker Compose produces a literal $ in the shell command.
+      test: ["CMD-SHELL", "echo \"SELECT open_mode FROM v\\$$pdbs WHERE name='FREEPDB1';\" | ORACLE_SID=FREE ORACLE_HOME=/opt/oracle/product/26ai/dbhomeFree /opt/oracle/product/26ai/dbhomeFree/bin/sqlplus -s '/ as sysdba' 2>/dev/null | grep -q 'READ WRITE'"]
       interval: 30s
       timeout: 10s
       retries: 150
