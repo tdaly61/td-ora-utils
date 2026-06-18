@@ -1,24 +1,13 @@
--- Model setup
+-- vector-setup.sql
+-- Placeholder — ONNX model loading has moved to app-level SQL.
+--
+-- run-adb-26ai.sh handles all infrastructure:
+--   - downloads model.onnx to ~/model.onnx
+--   - creates Oracle DIRECTORY 'ONNX_STAGING' pointing to the DBFS-visible path
+--   - copies model.onnx into that path
+--
+-- Each app then loads its own named model via load-apex-app.sh -v <vector-setup.sql>.
+-- Example: caseweave/apex-sql-src/Set_Up_Vector_Stuff.sql loads DOC_MODEL for WEAVE32.
 
-BEGIN
-   DBMS_VECTOR.LOAD_ONNX_MODEL(
-        directory => 'DATA_PUMP_DIR',
-        file_name => 'model.onnx',
-        model_name => 'ALL_MINILM');
-END;
-/
-
- 
- 
--- Check it is “loaded”
-select
-  model_name
-  , mining_function
-  , algorithm
-  , (model_size/1024/1024) as model_size_mb
-from user_mining_models
-order by model_name;
- 
-
-select sysdate from dual; 
-exit; 
+select sysdate from dual;
+exit;

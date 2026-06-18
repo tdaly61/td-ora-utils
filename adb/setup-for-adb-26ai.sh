@@ -18,7 +18,7 @@ detect_platform() {
 # Handles values containing '=' (e.g. URLs). Strips surrounding whitespace.
 ini_val() {
     local key="$1"
-    grep -m1 "^${key}=" "$CONFIG_FILE" | cut -d'=' -f2- | tr -d ' \n\r'
+    grep -m1 "^${key}=" "$CONFIG_FILE" | cut -d'=' -f2- | sed 's/[[:space:]]*#.*//' | tr -d ' \n\r'
 }
 
 # Available disk space in KB for a given path (cross-platform)

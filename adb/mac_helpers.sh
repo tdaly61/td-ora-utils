@@ -6,6 +6,88 @@
 # Only Colima is supported as the container runtime on macOS.
 # If Docker Desktop, Rancher Desktop, or OrbStack is running, the scripts
 # exit with a message to shut it down first.
+#
+# k3s co-existence: mifos-gazelle starts Colima with --kubernetes. When running
+# Oracle ADB, k3s competes for memory (6-8 GB). Use stop_k3s_mac / start_k3s_mac
+# (or run-adb-26ai.sh -k) to pause k3s without restarting Colima.
+
+# ─────────────────────────────────────────────────────────────────
+# k3s helpers — pause/resume Kubernetes inside the Colima VM so that
+# Oracle ADB gets the memory it needs without restarting Colima.
+# ─────────────────────────────────────────────────────────────────
+
+# Returns 0 if k8s containers are present in the Docker daemon, 1 otherwise.
+# DOCKER_HOST is already set to the Colima socket by set_docker_host_mac —
+# call docker directly rather than going through colima ssh.
+k3s_is_running_mac() {
+    local count
+    count=$(docker ps -q --filter "label=io.kubernetes.pod.namespace" 2>/dev/null \
+            | wc -l | tr -d ' ')
+    [ "${count:-0}" -gt 0 ]
+}
+
+# Count application (non-kube-system) k8s containers in Docker.
+k3s_app_pod_count_mac() {
+    docker ps \
+        --filter "label=io.kubernetes.pod.namespace" \
+        --format '{{.Label "io.kubernetes.pod.namespace"}}' 2>/dev/null \
+        | grep -v "^kube-system$" | grep -v "^$" | wc -l | tr -d ' ' || echo 0
+}
+
+# Stop k3s inside the Colima VM. Colima and Docker keep running.
+# Order matters: disable+stop the systemd unit FIRST so Restart= cannot fire,
+# then run k3s-killall.sh for full cleanup, then force-remove any survivors.
+stop_k3s_mac() {
+    local k8s_count
+    k8s_count=$(docker ps -q --filter "label=io.kubernetes.pod.namespace" 2>/dev/null \
+                | wc -l | tr -d ' ')
+
+    if [ "${k8s_count:-0}" -eq 0 ]; then
+        echo "No k8s containers in Docker — k3s already stopped."
+        return
+    fi
+
+    echo "Found $k8s_count k8s container(s) — stopping k3s..."
+
+    # 1. Disable + stop the systemd unit BEFORE killing anything.
+    #    This prevents systemd's Restart= from respawning k3s after kill.
+    colima ssh -- sudo systemctl disable k3s 2>/dev/null || true
+    colima ssh -- sudo systemctl stop k3s    2>/dev/null || true
+
+    # 2. k3s-killall.sh cleans up containers, mounts, and network interfaces.
+    colima ssh -- sudo k3s-killall.sh >/dev/null 2>&1 || true
+
+    # 3. Force-remove any Docker containers that survived the above.
+    local survivors
+    survivors=$(docker ps -aq --filter "label=io.kubernetes.pod.namespace" 2>/dev/null)
+    if [ -n "$survivors" ]; then
+        echo "$survivors" | xargs docker rm -f 2>/dev/null || true
+    fi
+
+    sleep 2
+    local after
+    after=$(docker ps -q --filter "label=io.kubernetes.pod.namespace" 2>/dev/null \
+            | wc -l | tr -d ' ')
+    echo "k3s stopped and disabled. k8s containers remaining: ${after:-0}"
+    echo "  To restore k3s:      colima ssh -- sudo systemctl enable k3s && sudo systemctl start k3s"
+    echo "  To redeploy gazelle: sudo ./run.sh -u \$USER -m deploy -a all"
+}
+
+# Start k3s inside the Colima VM (after it was stopped by stop_k3s_mac).
+start_k3s_mac() {
+    if k3s_is_running_mac; then
+        echo "k3s is already running."
+        return
+    fi
+    if ! docker info &>/dev/null 2>&1; then
+        echo "ERROR: Docker (Colima) is not reachable. Start Colima first."
+        return 1
+    fi
+    echo "Starting k3s inside Colima VM..."
+    colima ssh -- sudo systemctl enable k3s 2>/dev/null || true
+    colima ssh -- sudo systemctl start k3s
+    echo "k3s started. Redeploy mifos-gazelle with: sudo ./run.sh -u \$USER -m deploy -a all"
+}
 
 # ─────────────────────────────────────────────────────────────────
 # check_no_conflicting_runtime_mac — exit if a non-Colima Docker

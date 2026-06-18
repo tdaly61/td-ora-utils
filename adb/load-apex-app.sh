@@ -20,6 +20,8 @@
 #       Format: STATIC_ID=https://endpoint  (repeat for multiple servers)
 #       Supported IDs: OCI_GROK_BIG, META_LLAMA_33_70B_INSTRUCT
 #       (default: URLs extracted from the export file)
+#   -v  Path to an app-specific vector/model setup SQL file (run as ADMIN after import)
+#       Use this to load ONNX models the app needs (e.g. Set_Up_Vector_Stuff.sql)
 #   -h  Show this help message
 #
 # Prerequisites:
@@ -54,6 +56,9 @@ Options:
                       Repeat the flag for multiple servers.
                       Default URLs come from LLM_<STATIC_ID> entries in config.ini.
                       Example: -r OCI_GROK_BIG=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com
+  -v <file>           App-specific vector/model setup SQL (run as ADMIN after import).
+                      Loads ONNX models the app needs from ONNX_STAGING (staged by run-adb-26ai.sh).
+                      Example: -v /path/to/caseweave/apex-sql-src/Set_Up_Vector_Stuff.sql
   -h                  Show this help message and exit
 
 Prerequisites:
@@ -83,7 +88,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 cfg_val() {
-  awk -F "=" "/^${1}[[:space:]]*=/ {print \$2}" "$CONFIG_FILE" | tr -d ' \n\r'
+  awk -F "=" "/^${1}[[:space:]]*=/ {print \$2}" "$CONFIG_FILE" | sed 's/[[:space:]]*#.*//' | tr -d ' \n\r'
 }
 
 DEFAULT_PASSWORD=$(cfg_val DEFAULT_PASSWORD)
@@ -115,9 +120,10 @@ done < "$CONFIG_FILE"
 APEX_SQL=""
 OVERRIDE_USER=""
 OVERRIDE_PASS=""
+VECTOR_SQL=""
 declare -A RS_OVERRIDES=()
 
-while getopts ":f:u:p:s:r:h" opt; do
+while getopts ":f:u:p:s:r:v:h" opt; do
   case $opt in
     f) APEX_SQL="$OPTARG" ;;
     u) OVERRIDE_USER="$OPTARG" ;;
@@ -127,6 +133,7 @@ while getopts ":f:u:p:s:r:h" opt; do
        _rs_id="${OPTARG%%=*}"
        _rs_url="${OPTARG#*=}"
        RS_OVERRIDES["$_rs_id"]="$_rs_url" ;;
+    v) VECTOR_SQL="$OPTARG" ;;
     h) usage ;;
     :) echo "ERROR: -$OPTARG requires an argument."; exit 1 ;;
     \?) echo "ERROR: Unknown option -$OPTARG"; exit 1 ;;
@@ -146,14 +153,32 @@ done
 _RS_BLOCK=""
 for _rs_key in "${!RS_FINAL[@]}"; do
   [ -z "$_RS_BLOCK" ] && _RS_BLOCK="BEGIN"$'\n'
-  _RS_BLOCK+="  apex_application_install.set_remote_server(p_static_id => '${_rs_key}', p_base_url => '${RS_FINAL[$_rs_key]}');"$'\n'
+  _rs_url="${RS_FINAL[$_rs_key]%/}"
+  # OpenAI-compatible providers (Ollama local) need /v1 appended so APEX calls
+  # /v1/chat/completions rather than /chat/completions.
+  [ "${LLM_TYPE[$_rs_key]:-}" = "local" ] && _rs_url="${_rs_url}/v1"
+  _RS_BLOCK+="  apex_application_install.set_remote_server(p_static_id => '${_rs_key}', p_base_url => '${_rs_url}');"$'\n'
 done
 [ -n "$_RS_BLOCK" ] && _RS_BLOCK+="  DBMS_OUTPUT.PUT_LINE('Remote server base URLs set.');"$'\n'"END;"$'\n'"/"
 
 # ── Resolve APEX export file ──────────────────────────────────────────────────
 if [ -z "$APEX_SQL" ]; then
-  echo ""
-  read -r -p "Enter path to APEX export SQL file: " APEX_SQL
+  _cfg_export=$(cfg_val APEX_EXPORT_FILE)
+  if [ -n "$_cfg_export" ]; then
+    APEX_SQL="$_cfg_export"
+    echo "Using APEX export file from config.ini: $APEX_SQL"
+  else
+    echo ""
+    read -r -p "Enter path to APEX export SQL file: " APEX_SQL
+  fi
+fi
+
+if [ -z "$VECTOR_SQL" ]; then
+  _cfg_vector=$(cfg_val APEX_VECTOR_SQL)
+  if [ -n "$_cfg_vector" ]; then
+    VECTOR_SQL="$_cfg_vector"
+    echo "Using vector setup SQL from config.ini: $VECTOR_SQL"
+  fi
 fi
 
 APEX_SQL="${APEX_SQL/#\~/$HOME}"
@@ -427,7 +452,54 @@ exit
 ACL_EOF
 echo "Role step complete."
 
-# ── Step 4: Configure local LLM AI services for the app workspace ──────────────
+# ── Step 3b: Grant outbound network ACL to schema user ───────────────────────
+# Required for Generative AI HTTP calls: APEX makes UTL_HTTP requests using the
+# workspace schema's identity, so the schema user needs connect+resolve on '*'.
+echo ""
+echo "=== Step 3b: Granting network ACL to $SCHEMA_USER_UPPER ==="
+"$SQLPLUS" -s "admin/$DEFAULT_PASSWORD@$SERVICE_NAME" << NET_ACL_EOF
+SET SERVEROUTPUT ON SIZE UNLIMITED
+WHENEVER SQLERROR CONTINUE
+BEGIN
+  DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
+    host => '*',
+    ace  => xs\$ace_type(
+              privilege_list => xs\$name_list('connect', 'resolve'),
+              principal_name => '$SCHEMA_USER_UPPER',
+              principal_type => xs_acl.ptype_db));
+  DBMS_OUTPUT.PUT_LINE('Network ACL granted to $SCHEMA_USER_UPPER.');
+EXCEPTION WHEN OTHERS THEN
+  DBMS_OUTPUT.PUT_LINE('Network ACL note: ' || SQLERRM);
+END;
+/
+exit
+NET_ACL_EOF
+echo "Network ACL step complete."
+
+# ── Step 4: Load app-specific ONNX model (if -v supplied) ────────────────────
+# Runs the app's vector setup SQL as ADMIN so it can call DBMS_VECTOR.LOAD_ONNX_MODEL
+# and grant the resulting mining model to the app's schema.
+# The ONNX file must already be staged by run-adb-26ai.sh (ONNX_STAGING directory).
+if [ -n "$VECTOR_SQL" ]; then
+  VECTOR_SQL="${VECTOR_SQL/#\~/$HOME}"
+  VECTOR_SQL="$(realpath -m "$VECTOR_SQL" 2>/dev/null || echo "$VECTOR_SQL")"
+  if [ ! -f "$VECTOR_SQL" ]; then
+    echo "ERROR: Vector setup SQL not found: $VECTOR_SQL"
+    exit 1
+  fi
+  echo ""
+  echo "=== Step 4: Loading ONNX model from $VECTOR_SQL ==="
+  # Pass schema user + password as positional args (&1 &2 in the SQL file)
+  # so the script can CONNECT as the app schema without hardcoding credentials.
+  "$SQLPLUS" -s "admin/$DEFAULT_PASSWORD@$SERVICE_NAME" \
+    "@$VECTOR_SQL" "$SCHEMA_USER" "$SCHEMA_PASS" "$SERVICE_NAME"
+  echo "Vector setup step complete."
+else
+  echo ""
+  echo "=== Step 4: Skipped — no vector setup SQL supplied (-v) ==="
+fi
+
+# ── Step 5: Configure local LLM AI services for the app workspace ──────────────
 # Runs for each LLM_* entry with type=local in config.ini.
 # Creates (or updates) an encrypted APEX workspace credential and Generative AI
 # remote server entry.  The credential secret is stored via the APEX API so it
@@ -440,107 +512,59 @@ for _LLM_ID in "${!LLM_TYPE[@]}"; do
   _LLM_MODEL="${LLM_MODEL[$_LLM_ID]}"
   _LLM_CRED_SID="${_LLM_ID}_CRED"
   echo ""
-  echo "=== Step 4: Configuring local LLM '${_LLM_ID}' for $SCHEMA_USER_UPPER ==="
+  echo "=== Step 5: Configuring local LLM '${_LLM_ID}' for $SCHEMA_USER_UPPER ==="
 
   "$SQLPLUS" -s "admin/$DEFAULT_PASSWORD@$SERVICE_NAME" << OLLAMA_EOF
 SET SERVEROUTPUT ON SIZE UNLIMITED
 WHENEVER SQLERROR CONTINUE
 
+-- wwv_credentials is VPD-protected: use apex_credential.set_persistent_credentials
+-- (definer-rights, owned by APEX_240200) which bypasses the VPD policy.
+-- The remote server base_url was set correctly by set_remote_server in Step 2
+-- (_RS_BLOCK appends /v1 for local-type LLMs).  Direct UPDATE on wwv_remote_servers
+-- via external sqlplus is blocked by VPD even with set_workspace (ORA-41900).
+-- To fix an already-installed app's URL: re-run load-apex-app.sh (re-import is
+-- idempotent) or update via APEX UI: Workspace Utilities > Generative AI > Edit.
 DECLARE
-  v_ws_id      NUMBER;
-  v_apex_owner VARCHAR2(128);
-  v_cred_id    NUMBER;
-  v_srv_id     NUMBER;
-  v_static_id  VARCHAR2(100) := '$_LLM_ID';
-  v_cred_sid   VARCHAR2(100) := '$_LLM_CRED_SID';
-  v_base_url   VARCHAR2(500) := '$_LLM_API_URL';
-  v_model      VARCHAR2(100) := '$_LLM_MODEL';
-  v_sql        VARCHAR2(4000);
+  v_ws_id    NUMBER;
+  v_cred_sid VARCHAR2(100) := '$_LLM_CRED_SID';
+  v_base_url VARCHAR2(500) := '$_LLM_API_URL';
+  v_model    VARCHAR2(100) := '$_LLM_MODEL';
 BEGIN
   SELECT workspace_id INTO v_ws_id
     FROM apex_workspaces
    WHERE workspace = UPPER('$SCHEMA_USER_UPPER');
 
-  SELECT username INTO v_apex_owner
-    FROM dba_users
-   WHERE username LIKE 'APEX_%'
-     AND oracle_maintained = 'Y'
-     AND username NOT IN ('APEX_PUBLIC_USER','APEX_LISTENER','APEX_REST_PUBLIC_USER','APEX_PUBLIC_ROUTER')
-     AND ROWNUM = 1;
+  EXECUTE IMMEDIATE 'BEGIN
+    apex_util.set_workspace(p_workspace => UPPER(''$SCHEMA_USER_UPPER''));
+    apex_util.set_security_group_id(p_security_group_id => ' || v_ws_id || ');
+  END;';
 
-  -- Step A: Create or locate the workspace credential row (secret set in step B)
-  v_sql := 'SELECT id FROM ' || v_apex_owner || '.wwv_credentials'
-        || ' WHERE security_group_id = :ws AND static_id = :sid';
+  -- Encrypt the Ollama credential secret imported from the APEX export.
   BEGIN
-    EXECUTE IMMEDIATE v_sql INTO v_cred_id USING v_ws_id, v_cred_sid;
-    DBMS_OUTPUT.PUT_LINE('Credential ' || v_cred_sid || ' exists (id=' || v_cred_id || ') — will re-encrypt.');
+    apex_credential.set_persistent_credentials(
+      p_credential_static_id => v_cred_sid,
+      p_key                  => 'Authorization',
+      p_value                => 'Bearer ollama-no-auth-needed'
+    );
+    DBMS_OUTPUT.PUT_LINE('Credential secret encrypted: ' || v_cred_sid);
   EXCEPTION
-    WHEN NO_DATA_FOUND THEN
-      v_sql := 'SELECT ' || v_apex_owner || '.wwv_seq.nextval FROM dual';
-      EXECUTE IMMEDIATE v_sql INTO v_cred_id;
-      v_sql := 'INSERT INTO ' || v_apex_owner || '.wwv_credentials'
-            || ' (id, security_group_id, name, static_id,'
-            || '  authentication_type, client_id,'
-            || '  prompt_on_install,'
-            || '  created_by, created_on, last_updated_by, last_updated_on)'
-            || ' VALUES (:id, :ws, :nm, :sid,'
-            || '  ''HTTP_HEADER'', ''Authorization'','
-            || '  ''Y'','
-            || '  USER, SYSDATE, USER, SYSDATE)';
-      EXECUTE IMMEDIATE v_sql USING v_cred_id, v_ws_id, v_static_id || ' Credential', v_cred_sid;
-      DBMS_OUTPUT.PUT_LINE('Credential created: ' || v_cred_sid);
+    WHEN OTHERS THEN
+      DBMS_OUTPUT.PUT_LINE('Credential note (' || v_cred_sid || '): ' || SQLERRM);
+      DBMS_OUTPUT.PUT_LINE('  Set manually: APEX > Workspace Utilities > Credentials > ' || v_cred_sid);
   END;
 
-  -- Step B: Encrypt the secret via APEX API.
-  --   Direct INSERT of plaintext raises ORA-28817 at runtime.
-  apex_util.set_workspace(p_workspace => '$SCHEMA_USER_UPPER');
-  apex_credential.set_persistent_credentials(
-    p_credential_static_id => v_cred_sid,
-    p_key                  => 'Authorization',
-    p_value                => 'Bearer ollama-no-auth-needed'
-  );
-  DBMS_OUTPUT.PUT_LINE('Credential secret encrypted.');
-
-  -- Step C: Create or update the Generative AI remote server entry
-  v_sql := 'SELECT id FROM ' || v_apex_owner || '.wwv_remote_servers'
-        || ' WHERE security_group_id = :ws AND static_id = :sid';
-  BEGIN
-    EXECUTE IMMEDIATE v_sql INTO v_srv_id USING v_ws_id, v_static_id;
-    v_sql := 'UPDATE ' || v_apex_owner || '.wwv_remote_servers'
-          || ' SET base_url = :url, ai_model_name = :mdl,'
-          || '     credential_id = :cid,'
-          || '     last_updated_on = SYSDATE, last_updated_by = USER'
-          || ' WHERE id = :id';
-    EXECUTE IMMEDIATE v_sql USING v_base_url, v_model, v_cred_id, v_srv_id;
-    DBMS_OUTPUT.PUT_LINE('AI service updated: ' || v_static_id || ' -> ' || v_base_url || ' (' || v_model || ')');
-  EXCEPTION
-    WHEN NO_DATA_FOUND THEN
-      v_sql := 'SELECT ' || v_apex_owner || '.wwv_seq.nextval FROM dual';
-      EXECUTE IMMEDIATE v_sql INTO v_srv_id;
-      v_sql := 'INSERT INTO ' || v_apex_owner || '.wwv_remote_servers'
-            || ' (id, security_group_id, name, static_id, base_url,'
-            || '  server_type, ai_provider_type, ai_is_builder_service,'
-            || '  ai_model_name, credential_id, prompt_on_install,'
-            || '  created_by, created_on, last_updated_by, last_updated_on)'
-            || ' VALUES (:id, :ws, :nm, :sid, :url,'
-            || '  ''GENERATIVE_AI'', ''OPENAI'', ''N'','
-            || '  :mdl, :cid, ''Y'','
-            || '  USER, SYSDATE, USER, SYSDATE)';
-      EXECUTE IMMEDIATE v_sql USING v_srv_id, v_ws_id,
-        v_static_id, v_static_id, v_base_url, v_model, v_cred_id;
-      DBMS_OUTPUT.PUT_LINE('AI service created: ' || v_static_id || ' -> ' || v_base_url || ' (' || v_model || ')');
-  END;
-
+  DBMS_OUTPUT.PUT_LINE('AI service expected: $_LLM_ID -> ' || v_base_url || ' (model: ' || v_model || ')');
   COMMIT;
 END;
 /
 exit
 OLLAMA_EOF
-  echo "Local LLM service step complete: $_LLM_ID"
+  echo "Step 5 complete: $_LLM_ID"
 done
 if [ "$_local_llm_count" -eq 0 ]; then
   echo ""
-  echo "=== Step 4: Skipped — no local LLM entries (type=local) in config.ini ==="
+  echo "=== Step 5: Skipped — no local LLM entries (type=local) in config.ini ==="
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────

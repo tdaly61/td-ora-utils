@@ -1,14 +1,13 @@
--- setup-ollama-ai.sql
+-- setup-ollama-ai.sql.tpl
 -- Configures outbound network access and registers Ollama as a generative AI
 -- provider so the Oracle 26ai Free database can call a local LLM.
--- Run as: SYSTEM (connected via sqlplus from the host) against FREEPDB1.
--- Grants that require SYS are executed inside the DB container by
--- run-adb-26ai.sh (see run_sql_file_as_sysdba).
+-- Run as: ADMIN (connected via sqlplus from the host) against the ADB-Free PDB.
 --
 -- Substitution tokens (replaced by generate_sql_files in run-adb-26ai.sh):
---   __APEX_USER__      — the application schema (e.g. TRACKER1)
---   __OLLAMA_BASE_URL__— Ollama endpoint from inside Docker (e.g. http://host.docker.internal:11434)
---   __OLLAMA_MODEL__   — Ollama model name (e.g. llama3)
+--   __APEX_USER__       — the application schema / APEX workspace (e.g. TRACKER1)
+--   __APEX_PASSWORD__   — the application user password
+--   __OLLAMA_BASE_URL__ — Ollama endpoint from inside Docker (e.g. http://host.docker.internal:11434)
+--   __OLLAMA_MODEL__    — Ollama model name (e.g. llama3.2:3b)
 
 SET SERVEROUTPUT ON;
 
@@ -17,22 +16,33 @@ SET SERVEROUTPUT ON;
 -- ─────────────────────────────────────────────────────────────────────────────
 DECLARE
   v_apex_installed NUMBER;
+  v_apex_owner     VARCHAR2(128);
 BEGIN
-  -- Grant to APEX flow schema owner (needed for APEX restful services)
-  SELECT COUNT(*) INTO v_apex_installed FROM dba_users WHERE username = 'APEX_PUBLIC_USER';
+  -- In Oracle 26ai ADB-Free, APEX_PUBLIC_USER does not exist. Detect APEX by
+  -- looking for the versioned schema (e.g. APEX_240200) the same way create-users.sql does.
+  SELECT COUNT(*) INTO v_apex_installed FROM dba_users
+  WHERE username LIKE 'APEX_%' AND oracle_maintained = 'Y'
+  AND username NOT IN ('APEX_PUBLIC_USER','APEX_LISTENER','APEX_REST_PUBLIC_USER','APEX_PUBLIC_ROUTER');
+
   IF v_apex_installed > 0 THEN
-    EXECUTE IMMEDIATE q'[
-      BEGIN
-        DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
-          host => '*',
-          ace  => xs$ace_type(
-                    privilege_list => xs$name_list('connect'),
-                    principal_name => APEX_APPLICATION.g_flow_schema_owner,
-                    principal_type => xs_acl.ptype_db));
-      END;]';
-    DBMS_OUTPUT.PUT_LINE('Network ACL granted to APEX flow schema owner.');
+    SELECT username INTO v_apex_owner FROM dba_users
+    WHERE username LIKE 'APEX_%' AND oracle_maintained = 'Y'
+    AND username NOT IN ('APEX_PUBLIC_USER','APEX_LISTENER','APEX_REST_PUBLIC_USER','APEX_PUBLIC_ROUTER')
+    AND ROWNUM = 1;
+
+    -- Use the schema name directly rather than APEX_APPLICATION.g_flow_schema_owner,
+    -- which requires an initialized APEX request context (not available via external sqlplus).
+    EXECUTE IMMEDIATE 'BEGIN
+      DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
+        host => ''*'',
+        ace  => xs$ace_type(
+                  privilege_list => xs$name_list(''connect''),
+                  principal_name => ''' || v_apex_owner || ''',
+                  principal_type => xs_acl.ptype_db));
+    END;';
+    DBMS_OUTPUT.PUT_LINE('Network ACL granted to APEX schema owner (' || v_apex_owner || ').');
   ELSE
-    DBMS_OUTPUT.PUT_LINE('APEX not installed — skipping APEX flow schema owner ACL.');
+    DBMS_OUTPUT.PUT_LINE('APEX schema owner not found — skipping APEX flow schema owner ACL.');
   END IF;
 END;
 /
@@ -49,7 +59,7 @@ BEGIN
 END;
 /
 
--- Also grant to SYSTEM so admin scripts can test connectivity
+-- Grant to SYSTEM and ADMIN so admin scripts can test connectivity via UTL_HTTP
 BEGIN
   DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
     host => '*',
@@ -61,11 +71,19 @@ BEGIN
 END;
 /
 
+BEGIN
+  DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
+    host => '*',
+    ace  => xs$ace_type(
+              privilege_list => xs$name_list('connect', 'resolve'),
+              principal_name => 'ADMIN',
+              principal_type => xs_acl.ptype_db));
+  DBMS_OUTPUT.PUT_LINE('Network ACL granted to ADMIN.');
+END;
+/
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 2. Grant UTL_HTTP and DBMS_VECTOR_CHAIN to __APEX_USER__
---    These are SYS-owned packages so we need to grant via SYS.
---    SYSTEM can grant them using EXECUTE IMMEDIATE from the SYS context
---    available through the DBA role granted to SYSTEM in Oracle Free.
 -- ─────────────────────────────────────────────────────────────────────────────
 BEGIN
   EXECUTE IMMEDIATE 'GRANT EXECUTE ON SYS.UTL_HTTP TO __APEX_USER__';
@@ -73,7 +91,6 @@ BEGIN
 EXCEPTION
   WHEN OTHERS THEN
     DBMS_OUTPUT.PUT_LINE('UTL_HTTP grant note: ' || SQLERRM);
-    DBMS_OUTPUT.PUT_LINE('Will be granted by run-adb-26ai.sh via SYS inside container.');
 END;
 /
 
@@ -83,20 +100,21 @@ BEGIN
 EXCEPTION
   WHEN OTHERS THEN
     DBMS_OUTPUT.PUT_LINE('DBMS_VECTOR_CHAIN grant note: ' || SQLERRM);
-    DBMS_OUTPUT.PUT_LINE('Will be granted by run-adb-26ai.sh via SYS inside container.');
 END;
 /
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 3. Create DB credential for Ollama (used by DBMS_VECTOR_CHAIN).
 --    Ollama has no auth, but Oracle requires a credential object.
+--    ADMIN may lack CREATE CREDENTIAL privilege on ADB-Free — wrap in exception
+--    so the script continues; DBMS_VECTOR_CHAIN JSON config works without it.
 -- ─────────────────────────────────────────────────────────────────────────────
 DECLARE
   v_count NUMBER;
 BEGIN
   SELECT COUNT(*) INTO v_count
     FROM all_credentials
-   WHERE owner = 'SYSTEM' AND credential_name = 'OLLAMA_CRED';
+   WHERE owner = 'ADMIN' AND credential_name = 'OLLAMA_CRED';
   IF v_count > 0 THEN
     DBMS_OUTPUT.PUT_LINE('Credential OLLAMA_CRED already exists — dropping and recreating.');
     DBMS_CREDENTIAL.DROP_CREDENTIAL(credential_name => 'OLLAMA_CRED');
@@ -106,14 +124,15 @@ BEGIN
     username        => 'OLLAMA',
     password        => 'not-needed');
   DBMS_OUTPUT.PUT_LINE('Credential OLLAMA_CRED created.');
+EXCEPTION
+  WHEN OTHERS THEN
+    DBMS_OUTPUT.PUT_LINE('Note: OLLAMA_CRED skipped (' || SQLERRM || ')');
+    DBMS_OUTPUT.PUT_LINE('  DBMS_VECTOR_CHAIN JSON config works without a named credential.');
 END;
 /
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 4. Connectivity test — skipped when running from host sqlplus because
---    __OLLAMA_BASE_URL__ (host.docker.internal) only resolves inside Docker.
---    The validate_ollama_from_db() function in run-adb-26ai.sh performs the
---    definitive test from inside the DB container.
+-- 4. Connectivity note
 -- ─────────────────────────────────────────────────────────────────────────────
 PROMPT Note: Ollama connectivity is validated from inside the DB container by run-adb-26ai.sh.
 PROMPT       Skipping UTL_HTTP test here (host.docker.internal does not resolve on the host).
@@ -122,8 +141,11 @@ PROMPT       Skipping UTL_HTTP test here (host.docker.internal does not resolve 
 -- 5. Register Ollama as an APEX Generative AI Service for the __APEX_USER__
 --    workspace so it appears under Workspace Utilities > Generative AI.
 --    Uses the OpenAI-compatible endpoint (/v1) that Ollama exposes.
---    Also creates an APEX workspace credential (HTTP_HEADER type with a
---    dummy Bearer token) since APEX requires one for OpenAI-type providers.
+--
+--    VPD on wwv_credentials and wwv_remote_servers enforces that queries
+--    only return rows for the current APEX security_group_id.  We must call
+--    apex_util.set_workspace BEFORE accessing those tables, otherwise the
+--    ADMIN session defaults to the INTERNAL context and ORA-41900 is raised.
 -- ─────────────────────────────────────────────────────────────────────────────
 DECLARE
   v_ws_id      NUMBER;
@@ -139,8 +161,12 @@ BEGIN
     FROM apex_workspaces
    WHERE workspace = '__APEX_USER__';
 
-  -- Discover the current APEX schema owner (e.g. APEX_240200) so this
-  -- script survives APEX upgrades without hard-coding the version.
+  -- Set workspace context FIRST so VPD on wwv_credentials/wwv_remote_servers
+  -- allows access and uses the correct security_group_id.
+  apex_util.set_workspace(p_workspace => '__APEX_USER__');
+  apex_util.set_security_group_id(p_security_group_id => v_ws_id);
+
+  -- Discover the current APEX schema owner (e.g. APEX_240200).
   SELECT username INTO v_apex_owner
     FROM dba_users
    WHERE username LIKE 'APEX_%'
@@ -148,9 +174,9 @@ BEGIN
      AND username NOT IN ('APEX_PUBLIC_USER','APEX_LISTENER','APEX_REST_PUBLIC_USER','APEX_PUBLIC_ROUTER')
      AND ROWNUM = 1;
 
-  -- Step A: Create or update the APEX workspace credential (HTTP_HEADER type).
-  -- APEX sends this as "Authorization: Bearer <key>" on each request to Ollama.
-  -- Ollama ignores the header, but APEX requires a credential for OpenAI providers.
+  -- Step A: Create or look up the APEX workspace credential (HTTP_HEADER type).
+  -- Ollama ignores the Authorization header, but APEX requires a credential for
+  -- OpenAI-type providers.
   v_sql := 'SELECT id FROM ' || v_apex_owner || '.wwv_credentials'
         || ' WHERE security_group_id = :ws AND static_id = :sid';
   BEGIN
@@ -179,7 +205,7 @@ BEGIN
         || ' WHERE security_group_id = :ws AND static_id = :sid';
   BEGIN
     EXECUTE IMMEDIATE v_sql INTO v_srv_id USING v_ws_id, v_static_id;
-    DBMS_OUTPUT.PUT_LINE('APEX AI service ' || v_static_id || ' already exists (id=' || v_srv_id || ') — updating.');
+    DBMS_OUTPUT.PUT_LINE('APEX AI service ' || v_static_id || ' already exists — updating.');
     v_sql := 'UPDATE ' || v_apex_owner || '.wwv_remote_servers'
           || ' SET base_url = :url, ai_model_name = :mdl,'
           || '     credential_id = :cid,'
@@ -204,6 +230,21 @@ BEGIN
         '__OLLAMA_BASE_URL__/v1', '__OLLAMA_MODEL__', v_cred_id;
       DBMS_OUTPUT.PUT_LINE('APEX AI service created: ' || v_static_id || ' -> __OLLAMA_BASE_URL__/v1 (model: __OLLAMA_MODEL__)');
   END;
+
+  -- Step C: Encrypt the credential secret via the APEX API so APEX can decrypt
+  -- it at runtime with DBMS_CRYPTO (direct INSERT stores plaintext → ORA-28817).
+  BEGIN
+    apex_credential.set_persistent_credentials(
+      p_credential_static_id => v_cred_sid,
+      p_key                  => 'Authorization',
+      p_value                => 'Bearer ollama-no-auth-needed'
+    );
+    DBMS_OUTPUT.PUT_LINE('Credential secret encrypted: ' || v_cred_sid);
+  EXCEPTION
+    WHEN OTHERS THEN
+      DBMS_OUTPUT.PUT_LINE('Credential encrypt note: ' || SQLERRM);
+  END;
+
   COMMIT;
 END;
 /
