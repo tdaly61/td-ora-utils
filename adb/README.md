@@ -45,6 +45,7 @@ macOS host
 ./setup-for-adb-26ai.sh
 
 # 2. Start everything (ADB container + nginx proxy + ONNX model + APEX users)
+#    Add -k if mifos-gazelle Kubernetes pods are running (see "mifos-gazelle co-existence" below)
 ./run-adb-26ai.sh
 
 # 3. Load your APEX application (uses APEX_EXPORT_FILE from config.ini by default)
@@ -206,6 +207,55 @@ Plain TCP (`dsn = localhost:1521/FREEPDB1`) will fail — ADB-Free does not expo
 | Ollama direct (HTTP) | `http://localhost:11434` (macOS host) |
 
 Default credentials: **Workspace** `TRACKER1` · **User** `TRACKER1` · **Password** `Welcome_MY_ATP_123`
+
+---
+
+## mifos-gazelle co-existence
+
+Both this project and mifos-gazelle share the **same Colima VM** (the default profile). mifos-gazelle starts that VM with `--kubernetes`, so k3s and its system pods occupy 6–8 GB of the VM's RAM. When Oracle ADB is also running, the two compete for memory.
+
+### Check whether k3s is running
+
+```bash
+./run-adb-26ai.sh      # prints a WARNING and the k3s pod count if k3s is active
+```
+
+Or check directly:
+
+```bash
+docker ps --filter "label=io.kubernetes.pod.namespace" --format "table {{.Names}}\t{{.Status}}"
+```
+
+### Stop k3s before starting Oracle ADB
+
+```bash
+# Stops k3s inside the Colima VM; Colima and Docker keep running.
+./run-adb-26ai.sh -k
+```
+
+`-k` disables and stops k3s via `systemctl`, then runs `k3s-killall.sh` to release
+containers and network interfaces. Colima continues running so Oracle ADB starts
+without a VM restart.
+
+### Restore k3s when you switch back to mifos-gazelle
+
+```bash
+colima ssh -- sudo systemctl enable k3s && colima ssh -- sudo systemctl start k3s
+# Then redeploy mifos-gazelle if needed:
+# sudo ./run.sh -u $USER -m deploy -a all
+```
+
+Or use the helper directly from the project root:
+
+```bash
+source adb/mac_helpers.sh && start_k3s_mac
+```
+
+### Tips
+
+- `COLIMA_DISK=100` in `config.ini` covers both projects (~35 GB mifos + ~20 GB Oracle).
+- You do not need to resize or recreate the Colima VM when switching between projects.
+- Stopping k3s does **not** delete Kubernetes workloads; they resume when k3s restarts.
 
 ---
 
