@@ -81,29 +81,28 @@ for _arg in "$@"; do
 done
 unset _arg
 
-# ── Read config.ini ───────────────────────────────────────────────────────────
+# ── Shared utilities ──────────────────────────────────────────────────────────
 if [ ! -f "$CONFIG_FILE" ]; then
   echo "ERROR: config.ini not found in $RUN_DIR"
   exit 1
 fi
 
-cfg_val() {
-  awk -F "=" "/^${1}[[:space:]]*=/ {print \$2}" "$CONFIG_FILE" | sed 's/[[:space:]]*#.*//' | tr -d ' \n\r'
-}
+# shellcheck source=common.sh
+source "$RUN_DIR/common.sh"
 
-DEFAULT_PASSWORD=$(cfg_val DEFAULT_PASSWORD)
-SERVICE_NAME=$(cfg_val SERVICE_NAME); SERVICE_NAME=${SERVICE_NAME:-myatp_high}
+DEFAULT_PASSWORD=$(ini_val DEFAULT_PASSWORD)
+SERVICE_NAME=$(ini_val SERVICE_NAME); SERVICE_NAME=${SERVICE_NAME:-myatp_high}
 
 # Platform-aware Instant Client selection
 case "$(uname -s)" in
-  Darwin*) INSTANT_CLIENT=$(cfg_val INSTANT_CLIENT_MAC) ;;
-  *)       INSTANT_CLIENT=$(cfg_val INSTANT_CLIENT) ;;
+  Darwin*) INSTANT_CLIENT=$(ini_val INSTANT_CLIENT_MAC) ;;
+  *)       INSTANT_CLIENT=$(ini_val INSTANT_CLIENT) ;;
 esac
-[ -z "$INSTANT_CLIENT" ] && INSTANT_CLIENT=$(cfg_val INSTANT_CLIENT)
+[ -z "$INSTANT_CLIENT" ] && INSTANT_CLIENT=$(ini_val INSTANT_CLIENT)
 
-APEX_PORT=$(cfg_val APEX_PORT);     APEX_PORT=${APEX_PORT:-8443}
-APEX_USER=$(cfg_val APEX_USER);     APEX_USER=${APEX_USER:-TRACKER1}
-APEX_PASSWORD=$(cfg_val APEX_PASSWORD); APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
+APEX_PORT=$(ini_val APEX_PORT);     APEX_PORT=${APEX_PORT:-8443}
+APEX_USER=$(ini_val APEX_USER);     APEX_USER=${APEX_USER:-TRACKER1}
+APEX_PASSWORD=$(ini_val APEX_PASSWORD); APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
 # Read LLM_<STATIC_ID>=<url>|<model>|<type> entries from config.ini
 declare -A LLM_URL=()
 declare -A LLM_MODEL=()
@@ -163,7 +162,7 @@ done
 
 # ── Resolve APEX export file ──────────────────────────────────────────────────
 if [ -z "$APEX_SQL" ]; then
-  _cfg_export=$(cfg_val APEX_EXPORT_FILE)
+  _cfg_export=$(ini_val APEX_EXPORT_FILE)
   if [ -n "$_cfg_export" ]; then
     APEX_SQL="$_cfg_export"
     echo "Using APEX export file from config.ini: $APEX_SQL"
@@ -174,7 +173,7 @@ if [ -z "$APEX_SQL" ]; then
 fi
 
 if [ -z "$VECTOR_SQL" ]; then
-  _cfg_vector=$(cfg_val APEX_VECTOR_SQL)
+  _cfg_vector=$(ini_val APEX_VECTOR_SQL)
   if [ -n "$_cfg_vector" ]; then
     VECTOR_SQL="$_cfg_vector"
     echo "Using vector setup SQL from config.ini: $VECTOR_SQL"
@@ -264,6 +263,7 @@ DECLARE
   v_user_exists    NUMBER;
   v_apex_installed NUMBER;
   v_ws_exists      NUMBER;
+  v_ws_id          NUMBER;
 BEGIN
 
   -- ── 1a. Create Oracle schema if it does not exist ──────────────────────────
@@ -313,9 +313,16 @@ BEGIN
     DBMS_OUTPUT.PUT_LINE('APEX workspace $SCHEMA_USER_UPPER already exists — skipped.');
   END IF;
 
+  -- Resolve workspace ID for use in set_security_group_id below.
+  SELECT workspace_id INTO v_ws_id
+  FROM   apex_workspaces
+  WHERE  workspace = UPPER('$SCHEMA_USER_UPPER');
+
   -- ── 1c. Create APEX admin user in the workspace if not present ─────────────
-  EXECUTE IMMEDIATE
-    'BEGIN apex_util.set_workspace(p_workspace => ''$SCHEMA_USER_UPPER''); END;';
+  -- set_security_group_id is more reliable than set_workspace when called from
+  -- a plain SQL*Plus admin session (set_workspace via EXECUTE IMMEDIATE does not
+  -- always propagate the package-level context before create_user runs).
+  apex_util.set_security_group_id(p_security_group_id => v_ws_id);
 
   DECLARE
     v_apex_user_exists NUMBER;
@@ -326,16 +333,14 @@ BEGIN
     AND    user_name      = UPPER('$SCHEMA_USER_UPPER');
 
     IF v_apex_user_exists = 0 THEN
-      EXECUTE IMMEDIATE q'[BEGIN
-        apex_util.create_user(
-          p_user_name                 => '$SCHEMA_USER_UPPER',
-          p_web_password              => '$SCHEMA_PASS',
-          p_developer_privs           => 'ADMIN:CREATE:DATA_LOADER:EDIT:HELP:MONITOR:SQL',
-          p_email_address             => '$SCHEMA_USER_UPPER@local',
-          p_default_schema            => '$SCHEMA_USER_UPPER',
-          p_account_expiry            => SYSDATE + 36500,
-          p_change_password_on_first_use => 'N');
-      END;]';
+      apex_util.create_user(
+        p_user_name                    => '$SCHEMA_USER_UPPER',
+        p_web_password                 => '$SCHEMA_PASS',
+        p_developer_privs              => 'ADMIN:CREATE:DATA_LOADER:EDIT:HELP:MONITOR:SQL',
+        p_email_address                => '$SCHEMA_USER_UPPER@local',
+        p_default_schema               => '$SCHEMA_USER_UPPER',
+        p_account_expiry               => SYSDATE + 36500,
+        p_change_password_on_first_use => 'N');
       DBMS_OUTPUT.PUT_LINE('APEX admin user $SCHEMA_USER_UPPER created in workspace.');
     ELSE
       DBMS_OUTPUT.PUT_LINE('APEX admin user $SCHEMA_USER_UPPER already exists — skipped.');

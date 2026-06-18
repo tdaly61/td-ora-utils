@@ -13,13 +13,6 @@ detect_platform() {
     ARCH=$(uname -m)   # x86_64 | arm64 | aarch64
 }
 
-# Read a single KEY=VALUE entry from CONFIG_FILE by exact key name.
-# Handles values containing '=' (e.g. URLs). Strips surrounding whitespace.
-ini_val() {
-    local key="$1"
-    grep -m1 "^${key}=" "$CONFIG_FILE" | cut -d'=' -f2- | sed 's/[[:space:]]*#.*//' | tr -d ' \n\r'
-}
-
 # Check if a container exists and is healthy/running. Returns:
 #   0 — container is running (reuse it)
 #   1 — container does not exist or was removed (create it)
@@ -234,6 +227,17 @@ run_sql_file() {
     echo "SQL file $sql_file executed successfully."
 }
 
+# Pipe SQL from stdin to sqlplus. Used for short inline statements where a temp
+# file would be noisy. Inherits WALLET_DIR, ORACLE_CLIENT_DIR, INSTANT_CLIENT.
+# Usage: run_sql_stdin [user]   (default: admin)  <<'SQL'  ...  SQL
+run_sql_stdin() {
+    local user="${1:-admin}"
+    TNS_ADMIN="$WALLET_DIR" \
+    LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    DYLD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
+        "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus" -s "$user/$DEFAULT_PASSWORD@$SERVICE_NAME"
+}
+
 # Enable MAX_STRING_SIZE=EXTENDED so VARCHAR2(32767) columns are supported.
 # ADB-Free typically has this enabled by default — the check will return early.
 enable_extended_string_size() {
@@ -242,12 +246,12 @@ enable_extended_string_size() {
     # Check via wallet-based external sqlplus (avoids docker exec -i stdin-EOF hang on macOS).
     # ADB-free ATP containers always have EXTENDED pre-configured; || true skips if unreachable.
     local current
-    current=$(printf 'SET PAGESIZE 0 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMOUT ON TRIMSPOOL ON\nSELECT value FROM v$parameter WHERE name='"'"'max_string_size'"'"';\nEXIT;\n' \
-        | TNS_ADMIN="$WALLET_DIR" \
-          LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-          DYLD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
-          "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus" -s \
-              "admin/$DEFAULT_PASSWORD@$SERVICE_NAME" 2>/dev/null) || true
+    current=$(run_sql_stdin admin 2>/dev/null <<'SQLEOF'
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMOUT ON TRIMSPOOL ON
+SELECT value FROM v$parameter WHERE name='max_string_size';
+EXIT;
+SQLEOF
+    ) || true
     current=$(echo "$current" | tr -d '[:space:]')
 
     # tr portable uppercase; treat empty (connection failed) as EXTENDED — safe for ADB-free
@@ -340,6 +344,7 @@ setup_apex_user_db_password() {
 # Start the ADB-Free 26ai single container (ORDS and APEX are pre-installed).
 run_adb() {
     echo "Starting ADB container from $DOCKER_IMAGE..."
+    # ADB-Free listens on 1522 internally; 1521 maps to the standard Oracle port externally.
     docker run -d \
         -p 1521:1522 \
         -p 1522:1522 \
@@ -404,9 +409,10 @@ show_dry_run_plan() {
     local k3s_state="n/a (Linux)"
     if [ "$PLATFORM" = "darwin" ]; then
         if k3s_is_running_mac 2>/dev/null; then
-            local _pc
+            local _pc _stop_note=""
             _pc=$(k3s_app_pod_count_mac 2>/dev/null || echo "?")
-            k3s_state="running  ($_pc app pods)$([ "$STOP_K3S" = "true" ] && echo "  → will be stopped (-k)")"
+            [ "$STOP_K3S" = "true" ] && _stop_note="  → will be stopped (-k)" || true
+            k3s_state="running  ($_pc app pods)$_stop_note"
         else
             k3s_state="stopped"
         fi
@@ -713,10 +719,7 @@ echo "  ssl_wallet cwallet.sso rebuilt with proxy cert included."
 TRUST_SHELL
 
     # 3. Drop any stale logon trigger from prior attempts (no longer needed)
-    TNS_ADMIN="$WALLET_DIR" \
-    LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-    DYLD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
-    "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus" -s "admin/$DEFAULT_PASSWORD@$SERVICE_NAME" << 'TRUST_EOF'
+    run_sql_stdin admin << 'TRUST_EOF'
 SET SERVEROUTPUT ON
 BEGIN
   FOR t IN (SELECT trigger_name FROM all_triggers
@@ -751,14 +754,22 @@ PROXY_NETWORK="oracle-ai-net"
 
 detect_platform
 
+# Source common utilities (ini_val, avail_kb_for_dir, colour helpers).
+# CONFIG_FILE not yet set — common.sh functions that use it are called later.
+# shellcheck source=common.sh
+source "$RUN_DIR/common.sh"
+
+# Source platform-specific helpers.
 if [ "$PLATFORM" = "darwin" ]; then
-    # Source mac_helpers.sh and set the correct Docker socket/context before any docker call.
-    # shellcheck source=mac_helpers.sh
-    source "$RUN_DIR/mac_helpers.sh"
     # Read CONTAINER_RUNTIME early (before full read_config) so set_docker_host_mac gets the right value.
     CONTAINER_RUNTIME=$(grep -m1 "^CONTAINER_RUNTIME=" "$RUN_DIR/config.ini" 2>/dev/null | cut -d'=' -f2- | tr -d ' \n\r')
     CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-auto}"
+    # shellcheck source=mac_helpers.sh
+    source "$RUN_DIR/mac_helpers.sh"
     set_docker_host_mac
+else
+    # shellcheck source=linux_helpers.sh
+    source "$RUN_DIR/linux_helpers.sh"
 fi
 
 # On Linux: if docker isn't accessible, try to apply the docker group without requiring a logout.
@@ -868,11 +879,7 @@ trust_proxy_cert
 # object pointing to '/u01/data', we query dba_directories to get the resolved DBFS path
 # (e.g. /u01/dbfs/<GUID>/data/u01/data) and copy the model file there.
 echo "Creating Oracle DIRECTORY 'ONNX_STAGING' → /u01/data ..."
-TNS_ADMIN="$WALLET_DIR" \
-LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-DYLD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
-"$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus" -s \
-    "admin/$DEFAULT_PASSWORD@$SERVICE_NAME" <<'SQLEOF'
+run_sql_stdin admin <<'SQLEOF'
 SET FEEDBACK OFF
 CREATE OR REPLACE DIRECTORY ONNX_STAGING AS '/u01/data';
 EXIT;
@@ -880,11 +887,7 @@ SQLEOF
 echo "ONNX_STAGING directory created."
 
 echo "Staging ONNX model to Oracle-visible DBFS path..."
-_dbfs_path=$(TNS_ADMIN="$WALLET_DIR" \
-  LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  DYLD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
-  "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus" -s \
-      "admin/$DEFAULT_PASSWORD@$SERVICE_NAME" <<'SQLEOF'
+_dbfs_path=$(run_sql_stdin admin <<'SQLEOF'
 SET FEEDBACK OFF HEADING OFF PAGESIZE 0
 SELECT directory_path FROM dba_directories WHERE directory_name = 'ONNX_STAGING';
 EXIT;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mac_helpers.sh — macOS/Colima Docker helpers.
+# mac_helpers.sh — macOS/Colima Docker and Instant Client helpers.
 # Sourced by run-adb-26ai.sh and setup-for-adb-26ai.sh on Darwin.
 # Requires: PLATFORM, CONFIG_FILE, and ini_val() already available.
 #
@@ -168,6 +168,102 @@ install_docker_mac() {
     echo "Installing Colima and Docker CLI via Homebrew..."
     brew install colima docker
     echo "Colima and Docker CLI installed."
+}
+
+# ─────────────────────────────────────────────────────────────────
+# Oracle Instant Client — macOS ARM64 (M1/M2/M3/M4)
+# ─────────────────────────────────────────────────────────────────
+
+# Mount a DMG, run its install_ic.sh, then detach.
+_install_dmg_mac() {
+    local dmg="$1"
+    local label
+    label=$(basename "$dmg" .dmg)
+
+    echo "Mounting $label..."
+    local vol
+    vol=$(hdiutil attach -nobrowse "$dmg" 2>/dev/null \
+          | awk '/\/Volumes\// {print $NF; exit}')
+    if [ -z "$vol" ] || [ ! -d "$vol" ]; then
+        echo "** Error ** Failed to mount $dmg"
+        exit 1
+    fi
+    echo "Mounted at $vol — running install_ic.sh..."
+    (cd "$vol" && sh ./install_ic.sh) 2>&1
+    local rc=$?
+    hdiutil detach "$vol" 2>/dev/null || true
+    if [ $rc -ne 0 ]; then
+        echo "** Error ** install_ic.sh failed for $label (exit $rc)"
+        exit 1
+    fi
+}
+
+_install_oc_mac() {
+    local ORACLE_CLIENT_DIR="$SUDO_USER_HOME_DIR/oraclient"
+    local SHELL_RC="$SUDO_USER_HOME_DIR/.zshrc"
+    local DEFAULT_IC_DIR="$SUDO_USER_HOME_DIR/Downloads/$INSTANT_CLIENT"
+
+    if [ -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
+        echo "Oracle Instant Client already installed at $ORACLE_CLIENT_DIR/$INSTANT_CLIENT."
+    else
+        local basic_dmg="$ORACLE_CLIENT_DIR/$BASIC_ZIP"
+        local sqlplus_dmg="$ORACLE_CLIENT_DIR/$SQLPLUS_ZIP"
+
+        mkdir -p "$ORACLE_CLIENT_DIR"
+
+        echo "Downloading Oracle Instant Client Basic DMG for macOS ($ARCH)..."
+        curl -L -o "$basic_dmg" "$BASIC_URL"
+        echo "Downloading Oracle Instant Client SQL*Plus DMG for macOS ($ARCH)..."
+        curl -L -o "$sqlplus_dmg" "$SQLPLUS_URL"
+
+        [ -d "$DEFAULT_IC_DIR" ] && rm -rf "$DEFAULT_IC_DIR"
+        _install_dmg_mac "$basic_dmg"
+        _install_dmg_mac "$sqlplus_dmg"
+
+        if [ ! -d "$DEFAULT_IC_DIR" ]; then
+            echo "** Error ** install_ic.sh did not create $DEFAULT_IC_DIR"
+            exit 1
+        fi
+
+        mkdir -p "$ORACLE_CLIENT_DIR"
+        mv "$DEFAULT_IC_DIR" "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
+
+        if [ ! -f "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus" ]; then
+            echo "** Error ** sqlplus not found after install. Check $ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
+            exit 1
+        fi
+        echo "Oracle Instant Client installed at $ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
+    fi
+
+    export ORACLE_HOME="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
+    export DYLD_LIBRARY_PATH="$ORACLE_HOME"
+
+    if ! grep -q "export ORACLE_HOME=$ORACLE_HOME" "$SHELL_RC"; then
+        echo "export ORACLE_HOME=$ORACLE_HOME" >> "$SHELL_RC"
+    fi
+    if ! grep -q "export DYLD_LIBRARY_PATH=$ORACLE_HOME" "$SHELL_RC"; then
+        echo "export DYLD_LIBRARY_PATH=$ORACLE_HOME" >> "$SHELL_RC"
+    fi
+    if ! grep -q "export PATH=$ORACLE_HOME:\$PATH" "$SHELL_RC"; then
+        echo "export PATH=$ORACLE_HOME:\$PATH" >> "$SHELL_RC"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────
+# Ollama — macOS install
+# ─────────────────────────────────────────────────────────────────
+_install_ollama_mac() {
+    if command -v ollama &>/dev/null; then
+        echo "Ollama already installed: $(ollama --version 2>/dev/null || echo 'unknown version')"
+        return
+    fi
+    if command -v brew &>/dev/null; then
+        echo "Installing Ollama via Homebrew..."
+        brew install ollama
+    else
+        echo "Ollama not found. Install it from https://ollama.com/download or: brew install ollama"
+        exit 1
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────

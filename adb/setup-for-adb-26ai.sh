@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────
-# Platform detection — runs first; everything else dispatches on PLATFORM/ARCH
+# Platform detection — runs first; everything else dispatches on PLATFORM/ARCH.
 # ─────────────────────────────────────────────────────────────────
 detect_platform() {
     case "$(uname -s)" in
@@ -12,23 +12,6 @@ detect_platform() {
     esac
     ARCH=$(uname -m)   # x86_64 | arm64 | aarch64
     echo "Detected platform: $PLATFORM / $ARCH"
-}
-
-# Read a single KEY=VALUE entry from CONFIG_FILE by exact key name.
-# Handles values containing '=' (e.g. URLs). Strips surrounding whitespace.
-ini_val() {
-    local key="$1"
-    grep -m1 "^${key}=" "$CONFIG_FILE" | cut -d'=' -f2- | sed 's/[[:space:]]*#.*//' | tr -d ' \n\r'
-}
-
-# Available disk space in KB for a given path (cross-platform)
-avail_kb_for_dir() {
-    local dir="$1"
-    if [ "$PLATFORM" = "darwin" ]; then
-        df -k "$dir" 2>/dev/null | awk 'NR==2 {print $4}'
-    else
-        df "$dir" --output=avail 2>/dev/null | tail -1
-    fi
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -116,16 +99,12 @@ check_and_add_hostname() {
 }
 
 # ─────────────────────────────────────────────────────────────────
-# Package management — Linux only (Mac ships curl/git/unzip; brew for extras)
+# Package management — Linux only.
+# On macOS curl/git/unzip ship with the OS; brew handles extras.
 # ─────────────────────────────────────────────────────────────────
 check_and_install_packages() {
     if [ "$PLATFORM" = "darwin" ]; then
-        for pkg in "$@"; do
-            if ! command -v "$pkg" &>/dev/null; then
-                echo "WARNING: $pkg not found. Install via Homebrew: brew install $pkg"
-            fi
-        done
-        return
+        return   # macOS: prerequisites assumed present (curl/git/unzip are stock)
     fi
     for package in "$@"; do
         if ! dpkg -l | grep -q "ii  $package"; then
@@ -136,47 +115,9 @@ check_and_install_packages() {
 }
 
 # ─────────────────────────────────────────────────────────────────
-# Docker — Linux-specific install and start functions.
-# macOS equivalents live in mac_helpers.sh (sourced below on Darwin).
+# Docker — platform-dispatch wrappers.
+# macOS implementations are in mac_helpers.sh; Linux in linux_helpers.sh.
 # ─────────────────────────────────────────────────────────────────
-_check_docker_installed_linux() {
-    if ! command -v docker &>/dev/null; then
-        echo "Docker is not installed. Installing Docker..."
-        apt install -y docker.io
-        systemctl daemon-reload
-        systemctl enable docker
-        systemctl restart containerd
-        systemctl restart docker
-    fi
-
-    if [ -n "$SUDO_USER_NAME" ] && ! id -nG "$SUDO_USER_NAME" | grep -qw docker; then
-        echo "Adding $SUDO_USER_NAME to the docker group..."
-        usermod -aG docker "$SUDO_USER_NAME"
-        echo "Done. Docker group will be active in new login sessions."
-        echo "run-adb-26ai.sh will apply it automatically in the current session."
-    else
-        echo "User $SUDO_USER_NAME is already in the docker group."
-    fi
-}
-
-_ensure_docker_running_linux() {
-    for i in {1..5}; do
-        if systemctl is-active --quiet docker; then
-            echo "Docker is running."
-            return
-        fi
-        echo "Docker is not running yet. Starting Docker... (Attempt $i of 5)"
-        systemctl restart containerd > /dev/null 2>&1
-        systemctl restart docker > /dev/null 2>&1
-        sleep 30
-    done
-    echo "Failed to start Docker after 5 attempts."
-    echo "Please try: sudo systemctl restart docker"
-    echo "Then run this script again."
-    exit 1
-}
-
-# Platform-dispatch wrappers — macOS implementations are in mac_helpers.sh
 install_docker() {
     [ "$PLATFORM" = "darwin" ] && install_docker_mac && return
     _check_docker_installed_linux   # Linux: install doubles as 'ensure installed'
@@ -193,170 +134,9 @@ ensure_docker_running() {
 }
 
 # ─────────────────────────────────────────────────────────────────
-# Oracle OS user/group setup — Linux only
+# Oracle Instant Client — platform-dispatch wrapper.
+# macOS implementation in mac_helpers.sh; Linux in linux_helpers.sh.
 # ─────────────────────────────────────────────────────────────────
-oracle_os_user_setup() {
-    if [ "$PLATFORM" = "darwin" ]; then
-        echo "Skipping Oracle OS user setup on macOS (handled inside Docker)."
-        return
-    fi
-
-    echo "Setting up Oracle user and groups..."
-    declare -A group_ids
-    group_ids=(
-        ["oinstall"]="54321"
-        ["dba"]="54322"
-        ["oper"]="54323"
-        ["backupdba"]="54324"
-        ["dginstall"]="54325"
-        ["kmdba"]="54326"
-        ["racdba"]="54330"
-    )
-
-    for group in "${!group_ids[@]}"; do
-        if ! getent group "$group" > /dev/null; then
-            groupadd -g "${group_ids[$group]}" "$group"
-        fi
-    done
-
-    if ! id -u oracle > /dev/null 2>&1; then
-        useradd -u 54321 -g oinstall -G dba,oper,oinstall,backupdba,dginstall,kmdba,racdba oracle
-    fi
-}
-
-# ─────────────────────────────────────────────────────────────────
-# Oracle Instant Client install — platform-specific
-# ─────────────────────────────────────────────────────────────────
-_install_oc_linux() {
-    local ORACLE_CLIENT_DIR="$SUDO_USER_HOME_DIR/oraclient"
-    local BASHRC_FILE="$SUDO_USER_HOME_DIR/.bashrc"
-
-    if ! command -v unzip &>/dev/null; then
-        echo "unzip is not installed. Installing..."
-        apt update && apt install -y unzip
-    fi
-
-    if [ -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
-        echo "Oracle Instant Client already installed at $ORACLE_CLIENT_DIR/$INSTANT_CLIENT."
-    else
-        su - "$SUDO_USER_NAME" -c "mkdir -p $ORACLE_CLIENT_DIR"
-        su - "$SUDO_USER_NAME" -c "curl -o $ORACLE_CLIENT_DIR/$BASIC_ZIP $BASIC_URL" > /dev/null 2>&1
-        su - "$SUDO_USER_NAME" -c "curl -o $ORACLE_CLIENT_DIR/$SQLPLUS_ZIP $SQLPLUS_URL" > /dev/null 2>&1
-        su - "$SUDO_USER_NAME" -c "unzip -o $ORACLE_CLIENT_DIR/$BASIC_ZIP -d $ORACLE_CLIENT_DIR" > /dev/null 2>&1
-        su - "$SUDO_USER_NAME" -c "unzip -o $ORACLE_CLIENT_DIR/$SQLPLUS_ZIP -d $ORACLE_CLIENT_DIR" > /dev/null 2>&1
-
-        if [ ! -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
-            echo "** Error ** Oracle Instant Client not correctly installed in $ORACLE_CLIENT_DIR."
-            exit 1
-        fi
-    fi
-
-    export ORACLE_HOME="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
-    export LD_LIBRARY_PATH="$ORACLE_HOME"
-
-    UBUNTU_VER=$(lsb_release -rs | cut -d. -f1)
-    if [ "$UBUNTU_VER" -ge 24 ]; then
-        apt-get install -y libaio1t64
-        LIBAIO_TARGET="/usr/lib/x86_64-linux-gnu/libaio.so.1t64"
-    else
-        apt-get install -y libaio1
-        LIBAIO_TARGET="/usr/lib/x86_64-linux-gnu/libaio.so.1.0.1"
-    fi
-    LIBAIO_LINK="/usr/lib/x86_64-linux-gnu/libaio.so.1"
-    if [ ! -e "$LIBAIO_LINK" ] || [ "$(readlink "$LIBAIO_LINK")" != "$LIBAIO_TARGET" ]; then
-        echo "Creating/fixing libaio.so.1 symlink -> $LIBAIO_TARGET"
-        ln -sf "$LIBAIO_TARGET" "$LIBAIO_LINK"
-    fi
-
-    local tns_admin_path="$SUDO_USER_HOME_DIR/auth/tls_wallet"
-    if ! grep -q "export TNS_ADMIN=" "$BASHRC_FILE"; then
-        echo "export TNS_ADMIN=$tns_admin_path" >> "$BASHRC_FILE"
-    fi
-    if ! grep -q "export ORACLE_HOME=$ORACLE_HOME" "$BASHRC_FILE"; then
-        echo "export ORACLE_HOME=$ORACLE_HOME" >> "$BASHRC_FILE"
-    fi
-    if ! grep -q "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH" "$BASHRC_FILE"; then
-        echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$BASHRC_FILE"
-    fi
-    if ! grep -q "export PATH=$ORACLE_HOME:\$PATH" "$BASHRC_FILE"; then
-        echo "export PATH=$ORACLE_HOME:\$PATH" >> "$BASHRC_FILE"
-    fi
-}
-
-_install_dmg_mac() {
-    local dmg="$1"
-    local label
-    label=$(basename "$dmg" .dmg)
-
-    echo "Mounting $label..."
-    local vol
-    vol=$(hdiutil attach -nobrowse "$dmg" 2>/dev/null \
-          | awk '/\/Volumes\// {print $NF; exit}')
-    if [ -z "$vol" ] || [ ! -d "$vol" ]; then
-        echo "** Error ** Failed to mount $dmg"
-        exit 1
-    fi
-    echo "Mounted at $vol — running install_ic.sh..."
-    (cd "$vol" && sh ./install_ic.sh) 2>&1
-    local rc=$?
-    hdiutil detach "$vol" 2>/dev/null || true
-    if [ $rc -ne 0 ]; then
-        echo "** Error ** install_ic.sh failed for $label (exit $rc)"
-        exit 1
-    fi
-}
-
-_install_oc_mac() {
-    local ORACLE_CLIENT_DIR="$SUDO_USER_HOME_DIR/oraclient"
-    local SHELL_RC="$SUDO_USER_HOME_DIR/.zshrc"
-    local DEFAULT_IC_DIR="$SUDO_USER_HOME_DIR/Downloads/$INSTANT_CLIENT"
-
-    if [ -d "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT" ]; then
-        echo "Oracle Instant Client already installed at $ORACLE_CLIENT_DIR/$INSTANT_CLIENT."
-    else
-        local basic_dmg="$ORACLE_CLIENT_DIR/$BASIC_ZIP"
-        local sqlplus_dmg="$ORACLE_CLIENT_DIR/$SQLPLUS_ZIP"
-
-        mkdir -p "$ORACLE_CLIENT_DIR"
-
-        echo "Downloading Oracle Instant Client Basic DMG for macOS ($ARCH)..."
-        curl -L -o "$basic_dmg" "$BASIC_URL"
-        echo "Downloading Oracle Instant Client SQL*Plus DMG for macOS ($ARCH)..."
-        curl -L -o "$sqlplus_dmg" "$SQLPLUS_URL"
-
-        [ -d "$DEFAULT_IC_DIR" ] && rm -rf "$DEFAULT_IC_DIR"
-        _install_dmg_mac "$basic_dmg"
-        _install_dmg_mac "$sqlplus_dmg"
-
-        if [ ! -d "$DEFAULT_IC_DIR" ]; then
-            echo "** Error ** install_ic.sh did not create $DEFAULT_IC_DIR"
-            exit 1
-        fi
-
-        mkdir -p "$ORACLE_CLIENT_DIR"
-        mv "$DEFAULT_IC_DIR" "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
-
-        if [ ! -f "$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus" ]; then
-            echo "** Error ** sqlplus not found after install. Check $ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
-            exit 1
-        fi
-        echo "Oracle Instant Client installed at $ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
-    fi
-
-    export ORACLE_HOME="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
-    export DYLD_LIBRARY_PATH="$ORACLE_HOME"
-
-    if ! grep -q "export ORACLE_HOME=$ORACLE_HOME" "$SHELL_RC"; then
-        echo "export ORACLE_HOME=$ORACLE_HOME" >> "$SHELL_RC"
-    fi
-    if ! grep -q "export DYLD_LIBRARY_PATH=$ORACLE_HOME" "$SHELL_RC"; then
-        echo "export DYLD_LIBRARY_PATH=$ORACLE_HOME" >> "$SHELL_RC"
-    fi
-    if ! grep -q "export PATH=$ORACLE_HOME:\$PATH" "$SHELL_RC"; then
-        echo "export PATH=$ORACLE_HOME:\$PATH" >> "$SHELL_RC"
-    fi
-}
-
 install_oracle_instant_client() {
     if [ "$PLATFORM" = "darwin" ]; then
         _install_oc_mac
@@ -366,7 +146,8 @@ install_oracle_instant_client() {
 }
 
 # ─────────────────────────────────────────────────────────────────
-# Oracle Container Registry login — optional (free-tier images accessible without login)
+# Oracle Container Registry login — optional
+# (free-tier GHCR images are accessible without credentials)
 # ─────────────────────────────────────────────────────────────────
 oracle_registry_login() {
     if [ -z "$ORACLE_REGISTRY_USER" ] || [ -z "$ORACLE_REGISTRY_PASSWORD" ]; then
@@ -385,36 +166,8 @@ oracle_registry_login() {
 
 # ─────────────────────────────────────────────────────────────────
 # Ollama (optional — commented out in main by default)
+# macOS implementation in mac_helpers.sh; Linux in linux_helpers.sh.
 # ─────────────────────────────────────────────────────────────────
-_install_ollama_linux() {
-    if command -v ollama &>/dev/null; then
-        echo "Ollama already installed: $(ollama --version 2>/dev/null || echo 'unknown version')"
-        return
-    fi
-    echo "Installing Ollama..."
-    curl -fsSL https://ollama.com/install.sh | sh
-    sleep 3
-    if ! command -v ollama &>/dev/null; then
-        echo "** Error ** Ollama installation failed."
-        exit 1
-    fi
-    echo "Ollama installed: $(ollama --version 2>/dev/null)"
-}
-
-_install_ollama_mac() {
-    if command -v ollama &>/dev/null; then
-        echo "Ollama already installed: $(ollama --version 2>/dev/null || echo 'unknown version')"
-        return
-    fi
-    if command -v brew &>/dev/null; then
-        echo "Installing Ollama via Homebrew..."
-        brew install ollama
-    else
-        echo "Ollama not found. Install it from https://ollama.com/download or: brew install ollama"
-        exit 1
-    fi
-}
-
 install_ollama() {
     if [ "$PLATFORM" = "darwin" ]; then
         _install_ollama_mac
@@ -642,10 +395,23 @@ RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 detect_platform
 
-# Source macOS helpers before read_config so CONTAINER_RUNTIME is available to them.
+# Source common utilities (ini_val, avail_kb_for_dir, colour helpers).
+# Must come before read_config so ini_val is available.
+# shellcheck source=common.sh
+source "$RUN_DIR/common.sh"
+
+# Source platform-specific helpers.
+# macOS helpers require CONTAINER_RUNTIME which read_config sets, so we set a
+# temporary early value here (same pattern as run-adb-26ai.sh).
 if [ "$PLATFORM" = "darwin" ]; then
+    CONTAINER_RUNTIME=$(grep -m1 "^CONTAINER_RUNTIME=" "$RUN_DIR/config.ini" 2>/dev/null \
+                        | cut -d'=' -f2- | tr -d ' \n\r')
+    CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-auto}"
     # shellcheck source=mac_helpers.sh
     source "$RUN_DIR/mac_helpers.sh"
+else
+    # shellcheck source=linux_helpers.sh
+    source "$RUN_DIR/linux_helpers.sh"
 fi
 
 read_config
@@ -679,7 +445,9 @@ install_docker
 check_docker_installed
 ensure_docker_running
 
-oracle_os_user_setup
+if [ "$PLATFORM" = "linux" ]; then
+    oracle_os_user_setup
+fi
 install_oracle_instant_client
 oracle_registry_login
 # install_ollama
