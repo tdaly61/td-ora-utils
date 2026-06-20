@@ -251,8 +251,15 @@ show_dry_run_plan() {
         else
             echo "   brew install colima docker"
         fi
-        if colima status 2>/dev/null | grep -q "Running"; then
+        if colima status &>/dev/null; then
             echo "   Colima already running — reuse existing VM"
+            if k3s_is_running_mac 2>/dev/null; then
+                local _pc
+                _pc=$(k3s_app_pod_count_mac 2>/dev/null || echo "?")
+                echo "   k3s running ($_pc app pods) — will be stopped to free memory for Oracle ADB"
+            else
+                echo "   k3s already stopped"
+            fi
         elif colima list 2>/dev/null | grep -q "default"; then
             echo "   Colima VM exists but stopped — colima start (existing VM, sizing flags ignored)"
         else
@@ -444,6 +451,14 @@ echo "User: $SUDO_USER_NAME"
 install_docker
 check_docker_installed
 ensure_docker_running
+
+# macOS: stop k3s inside the Colima VM if it is still running.
+# k3s (mifos-gazelle) consumes 6-8 GB that Oracle ADB needs.
+# Colima keeps running; k3s can be re-enabled later with start_k3s_mac.
+if [ "$PLATFORM" = "darwin" ] && k3s_is_running_mac 2>/dev/null; then
+    echo "k3s detected inside Colima — stopping to free memory for Oracle ADB..."
+    stop_k3s_mac
+fi
 
 if [ "$PLATFORM" = "linux" ]; then
     oracle_os_user_setup

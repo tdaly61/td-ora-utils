@@ -304,7 +304,7 @@ ensure_docker_running_mac() {
     export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
 
     # Case 1: already running — reuse (may be shared with mifos-gazelle)
-    if colima status 2>/dev/null | grep -q "Running"; then
+    if colima status &>/dev/null; then
         echo "Colima already running — reusing existing VM."
         _fix_docker_api_version_mac
         return

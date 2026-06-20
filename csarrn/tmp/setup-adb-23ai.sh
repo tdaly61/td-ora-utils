@@ -10,6 +10,22 @@ CONTAINER_NAME="adb_container"
 WALLET_DIR="$HOME/myadbwallet"
 export TNS_ADMIN="$WALLET_DIR"
 
+# ── Colima memory resize ──────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/../../adb/config.ini"
+COLIMA_MEMORY=$(grep -m1 "^COLIMA_MEMORY=" "$CONFIG_FILE" | cut -d'=' -f2- | sed 's/[[:space:]]*#.*//' | tr -d ' \n\r')
+COLIMA_MEMORY="${COLIMA_MEMORY:-4}"
+
+if command -v colima &>/dev/null; then
+    echo "Resizing Colima VM memory to ${COLIMA_MEMORY}GB (disk contents preserved)..."
+    colima stop 2>/dev/null || true
+    colima start --memory "$COLIMA_MEMORY"
+    export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
+else
+    echo "WARNING: colima not found — skipping memory resize."
+fi
+# ─────────────────────────────────────────────────────────────────
+
 # change the default and expired ADMIN password 
 docker exec $CONTAINER_NAME abd-cli add-database --workload-type "ATP" --admin-password $NEW_PASSWORD 
 
