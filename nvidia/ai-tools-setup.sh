@@ -172,7 +172,7 @@ info "CPU cores: $(nproc)"
 # ------------------------------------------------------------------------------
 if [[ "$CHECK_ONLY" == "true" ]]; then
   header "Tools that would be installed"
-  echo "  • Ollama        (latest, minimum 0.20.2)"
+  echo "  • Ollama        (always latest — installer is idempotent)"
   echo "  • Node.js 22.x  (via NodeSource, prerequisite for Claude Code)"
   echo "  • Claude Code   (npm install -g @anthropic-ai/claude-code)"
   echo "  • OpenCode      (latest release from github.com/sst/opencode)"
@@ -198,44 +198,37 @@ if [[ "$MODELS_ONLY" == "false" ]]; then
   # ---- Ollama ----------------------------------------------------------------
   header "Installing Ollama"
 
-  OLLAMA_MIN_VERSION="0.20.2"
-
-  install_ollama() {
-    info "Downloading Ollama installer..."
-    curl -fsSL https://ollama.com/install.sh | sh
-  }
-
-  version_ge() {
-    # Returns 0 (true) if $1 >= $2 (semver comparison)
-    python3 -c "
-from functools import cmp_to_key
-import sys
-def cmp(a, b):
-    av = [int(x) for x in a.split('.')]
-    bv = [int(x) for x in b.split('.')]
-    for x, y in zip(av, bv):
-        if x < y: return -1
-        if x > y: return 1
-    return len(av) - len(bv)
-sys.exit(0 if cmp(sys.argv[1], sys.argv[2]) >= 0 else 1)
-" "$1" "$2"
-  }
-
-  if command -v ollama &>/dev/null; then
-    CURRENT_VER=$(ollama --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "0.0.0")
-    if version_ge "$CURRENT_VER" "$OLLAMA_MIN_VERSION"; then
-      success "Ollama $CURRENT_VER already installed (>= $OLLAMA_MIN_VERSION)"
-    else
-      warn "Ollama $CURRENT_VER found but < $OLLAMA_MIN_VERSION — upgrading"
-      install_ollama
-    fi
-  else
-    install_ollama
-  fi
+  # Always run the Ollama installer — it is idempotent and self-updates to
+  # the latest release, so we don't need to track a minimum version here.
+  # Keeping a pinned floor would prevent upgrades (e.g. 0.28.x → 0.30.x).
+  info "Running Ollama installer (installs or upgrades to latest)..."
+  curl -fsSL https://ollama.com/install.sh | sh
 
   # Verify
   OLLAMA_VER=$(ollama --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "unknown")
   success "Ollama $OLLAMA_VER installed"
+
+  # Check NVIDIA driver meets CUDA 12.8 requirement for this Ollama version.
+  # Ollama 0.28+ ships libcudart 12.8 which requires driver series >= 570.
+  OLLAMA_MIN_CUDA_DRIVER=570
+  if command -v nvidia-smi &>/dev/null; then
+    CURRENT_GPU_DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader \
+      | grep -oP '^\d+' | head -1 || echo "0")
+    if [[ "$CURRENT_GPU_DRIVER" -lt "$OLLAMA_MIN_CUDA_DRIVER" ]]; then
+      echo ""
+      warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      warn "NVIDIA driver ${CURRENT_GPU_DRIVER} is TOO OLD for Ollama ${OLLAMA_VER}."
+      warn "Ollama 0.28+ requires CUDA 12.8 — needs driver >= ${OLLAMA_MIN_CUDA_DRIVER}."
+      warn "GPU acceleration will fail until the driver is upgraded."
+      warn ""
+      warn "Fix: sudo ./nvidia-gpu-setup.sh   (will install driver 595-server)"
+      warn "A reboot is required after the driver upgrade."
+      warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo ""
+    else
+      success "NVIDIA driver ${CURRENT_GPU_DRIVER} meets Ollama CUDA 12.8 requirement (>= ${OLLAMA_MIN_CUDA_DRIVER})"
+    fi
+  fi
 
   # Ensure Ollama systemd service is enabled and running
   if systemctl is-enabled ollama &>/dev/null 2>&1; then

@@ -162,7 +162,11 @@ done
 
 # ── Resolve APEX export file ──────────────────────────────────────────────────
 if [ -z "$APEX_SQL" ]; then
-  _cfg_export=$(ini_val APEX_EXPORT_FILE)
+  case "$(uname -s)" in
+    Darwin*) _cfg_export=$(ini_val APEX_EXPORT_FILE_MAC) ;;
+    *)       _cfg_export=$(ini_val APEX_EXPORT_FILE) ;;
+  esac
+  [ -z "$_cfg_export" ] && _cfg_export=$(ini_val APEX_EXPORT_FILE)
   if [ -n "$_cfg_export" ]; then
     APEX_SQL="$_cfg_export"
     echo "Using APEX export file from config.ini: $APEX_SQL"
@@ -173,7 +177,11 @@ if [ -z "$APEX_SQL" ]; then
 fi
 
 if [ -z "$VECTOR_SQL" ]; then
-  _cfg_vector=$(ini_val APEX_VECTOR_SQL)
+  case "$(uname -s)" in
+    Darwin*) _cfg_vector=$(ini_val APEX_VECTOR_SQL_MAC) ;;
+    *)       _cfg_vector=$(ini_val APEX_VECTOR_SQL) ;;
+  esac
+  [ -z "$_cfg_vector" ] && _cfg_vector=$(ini_val APEX_VECTOR_SQL)
   if [ -n "$_cfg_vector" ]; then
     VECTOR_SQL="$_cfg_vector"
     echo "Using vector setup SQL from config.ini: $VECTOR_SQL"

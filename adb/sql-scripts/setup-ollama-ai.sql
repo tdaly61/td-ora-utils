@@ -134,8 +134,8 @@ END;
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 4. Connectivity note
 -- ─────────────────────────────────────────────────────────────────────────────
-PROMPT Note: Ollama connectivity is validated from inside the DB container by run-adb-26ai.sh.
-PROMPT       Skipping UTL_HTTP test here (host.docker.internal does not resolve on the host).
+PROMPT Note: This script runs as SYS/SYSDBA inside the DB container (via docker exec).
+PROMPT       host.docker.internal resolves here; UTL_HTTP outbound to Ollama is available.
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 5. Register Ollama as an APEX Generative AI Service for the TRACKER1

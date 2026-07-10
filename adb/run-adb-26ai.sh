@@ -227,6 +227,24 @@ run_sql_file() {
     echo "SQL file $sql_file executed successfully."
 }
 
+# Run a SQL file as SYS/SYSDBA from inside the running DB container.
+# Bypasses APEX VPD policies (ORA-41900) that block direct access to internal
+# APEX tables (wwv_credentials, wwv_remote_servers) from external admin sessions.
+run_sql_as_sysdba() {
+    local sql_file="$1"
+    local container_path="/tmp/$(basename "$sql_file")"
+    if [ ! -f "$sql_file" ]; then
+        echo "SQL file $sql_file does not exist. Skipping."
+        return 1
+    fi
+    echo "Running SQL file $sql_file as SYS/SYSDBA (inside container)..."
+    docker cp "$sql_file" "$CONTAINER_NAME:$container_path"
+    docker exec "$CONTAINER_NAME" sqlplus -s / as sysdba "@$container_path"
+    local rc=$?
+    docker exec "$CONTAINER_NAME" rm -f "$container_path" 2>/dev/null || true
+    return $rc
+}
+
 # Pipe SQL from stdin to sqlplus. Used for short inline statements where a temp
 # file would be noisy. Inherits WALLET_DIR, ORACLE_CLIENT_DIR, INSTANT_CLIENT.
 # Usage: run_sql_stdin [user]   (default: admin)  <<'SQL'  ...  SQL
@@ -563,7 +581,25 @@ read_config() {
     HOSTNAME=$(ini_val HOSTNAME)
     DEFAULT_PASSWORD=$(ini_val DEFAULT_PASSWORD | tr -d '\n\r')
     CONTAINER_NAME=$(ini_val CONTAINER_NAME)
-    DOCKER_IMAGE=$(ini_val DOCKER_IMAGE)
+    # Select the Docker image for the effective architecture.
+    # On macOS with Colima in x86_64 emulation mode, COLIMA_ARCH=x86_64 overrides
+    # the host's arm64 uname -m so the AMD64 image is used for the Colima VM.
+    local _eff_arch="$ARCH"
+    if [ "$PLATFORM" = "darwin" ]; then
+        local _colima_arch
+        _colima_arch=$(ini_val COLIMA_ARCH 2>/dev/null | tr -d ' \n\r' || true)
+        [ -n "$_colima_arch" ] && _eff_arch="$_colima_arch"
+    fi
+    local _img_arm _img_amd _img_fallback
+    _img_arm=$(ini_val DOCKER_IMAGE_ARM 2>/dev/null | tr -d ' \n\r' || true)
+    _img_amd=$(ini_val DOCKER_IMAGE_AMD  2>/dev/null | tr -d ' \n\r' || true)
+    _img_fallback=$(ini_val DOCKER_IMAGE 2>/dev/null | tr -d ' \n\r' || true)
+    case "$_eff_arch" in
+        x86_64|amd64)  DOCKER_IMAGE="${_img_amd:-$_img_fallback}" ;;
+        arm64|aarch64) DOCKER_IMAGE="${_img_arm:-$_img_fallback}" ;;
+        *)             DOCKER_IMAGE="$_img_fallback" ;;
+    esac
+    echo "Docker image selected for arch '$_eff_arch': $DOCKER_IMAGE"
     ONNX_MODEL_URL=$(ini_val ONNX_MODEL_URL)
     ORACLE_REGISTRY_USER=$(ini_val ORACLE_REGISTRY_USER)
     ORACLE_REGISTRY_PASSWORD=$(ini_val ORACLE_REGISTRY_PASSWORD)
@@ -911,7 +947,7 @@ run_sql_file "$RUN_DIR/sql-scripts/create-users.sql" admin
 setup_apex_user_db_password
 
 echo "Configuring LLM integration..."
-run_sql_file "$RUN_DIR/sql-scripts/setup-ollama-ai.sql" admin || true
+run_sql_as_sysdba "$RUN_DIR/sql-scripts/setup-ollama-ai.sql" || true
 
 echo ""
 echo "=== Setup complete ==="

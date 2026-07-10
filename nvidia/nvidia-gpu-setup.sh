@@ -38,6 +38,14 @@ CHECK_ONLY=false
 SKIP_REBOOT=false
 DO_CLEANUP=false
 
+# Minimum NVIDIA driver series required for Ollama 0.28+ (CUDA 12.8 runtime).
+# Ollama ships libcudart 12.8 which needs driver >= 570.
+OLLAMA_MIN_DRIVER=570
+
+# Preferred driver series for fresh installs on OCI GPU instances.
+# 595-server has pre-built Oracle kernel modules and supports CUDA 12.9.
+PREFERRED_DRIVER="595-server"
+
 # ------------------------------------------------------------------------------
 # Parse arguments
 # ------------------------------------------------------------------------------
@@ -146,10 +154,12 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Determine driver series to use (prefer already-installed series)
+# Determine driver series to use
+# Scan from newest to oldest so we keep any already-installed newer driver.
+# If the installed driver is below OLLAMA_MIN_DRIVER, we upgrade regardless.
 # ------------------------------------------------------------------------------
 DRIVER_SERIES=""
-for series in 535 525 515; do
+for series in 595 590 585 580 575 570 565 560 550 535 525 515; do
   if dpkg -l "nvidia-utils-${series}-server" 2>/dev/null | grep -q '^ii'; then
     DRIVER_SERIES="${series}-server"
     break
@@ -160,12 +170,20 @@ for series in 535 525 515; do
   fi
 done
 
-# Fall back to 535-server as the default for OCI GPU instances
-if [[ -z "$DRIVER_SERIES" ]]; then
-  DRIVER_SERIES="535-server"
-  warn "No existing NVIDIA utils found; defaulting to driver series: $DRIVER_SERIES"
-else
+if [[ -n "$DRIVER_SERIES" ]]; then
   info "Detected installed driver series: $DRIVER_SERIES"
+  installed_num=$(echo "$DRIVER_SERIES" | grep -oP '^\d+')
+  if [[ "$installed_num" -lt "$OLLAMA_MIN_DRIVER" ]]; then
+    warn "Installed driver ${DRIVER_SERIES} is below minimum series ${OLLAMA_MIN_DRIVER}"
+    warn "Ollama 0.28+ requires CUDA 12.8 (driver >= ${OLLAMA_MIN_DRIVER}). Upgrading to ${PREFERRED_DRIVER}."
+    DRIVER_SERIES=""
+  fi
+fi
+
+# Fall back to preferred driver for OCI GPU instances
+if [[ -z "$DRIVER_SERIES" ]]; then
+  DRIVER_SERIES="$PREFERRED_DRIVER"
+  info "Using driver series: $DRIVER_SERIES"
 fi
 
 # Build candidate package names
@@ -205,6 +223,7 @@ else
 fi
 echo "  Driver loaded  : $DRIVER_LOADED"
 echo "  nvidia-smi OK  : $SMI_WORKS"
+echo "  Ollama min drv : ${OLLAMA_MIN_DRIVER} (CUDA 12.8 compatibility)"
 
 if $CHECK_ONLY; then
   info "--check-only requested; exiting without making changes."
@@ -212,9 +231,18 @@ if $CHECK_ONLY; then
 fi
 
 if $SMI_WORKS && $DRIVER_LOADED; then
-  success "NVIDIA driver is already loaded and nvidia-smi is working."
-  success "Nothing to install."
-  exit 0
+  CURRENT_DRIVER_NUM=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader \
+    | grep -oP '^\d+' | head -1 || echo "0")
+  if [[ "$CURRENT_DRIVER_NUM" -ge "$OLLAMA_MIN_DRIVER" ]]; then
+    success "NVIDIA driver ${CURRENT_DRIVER_NUM} is loaded, working, and meets the"
+    success "minimum series ${OLLAMA_MIN_DRIVER} required for Ollama CUDA 12.8 compatibility."
+    success "Nothing to install."
+    exit 0
+  else
+    warn "NVIDIA driver ${CURRENT_DRIVER_NUM} is loaded and working but below"
+    warn "minimum series ${OLLAMA_MIN_DRIVER} required for Ollama CUDA 12.8 compatibility."
+    warn "Upgrading to ${DRIVER_SERIES}..."
+  fi
 fi
 
 # ==============================================================================
