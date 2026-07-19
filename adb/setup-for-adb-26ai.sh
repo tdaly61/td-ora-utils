@@ -1,18 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ─────────────────────────────────────────────────────────────────
-# Platform detection — runs first; everything else dispatches on PLATFORM/ARCH.
-# ─────────────────────────────────────────────────────────────────
-detect_platform() {
-    case "$(uname -s)" in
-        Linux*)  PLATFORM=linux ;;
-        Darwin*) PLATFORM=darwin ;;
-        *) echo "Unsupported platform: $(uname -s). Exiting."; exit 1 ;;
-    esac
-    ARCH=$(uname -m)   # x86_64 | arm64 | aarch64
-    echo "Detected platform: $PLATFORM / $ARCH"
-}
+# Platform detection (detect_platform) lives in common.sh — sourced further down,
+# right after RUN_DIR is known.
 
 # ─────────────────────────────────────────────────────────────────
 # Cleanup
@@ -328,9 +318,10 @@ show_dry_run_plan() {
 }
 
 read_config() {
-    CONFIG_FILE="$RUN_DIR/config.ini"
+    # Config is adb/.env (was config.ini); fall back to config.ini for old checkouts.
+    CONFIG_FILE="$RUN_DIR/.env"; [ -f "$CONFIG_FILE" ] || CONFIG_FILE="$RUN_DIR/config.ini"
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo "Configuration file config.ini not found in $RUN_DIR. Exiting."
+        echo "Configuration file .env (or config.ini) not found in $RUN_DIR. Exiting."
         exit 1
     fi
 
@@ -338,7 +329,9 @@ read_config() {
     DEFAULT_PASSWORD=$(ini_val DEFAULT_PASSWORD)
     ORACLE_REGISTRY_USER=$(ini_val ORACLE_REGISTRY_USER)
     ORACLE_REGISTRY_PASSWORD=$(ini_val ORACLE_REGISTRY_PASSWORD)
-    DOCKER_IMAGE=$(ini_val DOCKER_IMAGE)
+    # select_docker_image (common.sh) resolves DOCKER_IMAGE_ARM/_AMD for the effective
+    # arch, same logic run-adb-26ai.sh uses — keeps the two scripts' image choice in sync.
+    DOCKER_IMAGE="$(select_docker_image)"
     CONTAINER_RUNTIME=$(ini_val CONTAINER_RUNTIME)
     CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-auto}"
     COLIMA_ARCH=$(ini_val COLIMA_ARCH);           COLIMA_ARCH="${COLIMA_ARCH:-x86_64}"
@@ -347,24 +340,11 @@ read_config() {
     COLIMA_MEMORY=$(ini_val COLIMA_MEMORY);       COLIMA_MEMORY="${COLIMA_MEMORY:-8}"
     COLIMA_DISK=$(ini_val COLIMA_DISK);           COLIMA_DISK="${COLIMA_DISK:-100}"
 
-    if [ "$PLATFORM" = "darwin" ]; then
-        BASIC_ZIP=$(ini_val BASIC_ZIP_MAC)
-        SQLPLUS_ZIP=$(ini_val SQLPLUS_ZIP_MAC)
-        BASIC_URL=$(ini_val BASIC_URL_MAC)
-        SQLPLUS_URL=$(ini_val SQLPLUS_URL_MAC)
-        INSTANT_CLIENT=$(ini_val INSTANT_CLIENT_MAC)
-        [ -z "$BASIC_ZIP" ]      && BASIC_ZIP=$(ini_val BASIC_ZIP)
-        [ -z "$SQLPLUS_ZIP" ]    && SQLPLUS_ZIP=$(ini_val SQLPLUS_ZIP)
-        [ -z "$BASIC_URL" ]      && BASIC_URL=$(ini_val BASIC_URL)
-        [ -z "$SQLPLUS_URL" ]    && SQLPLUS_URL=$(ini_val SQLPLUS_URL)
-        [ -z "$INSTANT_CLIENT" ] && INSTANT_CLIENT=$(ini_val INSTANT_CLIENT)
-    else
-        BASIC_ZIP=$(ini_val BASIC_ZIP)
-        SQLPLUS_ZIP=$(ini_val SQLPLUS_ZIP)
-        BASIC_URL=$(ini_val BASIC_URL)
-        SQLPLUS_URL=$(ini_val SQLPLUS_URL)
-        INSTANT_CLIENT=$(ini_val INSTANT_CLIENT)
-    fi
+    BASIC_ZIP="$(platform_val BASIC_ZIP)"
+    SQLPLUS_ZIP="$(platform_val SQLPLUS_ZIP)"
+    BASIC_URL="$(platform_val BASIC_URL)"
+    SQLPLUS_URL="$(platform_val SQLPLUS_URL)"
+    INSTANT_CLIENT="$(resolve_instant_client)"
 
     local missing=""
     [ -z "$BASIC_ZIP" ]        && missing="$missing BASIC_ZIP"
@@ -400,18 +380,18 @@ COLIMA_DISK=""
 
 RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-detect_platform
-
-# Source common utilities (ini_val, avail_kb_for_dir, colour helpers).
-# Must come before read_config so ini_val is available.
+# Source common utilities (detect_platform, ini_val, platform_val, select_docker_image,
+# resolve_instant_client, avail_kb_for_dir, colour helpers) before anything else runs.
 # shellcheck source=common.sh
 source "$RUN_DIR/common.sh"
+detect_platform
 
 # Source platform-specific helpers.
 # macOS helpers require CONTAINER_RUNTIME which read_config sets, so we set a
 # temporary early value here (same pattern as run-adb-26ai.sh).
 if [ "$PLATFORM" = "darwin" ]; then
-    CONTAINER_RUNTIME=$(grep -m1 "^CONTAINER_RUNTIME=" "$RUN_DIR/config.ini" 2>/dev/null \
+    _early_cfg="$RUN_DIR/.env"; [ -f "$_early_cfg" ] || _early_cfg="$RUN_DIR/config.ini"
+    CONTAINER_RUNTIME=$(grep -m1 "^CONTAINER_RUNTIME=" "$_early_cfg" 2>/dev/null \
                         | cut -d'=' -f2- | tr -d ' \n\r')
     CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-auto}"
     # shellcheck source=mac_helpers.sh

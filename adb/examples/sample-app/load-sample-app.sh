@@ -11,34 +11,32 @@
 
 set -euo pipefail
 
-# This script lives at apps/sample-app/ — ADB_DIR is the adb root two levels up.
+# This script lives at examples/sample-app/ — ADB_DIR is the adb root two levels up.
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 ADB_DIR="$( cd "$SCRIPT_DIR/../../" && pwd )"
-CONFIG_FILE="$ADB_DIR/config.ini"
+# Config is adb/.env (was config.ini); fall back to config.ini for old checkouts.
+CONFIG_FILE="$ADB_DIR/.env"; [ -f "$CONFIG_FILE" ] || CONFIG_FILE="$ADB_DIR/config.ini"
 SQL_DIR="$SCRIPT_DIR/sql"
 
 # ── Shared utilities ──────────────────────────────────────────────────────────
 # shellcheck source=../../common.sh
 source "$ADB_DIR/common.sh"
+detect_platform
 
 # ── Read config ──────────────────────────────────────────────────────────────
 if [ ! -f "$CONFIG_FILE" ]; then
-  echo "config.ini not found at $CONFIG_FILE. Exiting."
+  echo "Configuration file .env (or config.ini) not found in $ADB_DIR. Exiting."
   exit 1
 fi
 
 DEFAULT_PASSWORD=$(ini_val DEFAULT_PASSWORD)
 SERVICE_NAME=$(ini_val SERVICE_NAME)
 ORACLE_CLIENT_DIR="$HOME/oraclient"
-APEX_PORT=$(ini_val APEX_PORT); APEX_PORT=${APEX_PORT:-8080}
+APEX_PORT=$(ini_val APEX_PORT); APEX_PORT=${APEX_PORT:-8443}
 APEX_USER=$(ini_val APEX_USER);  APEX_USER=${APEX_USER:-TRACKER1}
 APEX_PASSWORD=$(ini_val APEX_PASSWORD); APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
 
-# Pick Mac or Linux Instant Client directory name
-if [ "$(uname -s)" = "Darwin" ]; then
-  INSTANT_CLIENT=$(ini_val INSTANT_CLIENT_MAC)
-fi
-INSTANT_CLIENT=${INSTANT_CLIENT:-$(ini_val INSTANT_CLIENT)}
+INSTANT_CLIENT="$(resolve_instant_client)"
 
 SQLPLUS="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus"
 if [ ! -x "$SQLPLUS" ]; then
@@ -47,7 +45,7 @@ if [ ! -x "$SQLPLUS" ]; then
   exit 1
 fi
 
-export TNS_ADMIN="$HOME/auth/tns"
+export TNS_ADMIN="${TNS_ADMIN:-$HOME/auth/tls_wallet}"
 export LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
 export DYLD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
 

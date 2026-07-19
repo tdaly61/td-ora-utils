@@ -41,22 +41,27 @@ macOS host
 ## Quick Start
 
 ```bash
-# 1. First run: install Oracle Instant Client, configure Colima
+# 1. First run: install Oracle Instant Client, configure Docker/Colima
 ./setup-for-adb-26ai.sh
 
 # 2. Start everything (ADB container + nginx proxy + ONNX model + APEX users)
 #    Add -k if mifos-gazelle Kubernetes pods are running (see "mifos-gazelle co-existence" below)
 ./run-adb-26ai.sh
 
-# 3. Load your APEX application (uses APEX_EXPORT_FILE from config.ini by default)
+# 3. Load your APEX application (uses APEX_EXPORT_FILE from .env by default)
 ./load-apex-app.sh
 # Or override with: ./load-apex-app.sh -f path/to/your-app.sql
+# No app to load yet? Try the generic demo: ./examples/sample-app/load-sample-app.sh
 
 # 4. Open APEX
 open https://localhost:8443/ords/apex
 # Workspace: TRACKER1  User: TRACKER1  Password: Welcome_MY_ATP_123
 
-# 5. Clean up (stop containers; prompts before deleting data)
+# 5. Later — export your app and hand it to someone deploying to OCI ADB:
+./export-apex-app.sh -u TRACKER1
+./bundle-apex-for-oci.sh -f apex-exports/app_<timestamp>.sql
+
+# 6. Clean up (stop containers; prompts before deleting data)
 ./run-adb-26ai.sh -c
 ```
 
@@ -66,28 +71,34 @@ open https://localhost:8443/ords/apex
 
 | File | Purpose |
 |------|---------|
-| `config.ini` | All settings — edit this before running |
+| `.env` | All settings — edit `.env.sample` → copy to `.env` before running |
 | `run-adb-26ai.sh` | Main script: start containers, load model, configure AI |
-| `setup-for-adb-26ai.sh` | One-time install: Instant Client, Colima, registry login |
-| `load-apex-app.sh` | Import an APEX app export + wire up AI remote servers |
+| `setup-for-adb-26ai.sh` | One-time install: Instant Client, Docker/Colima, registry login |
+| `load-apex-app.sh` | Import an APEX app export + wire up AI remote servers (local or cloud) |
+| `export-apex-app.sh` | Export a live APEX app to a versioned SQL file + manifest |
+| `bundle-apex-for-oci.sh` | Package an app for manual handover to an Oracle ADB on OCI |
+| `deploy-apex-to-oci.sh` | Optional: automate that handover via the `oci` CLI |
+| `examples/sample-app/` | Generic worked example — Notes app + vector search |
+| `legacy/compose-fullstack/` | Archived two-container alternative (not wired to any script) |
 | `ollama-proxy/nginx.conf` | nginx HTTPS→HTTP proxy config |
 | `ollama-proxy.crt` / `ollama-proxy.key` | Self-signed cert for the proxy (gitignored) |
 | `sql-scripts/create-users.sql.tpl` | User + APEX workspace template |
-| `sql-scripts/vector-setup.sql` | Loads `ALL_MINILM` ONNX model into the database |
+| `sql-scripts/load-onnx-model.sql.tpl` | Generic ONNX embedding-model loader (any model name/URL) |
+| `sql-scripts/oci-admin-grants.sql.tpl` | Generic ADMIN grants for an OCI ADB handover |
 | `sql-scripts/setup-ollama-ai.sql.tpl` | Network ACL + APEX AI remote server template |
 
 ---
 
-## Configuration (`config.ini`)
+## Configuration (`.env`)
 
-Key settings most likely to need changing:
+Copy `.env.sample` to `.env` and edit. Key settings most likely to need changing:
 
 ```ini
-DOCKER_IMAGE=ghcr.io/oracle/adb-free:26.2.4.2-26ai-arm64   # image tag
+DOCKER_IMAGE_ARM=ghcr.io/oracle/adb-free:26.5.4.2-26ai-arm64   # arch-specific image tags —
+DOCKER_IMAGE_AMD=ghcr.io/oracle/adb-free:26.5.4.2-26ai-amd64   # run-adb-26ai.sh picks the right one
 CONTAINER_NAME=adb-free
 DEFAULT_PASSWORD=Welcome_MY_ATP_123          # ADMIN, wallet, and demo user password
 APEX_USER=TRACKER1
-WALLET_PASSWORD=Welcome_MY_ATP_123           # used for tls_wallet (client mTLS connections)
 
 # LLM endpoint — "local" type: run-adb-26ai.sh starts the nginx proxy automatically
 LLM_OLLAMA_LOCAL=https://ollama-proxy:443|llama3.2:3b|local
@@ -171,9 +182,9 @@ This survives `docker restart` (container writable layer is preserved). It is **
 ADB-Free requires TCPS (mTLS) for all Python connections. Configure `oracledb` with wallet parameters:
 
 ```ini
-# .credentials
-[local_weave32]
-user = weave32
+# your-app/.credentials (or .env — format is up to your app)
+[db]
+user = TRACKER1
 password = Welcome_MY_ATP_123
 dsn = myatp_high
 wallet_location = /Users/you/auth/tls_wallet
@@ -207,6 +218,44 @@ Plain TCP (`dsn = localhost:1521/FREEPDB1`) will fail — ADB-Free does not expo
 | Ollama direct (HTTP) | `http://localhost:11434` (macOS host) |
 
 Default credentials: **Workspace** `TRACKER1` · **User** `TRACKER1` · **Password** `Welcome_MY_ATP_123`
+
+---
+
+## Export an app and deploy it to OCI Autonomous Database
+
+Two ways to move an app from this local instance to a real Oracle ADB on OCI —
+both start with an export:
+
+```bash
+./export-apex-app.sh -u TRACKER1        # -> apex-exports/app_<timestamp>.sql + manifest
+```
+
+**Manual handover (works today, no OCI CLI setup needed):**
+
+```bash
+./bundle-apex-for-oci.sh -f apex-exports/app_<timestamp>.sql \
+    --onnx-model MY_EMBED_MODEL --post-sql app_users.sql --payload-dir ./workers
+# -> dist/apex-oci-<schema>-<timestamp>.tar.gz
+```
+
+Hand the tarball to whoever has access to the target ADB. They follow the
+generated `README-OCI.md`: run the ADMIN grants in Database Actions, import the
+app in APEX Builder with Supporting Objects checked, run the numbered post-import
+SQL, then `./check-prereqs.sh` before starting any payload.
+
+**Automated push (optional — needs the `oci` CLI configured):**
+
+```bash
+./deploy-apex-to-oci.sh -f apex-exports/app_<timestamp>.sql \
+    --db-ocid ocid1.autonomousdatabase.oc1..xxxx --llm-host api.x.ai
+```
+
+Downloads the instance wallet, runs the ADMIN grants, and imports the app —
+`load-apex-app.sh` is target-agnostic, so the same importer used locally works
+against a cloud wallet. If the `oci` CLI isn't installed/configured, this script
+tells you and exits; the manual bundle above always works as a fallback.
+
+Neither of these scripts ever runs `git commit` or `git push`.
 
 ---
 
@@ -253,7 +302,7 @@ source adb/mac_helpers.sh && start_k3s_mac
 
 ### Tips
 
-- `COLIMA_DISK=100` in `config.ini` covers both projects (~35 GB mifos + ~20 GB Oracle).
+- `COLIMA_DISK=100` in `.env` covers both projects (~35 GB mifos + ~20 GB Oracle).
 - You do not need to resize or recreate the Colima VM when switching between projects.
 - Stopping k3s does **not** delete Kubernetes workloads; they resume when k3s restarts.
 
@@ -273,7 +322,7 @@ If the cert has been regenerated (`.crt` / `.key` deleted and recreated), the ol
 
 ### `ORA-20987: The requested URL has been prohibited`
 
-The URL passed to `UTL_HTTP` or `APEX_WEB_SERVICE` uses `http://` instead of `https://`. ADB-Free blocks plain HTTP outbound. Fix: ensure `LLM_OLLAMA_LOCAL` in `config.ini` starts with `https://`.
+The URL passed to `UTL_HTTP` or `APEX_WEB_SERVICE` uses `http://` instead of `https://`. ADB-Free blocks plain HTTP outbound. Fix: ensure `LLM_OLLAMA_LOCAL` in `.env` starts with `https://`.
 
 ### HTTP 403 Forbidden from Ollama via proxy
 

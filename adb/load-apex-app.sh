@@ -32,7 +32,8 @@
 set -euo pipefail
 
 RUN_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-CONFIG_FILE="$RUN_DIR/config.ini"
+# Config is adb/.env (was config.ini); fall back to config.ini for old checkouts.
+CONFIG_FILE="$RUN_DIR/.env"; [ -f "$CONFIG_FILE" ] || CONFIG_FILE="$RUN_DIR/config.ini"
 
 # ── Usage / Help ──────────────────────────────────────────────────────────────
 usage() {
@@ -58,7 +59,8 @@ Options:
                       Example: -r OCI_GROK_BIG=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com
   -v <file>           App-specific vector/model setup SQL (run as ADMIN after import).
                       Loads ONNX models the app needs from ONNX_STAGING (staged by run-adb-26ai.sh).
-                      Example: -v /path/to/caseweave/apex-sql-src/Set_Up_Vector_Stuff.sql
+                      See sql-scripts/load-onnx-model.sql.tpl for a generic starting point.
+                      Example: -v /path/to/your-app/vector-setup.sql
   -h                  Show this help message and exit
 
 Prerequisites:
@@ -89,31 +91,42 @@ fi
 
 # shellcheck source=common.sh
 source "$RUN_DIR/common.sh"
+detect_platform
 
 DEFAULT_PASSWORD=$(ini_val DEFAULT_PASSWORD)
 SERVICE_NAME=$(ini_val SERVICE_NAME); SERVICE_NAME=${SERVICE_NAME:-myatp_high}
 
-# Platform-aware Instant Client selection
-case "$(uname -s)" in
-  Darwin*) INSTANT_CLIENT=$(ini_val INSTANT_CLIENT_MAC) ;;
-  *)       INSTANT_CLIENT=$(ini_val INSTANT_CLIENT) ;;
-esac
-[ -z "$INSTANT_CLIENT" ] && INSTANT_CLIENT=$(ini_val INSTANT_CLIENT)
+INSTANT_CLIENT="$(resolve_instant_client)"
 
 APEX_PORT=$(ini_val APEX_PORT);     APEX_PORT=${APEX_PORT:-8443}
 APEX_USER=$(ini_val APEX_USER);     APEX_USER=${APEX_USER:-TRACKER1}
 APEX_PASSWORD=$(ini_val APEX_PASSWORD); APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
-# Read LLM_<STATIC_ID>=<url>|<model>|<type> entries from config.ini
+# Read LLM_<STATIC_ID>=<url>|<model>|<type> entries from config.ini.
+# An optional LLM_<STATIC_ID>_MAC line overrides the base entry on Apple Silicon.
+# We parse every LLM_ line into a raw map first, then resolve _MAC per platform so
+# the override maps back onto the base STATIC_ID (never a phantom "..._MAC" server).
+declare -A _LLM_RAW=()
+while IFS= read -r _cfg_line; do
+  if [[ "$_cfg_line" =~ ^LLM_([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*([^|]+\|[^|]+\|[^|[:space:]]+) ]]; then
+    _LLM_RAW["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+  fi
+done < "$CONFIG_FILE"
+
 declare -A LLM_URL=()
 declare -A LLM_MODEL=()
 declare -A LLM_TYPE=()
-while IFS= read -r _cfg_line; do
-  if [[ "$_cfg_line" =~ ^LLM_([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*([^|]+)\|([^|]+)\|([^|[:space:]]+) ]]; then
-    LLM_URL["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
-    LLM_MODEL["${BASH_REMATCH[1]}"]="${BASH_REMATCH[3]}"
-    LLM_TYPE["${BASH_REMATCH[1]}"]="${BASH_REMATCH[4]}"
+for _raw_id in "${!_LLM_RAW[@]}"; do
+  # Skip _MAC variants here; they're pulled in when resolving their base id.
+  [[ "$_raw_id" == *_MAC ]] && continue
+  _spec="${_LLM_RAW[$_raw_id]}"
+  # On macOS, prefer the _MAC override spec if present and non-empty.
+  if [ "$PLATFORM" = "darwin" ] && [ -n "${_LLM_RAW[${_raw_id}_MAC]:-}" ]; then
+    _spec="${_LLM_RAW[${_raw_id}_MAC]}"
   fi
-done < "$CONFIG_FILE"
+  LLM_URL["$_raw_id"]="${_spec%%|*}"
+  LLM_MODEL["$_raw_id"]="$(printf '%s' "$_spec" | cut -d'|' -f2)"
+  LLM_TYPE["$_raw_id"]="${_spec##*|}"
+done
 
 # ── Parse options ─────────────────────────────────────────────────────────────
 APEX_SQL=""
@@ -140,6 +153,10 @@ while getopts ":f:u:p:s:r:v:h" opt; do
 done
 shift $((OPTIND - 1))
 
+# The APEX app's Supporting Objects are the source of the DB schema and are always
+# installed at import. Keep them current in APEX Builder (Supporting Objects >
+# Installation) before exporting, so the export carries an up-to-date schema.
+
 # Merge LLM config URLs with any -r overrides (overrides win), then build Step 2 PL/SQL
 declare -A RS_FINAL=()
 for _rs_key in "${!LLM_URL[@]}"; do
@@ -156,17 +173,23 @@ for _rs_key in "${!RS_FINAL[@]}"; do
   # OpenAI-compatible providers (Ollama local) need /v1 appended so APEX calls
   # /v1/chat/completions rather than /chat/completions.
   [ "${LLM_TYPE[$_rs_key]:-}" = "local" ] && _rs_url="${_rs_url}/v1"
-  _RS_BLOCK+="  apex_application_install.set_remote_server(p_static_id => '${_rs_key}', p_base_url => '${_rs_url}');"$'\n'
+  _rs_model="${LLM_MODEL[$_rs_key]:-}"
+  # p_ai_model_name is a real, documented parameter of set_remote_server (position 7) —
+  # this is the supported way to apply the declared model at install time. A prior
+  # version of this script parsed LLM_MODEL but never passed it here, so config.ini's
+  # model field silently had no effect and apps kept whatever ai_model_name default
+  # was hardcoded in their own export file.
+  if [ -n "$_rs_model" ]; then
+    _RS_BLOCK+="  apex_application_install.set_remote_server(p_static_id => '${_rs_key}', p_base_url => '${_rs_url}', p_ai_model_name => '${_rs_model}');"$'\n'
+  else
+    _RS_BLOCK+="  apex_application_install.set_remote_server(p_static_id => '${_rs_key}', p_base_url => '${_rs_url}');"$'\n'
+  fi
 done
-[ -n "$_RS_BLOCK" ] && _RS_BLOCK+="  DBMS_OUTPUT.PUT_LINE('Remote server base URLs set.');"$'\n'"END;"$'\n'"/"
+[ -n "$_RS_BLOCK" ] && _RS_BLOCK+="  DBMS_OUTPUT.PUT_LINE('Remote server base URLs and models set.');"$'\n'"END;"$'\n'"/"
 
 # ── Resolve APEX export file ──────────────────────────────────────────────────
 if [ -z "$APEX_SQL" ]; then
-  case "$(uname -s)" in
-    Darwin*) _cfg_export=$(ini_val APEX_EXPORT_FILE_MAC) ;;
-    *)       _cfg_export=$(ini_val APEX_EXPORT_FILE) ;;
-  esac
-  [ -z "$_cfg_export" ] && _cfg_export=$(ini_val APEX_EXPORT_FILE)
+  _cfg_export="$(platform_val APEX_EXPORT_FILE)"
   if [ -n "$_cfg_export" ]; then
     APEX_SQL="$_cfg_export"
     echo "Using APEX export file from config.ini: $APEX_SQL"
@@ -177,11 +200,7 @@ if [ -z "$APEX_SQL" ]; then
 fi
 
 if [ -z "$VECTOR_SQL" ]; then
-  case "$(uname -s)" in
-    Darwin*) _cfg_vector=$(ini_val APEX_VECTOR_SQL_MAC) ;;
-    *)       _cfg_vector=$(ini_val APEX_VECTOR_SQL) ;;
-  esac
-  [ -z "$_cfg_vector" ] && _cfg_vector=$(ini_val APEX_VECTOR_SQL)
+  _cfg_vector="$(platform_val APEX_VECTOR_SQL)"
   if [ -n "$_cfg_vector" ]; then
     VECTOR_SQL="$_cfg_vector"
     echo "Using vector setup SQL from config.ini: $VECTOR_SQL"
@@ -197,15 +216,8 @@ if [ ! -f "$APEX_SQL" ]; then
 fi
 
 # ── Auto-detect parsing schema and app ID from export header ──────────────────
-# The export contains: ,p_default_owner=>'SCHEMANAME'
-DETECTED_OWNER=$(grep -m1 "p_default_owner" "$APEX_SQL" \
-  | sed "s/.*p_default_owner=>['\"]\\([^'\"]*\\)['\"].*/\\1/" \
-  | tr -d ' \r\n')
-
-# The export contains: ,p_default_application_id=>316
-DETECTED_APP_ID=$(grep -m1 "p_default_application_id" "$APEX_SQL" \
-  | sed "s/.*p_default_application_id=>['\">]*\([0-9]*\).*/\\1/" \
-  | tr -d ' \r\n')
+DETECTED_OWNER=$(apex_detect_owner "$APEX_SQL")
+DETECTED_APP_ID=$(apex_detect_app_id "$APEX_SQL")
 
 if [ -n "$OVERRIDE_USER" ]; then
   SCHEMA_USER="$OVERRIDE_USER"
@@ -240,9 +252,14 @@ if [ ! -x "$SQLPLUS" ]; then
   fi
 fi
 
-export TNS_ADMIN="$HOME/auth/tls_wallet"
-export LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
-export DYLD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
+# Respect a caller-supplied TNS_ADMIN (e.g. a cloud ADB wallet from
+# deploy-apex-to-oci.sh) — default to the local ADB-Free wallet only if unset.
+# This is what makes this script target-agnostic: it can import into the local
+# container or into a remote Oracle service, based purely on which wallet/service
+# it is pointed at.
+export TNS_ADMIN="${TNS_ADMIN:-$HOME/auth/tls_wallet}"
+export LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export DYLD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
@@ -398,11 +415,12 @@ BEGIN
 END;
 /
 
--- 2. Enable automatic installation of Supporting Objects (tables, sequences, etc.)
---    Without this, p_auto_install_sup_obj defaults to false and the schema DDL is skipped.
+-- 2. Always install the app's Supporting Objects — they are the source of the DB
+--    schema (tables, sequences, indexes, views, PL/SQL, property graphs). Keep them
+--    current in APEX Builder (Supporting Objects > Installation) before exporting.
 BEGIN
   apex_application_install.set_auto_install_sup_obj(p_auto_install_sup_obj => true);
-  DBMS_OUTPUT.PUT_LINE('Auto-install supporting objects: enabled.');
+  DBMS_OUTPUT.PUT_LINE('Auto-install supporting objects: true');
 END;
 /
 
@@ -533,11 +551,12 @@ WHENEVER SQLERROR CONTINUE
 
 -- wwv_credentials is VPD-protected: use apex_credential.set_persistent_credentials
 -- (definer-rights, owned by APEX_240200) which bypasses the VPD policy.
--- The remote server base_url was set correctly by set_remote_server in Step 2
--- (_RS_BLOCK appends /v1 for local-type LLMs).  Direct UPDATE on wwv_remote_servers
--- via external sqlplus is blocked by VPD even with set_workspace (ORA-41900).
--- To fix an already-installed app's URL: re-run load-apex-app.sh (re-import is
--- idempotent) or update via APEX UI: Workspace Utilities > Generative AI > Edit.
+-- The remote server base_url AND model name were both already set by
+-- set_remote_server in Step 2 (p_base_url, p_ai_model_name — _RS_BLOCK appends
+-- /v1 to the URL for local-type LLMs). A direct UPDATE on wwv_remote_servers
+-- from here would fail with ORA-41900 (missing UPDATE privilege) even after
+-- set_workspace/set_security_group_id — only Step 2, running inside the actual
+-- app import (wwv_flow_imp.import_begin), has write access to this table.
 DECLARE
   v_ws_id    NUMBER;
   v_cred_sid VARCHAR2(100) := '$_LLM_CRED_SID';

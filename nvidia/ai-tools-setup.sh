@@ -17,12 +17,14 @@
 #   --help          Show this help message
 #
 # Models pulled by default:
-#   gemma4:27b            - as requested
-#   qwen2.5-coder:32b     - best coding model for A10 (fits in 23GB VRAM at Q4)
-#   devstral              - Mistral coding model, GPU-friendly alternative
-#   llama3.3:70b          - best summarisation (runs in 235GB RAM)
-#   mistral-small3.1:24b  - fast GPU exploration / Q&A
-#   deepseek-r1:32b       - reasoning + code review, fits in GPU
+#   Pipeline models (from adb/.env via adb/pull-ollama-models.sh — the
+#   single source of truth for the APEX app's vision + text + local LLM_*
+#   models, e.g. gemma4:26b, llama3.3:70b).
+#   Plus these extra developer/coding models:
+#     qwen2.5-coder:32b     - best coding model for A10 (fits in 23GB VRAM at Q4)
+#     devstral              - Mistral coding model, GPU-friendly alternative
+#     mistral-small3.1:24b  - fast GPU exploration / Q&A
+#     deepseek-r1:32b       - reasoning + code review, fits in GPU
 # ==============================================================================
 
 set -euo pipefail
@@ -178,10 +180,11 @@ if [[ "$CHECK_ONLY" == "true" ]]; then
   echo "  • OpenCode      (latest release from github.com/sst/opencode)"
   echo ""
   header "Models that would be pulled"
-  echo "  • gemma4:27b           ~17GB  (requested)"
+  echo "  Pipeline models: from adb/.env (OLLAMA_VISION_MODEL, OLLAMA_TEXT_MODEL,"
+  echo "                   local LLM_* entries) via adb/pull-ollama-models.sh"
+  echo "  Extra dev/coding models:"
   echo "  • qwen2.5-coder:32b    ~20GB  (best coding, fits in A10 GPU)"
   echo "  • devstral             ~15GB  (Mistral coding, GPU)"
-  echo "  • llama3.3:70b         ~40GB  (best summarisation, CPU RAM)"
   echo "  • mistral-small3.1:24b ~14GB  (fast exploration, GPU)"
   echo "  • deepseek-r1:32b      ~20GB  (reasoning/code review, GPU)"
   echo ""
@@ -398,20 +401,20 @@ if [[ "$SKIP_MODELS" == "false" ]]; then
   # runs_on: gpu | cpu | gpu-partial
   # ---------------------------------------------------------------------------
 
+  # NOTE: the APEX app's *pipeline* models (vision + text + local LLM_* servers)
+  # are NOT listed here — they are pulled from .env by adb/pull-ollama-models.sh
+  # (single source of truth; see the delegated call after this loop). This list is
+  # only the extra developer/coding models for the workstation.
   declare -A MODEL_DESC=(
-    ["gemma4:27b"]="Google Gemma 4 27B — general purpose (requested)"
     ["qwen2.5-coder:32b"]="Qwen 2.5 Coder 32B — BEST CODING, fits fully in A10 GPU at Q4"
     ["devstral"]="Mistral Devstral — dedicated coding model, fast on GPU"
-    ["llama3.3:70b"]="Llama 3.3 70B — BEST SUMMARISATION, runs in 235GB RAM"
     ["mistral-small3.1:24b"]="Mistral Small 3.1 24B — fast exploration/Q&A, GPU"
     ["deepseek-r1:32b"]="DeepSeek R1 32B — reasoning + code review, fits in GPU"
   )
 
   MODELS=(
-    "gemma4:27b"
     "qwen2.5-coder:32b"
     "devstral"
-    "llama3.3:70b"
     "mistral-small3.1:24b"
     "deepseek-r1:32b"
   )
@@ -422,13 +425,11 @@ if [[ "$SKIP_MODELS" == "false" ]]; then
   echo "    GPU: $GPU_NAME (${GPU_VRAM_MB}MiB VRAM)"
   echo "    RAM: ${RAM_GB}GB"
   echo ""
-  echo "  Model plan:"
+  echo "  Model plan (extra dev/coding models; pipeline models come from .env):"
   echo "    qwen2.5-coder:32b   → GPU (fits ~20GB at Q4)"
   echo "    devstral            → GPU (~15GB at Q4)"
   echo "    mistral-small3.1:24b→ GPU (~14GB at Q4)"
   echo "    deepseek-r1:32b     → GPU (~20GB at Q4)"
-  echo "    gemma4:27b          → GPU (~17GB at Q4)"
-  echo "    llama3.3:70b        → CPU RAM (~40GB at Q4, 235GB RAM is sufficient)"
   echo ""
 
   FAILED_MODELS=()
@@ -445,6 +446,25 @@ if [[ "$SKIP_MODELS" == "false" ]]; then
     fi
     echo ""
   done
+
+  # ---------------------------------------------------------------------------
+  # Pipeline models — pulled from .env (single source of truth), so the
+  # exact tags the APEX AI service and vision pipeline reference are guaranteed
+  # present with matching names (fixes the old hardcoded gemma4:27b vs config
+  # gemma4:26b drift). Delegated to adb/pull-ollama-models.sh.
+  # ---------------------------------------------------------------------------
+  _AI_SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+  _PULL_SCRIPT="$_AI_SCRIPT_DIR/../adb/pull-ollama-models.sh"
+  if [[ -x "$_PULL_SCRIPT" ]]; then
+    header "Pulling APEX app pipeline models (from .env)"
+    if ! "$_PULL_SCRIPT"; then
+      warn "One or more pipeline models failed to pull — see above."
+      FAILED_MODELS+=("(pipeline models from .env)")
+    fi
+  else
+    warn "Pipeline model puller not found at $_PULL_SCRIPT — skipping."
+    warn "Pipeline LLM/vision models from .env were NOT pulled."
+  fi
 
   # ---------------------------------------------------------------------------
   # Summary
@@ -474,10 +494,11 @@ cat <<'GUIDE'
   ------
   ollama run qwen2.5-coder:32b          # best coding (GPU)
   ollama run devstral                   # Mistral coding (GPU)
-  ollama run llama3.3:70b               # summarisation (CPU RAM)
   ollama run deepseek-r1:32b            # reasoning/review (GPU)
   ollama run mistral-small3.1:24b       # fast Q&A / exploration (GPU)
-  ollama run gemma4:27b                 # general (GPU)
+  # Pipeline models (names come from adb/.env), e.g.:
+  ollama run llama3.3:70b               # summarisation (CPU RAM)
+  ollama run gemma4:26b                 # vision + general (GPU)
   ollama list                           # list installed models
   ollama ps                             # show running models
 

@@ -1,17 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ─────────────────────────────────────────────────────────────────
-# Platform detection — runs first; everything else dispatches on PLATFORM/ARCH
-# ─────────────────────────────────────────────────────────────────
-detect_platform() {
-    case "$(uname -s)" in
-        Linux*)  PLATFORM=linux ;;
-        Darwin*) PLATFORM=darwin ;;
-        *) echo "Unsupported platform: $(uname -s). Exiting."; exit 1 ;;
-    esac
-    ARCH=$(uname -m)   # x86_64 | arm64 | aarch64
-}
+# Platform detection (detect_platform) and arch/instant-client helpers live in
+# common.sh — sourced further down, right after RUN_DIR is known.
 
 # Check if a container exists and is healthy/running. Returns:
 #   0 — container is running (reuse it)
@@ -32,16 +23,6 @@ check_container_state() {
     echo "Container $name exists but is $state — removing stale container..."
     docker rm -f "$name" >/dev/null 2>&1 || true
     return 1  # treat as not existing
-}
-
-# Available disk space in KB for a given path (cross-platform)
-avail_kb_for_dir() {
-    local dir="$1"
-    if [ "$PLATFORM" = "darwin" ]; then
-        df -k "$dir" 2>/dev/null | awk 'NR==2 {print $4}'
-    else
-        df "$dir" --output=avail 2>/dev/null | tail -1
-    fi
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -572,7 +553,8 @@ preflight_check() {
 # Configuration
 # ─────────────────────────────────────────────────────────────────
 read_config() {
-    CONFIG_FILE="$RUN_DIR/config.ini"
+    # Config is adb/.env (was config.ini); fall back to config.ini for old checkouts.
+    CONFIG_FILE="$RUN_DIR/.env"; [ -f "$CONFIG_FILE" ] || CONFIG_FILE="$RUN_DIR/config.ini"
     if [ ! -f "$CONFIG_FILE" ]; then
         echo "Configuration file config.ini not found in $RUN_DIR. Exiting."
         exit 1
@@ -581,25 +563,10 @@ read_config() {
     HOSTNAME=$(ini_val HOSTNAME)
     DEFAULT_PASSWORD=$(ini_val DEFAULT_PASSWORD | tr -d '\n\r')
     CONTAINER_NAME=$(ini_val CONTAINER_NAME)
-    # Select the Docker image for the effective architecture.
-    # On macOS with Colima in x86_64 emulation mode, COLIMA_ARCH=x86_64 overrides
-    # the host's arm64 uname -m so the AMD64 image is used for the Colima VM.
-    local _eff_arch="$ARCH"
-    if [ "$PLATFORM" = "darwin" ]; then
-        local _colima_arch
-        _colima_arch=$(ini_val COLIMA_ARCH 2>/dev/null | tr -d ' \n\r' || true)
-        [ -n "$_colima_arch" ] && _eff_arch="$_colima_arch"
-    fi
-    local _img_arm _img_amd _img_fallback
-    _img_arm=$(ini_val DOCKER_IMAGE_ARM 2>/dev/null | tr -d ' \n\r' || true)
-    _img_amd=$(ini_val DOCKER_IMAGE_AMD  2>/dev/null | tr -d ' \n\r' || true)
-    _img_fallback=$(ini_val DOCKER_IMAGE 2>/dev/null | tr -d ' \n\r' || true)
-    case "$_eff_arch" in
-        x86_64|amd64)  DOCKER_IMAGE="${_img_amd:-$_img_fallback}" ;;
-        arm64|aarch64) DOCKER_IMAGE="${_img_arm:-$_img_fallback}" ;;
-        *)             DOCKER_IMAGE="$_img_fallback" ;;
-    esac
-    echo "Docker image selected for arch '$_eff_arch': $DOCKER_IMAGE"
+    # select_docker_image (common.sh) resolves DOCKER_IMAGE_ARM/_AMD for the effective
+    # arch — on macOS, COLIMA_ARCH overrides uname -m for a Colima VM running emulation.
+    DOCKER_IMAGE="$(select_docker_image)"
+    echo "Docker image selected: $DOCKER_IMAGE"
     ONNX_MODEL_URL=$(ini_val ONNX_MODEL_URL)
     ORACLE_REGISTRY_USER=$(ini_val ORACLE_REGISTRY_USER)
     ORACLE_REGISTRY_PASSWORD=$(ini_val ORACLE_REGISTRY_PASSWORD)
@@ -613,16 +580,8 @@ read_config() {
     CONTAINER_RUNTIME=$(ini_val CONTAINER_RUNTIME)
     CONTAINER_RUNTIME=${CONTAINER_RUNTIME:-auto}
 
-    if [ "$PLATFORM" = "darwin" ]; then
-        # Mac: prefer *_MAC keys, fall back to generic keys if Mac-specific ones are absent
-        SQLPLUS_URL=$(ini_val SQLPLUS_URL_MAC)
-        INSTANT_CLIENT=$(ini_val INSTANT_CLIENT_MAC)
-        [ -z "$SQLPLUS_URL" ]    && SQLPLUS_URL=$(ini_val SQLPLUS_URL)
-        [ -z "$INSTANT_CLIENT" ] && INSTANT_CLIENT=$(ini_val INSTANT_CLIENT)
-    else
-        SQLPLUS_URL=$(ini_val SQLPLUS_URL)
-        INSTANT_CLIENT=$(ini_val INSTANT_CLIENT)
-    fi
+    SQLPLUS_URL="$(platform_val SQLPLUS_URL)"
+    INSTANT_CLIENT="$(resolve_instant_client)"
 
     local missing=""
     [ -z "$SQLPLUS_URL" ]      && missing="$missing SQLPLUS_URL"
@@ -635,6 +594,64 @@ read_config() {
     if [ -n "$missing" ]; then
         echo "Missing required config.ini values:$missing"
         exit 1
+    fi
+}
+
+# Ensure the host firewall lets Docker containers reach Ollama on 11434.
+# Some hosts (e.g. hardened cloud images) run an iptables INPUT chain that only
+# allows loopback/ICMP/established/SSH and REJECTs everything else — which
+# silently breaks ollama-proxy -> host.docker.internal:11434 even though Ollama
+# itself is up and running (curl to localhost works, but container traffic gets
+# "Host is unreachable"). Idempotent: only inserts rules that are missing, and
+# only ever ahead of an existing catch-all DROP/REJECT (never widens an ACCEPT-
+# everything policy). No-op if iptables isn't installed.
+ensure_host_firewall_allows_ollama() {
+    echo "=== Checking host firewall allows Docker -> Ollama (11434) ==="
+
+    if ! command -v iptables &>/dev/null; then
+        echo "  iptables not found — skipping (no host firewall to configure)."
+        return 0
+    fi
+    if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        echo "  Not root and no passwordless sudo — skipping firewall check."
+        echo "  If Ollama calls from containers fail, see nvidia/ai-tools-setup.sh notes."
+        return 0
+    fi
+    _iptables() { if [ "$(id -u)" -eq 0 ]; then iptables "$@"; else sudo -n iptables "$@"; fi; }
+
+    # Only relevant if INPUT has a catch-all REJECT/DROP — an ACCEPT-default host
+    # with no such rule already allows this traffic; nothing to do.
+    if ! _iptables -L INPUT -n 2>/dev/null | grep -qE '^(REJECT|DROP)\b.*0\.0\.0\.0/0 +0\.0\.0\.0/0'; then
+        echo "  No catch-all REJECT/DROP in INPUT chain — nothing to open."
+        return 0
+    fi
+
+    local subnets missing=false
+    subnets=$(docker network inspect "$PROXY_NETWORK" bridge \
+        --format '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' 2>/dev/null | sort -u)
+    [ -z "$subnets" ] && subnets="172.17.0.0/16"$'\n'"172.18.0.0/16"
+
+    while IFS= read -r _subnet; do
+        [ -z "$_subnet" ] && continue
+        if _iptables -C INPUT -p tcp -s "$_subnet" --dport 11434 -j ACCEPT 2>/dev/null; then
+            echo "  Rule already present for $_subnet:11434 — skipping."
+        else
+            echo "  Inserting ACCEPT rule for $_subnet -> tcp/11434..."
+            local reject_line
+            reject_line=$(_iptables -L INPUT -n --line-numbers 2>/dev/null \
+                | awk '/^[0-9]+ +(REJECT|DROP)\b.*0\.0\.0\.0\/0 +0\.0\.0\.0\/0/ {print $1; exit}')
+            _iptables -I INPUT "${reject_line:-1}" -p tcp -s "$_subnet" --dport 11434 -j ACCEPT
+            missing=true
+        fi
+    done <<< "$subnets"
+
+    if [ "$missing" = "true" ]; then
+        if command -v netfilter-persistent &>/dev/null; then
+            if [ "$(id -u)" -eq 0 ]; then netfilter-persistent save; else sudo -n netfilter-persistent save; fi
+            echo "  Firewall rules persisted via netfilter-persistent."
+        else
+            echo "  NOTE: netfilter-persistent not found — rules added but not persisted across reboot."
+        fi
     fi
 }
 
@@ -658,11 +675,23 @@ start_ollama_proxy() {
     # Container-name DNS only works on named networks, not the default bridge.
     docker network create "$PROXY_NETWORK" 2>/dev/null || true
 
+    # Directory of ONNX model files served statically at /onnx-models/ (see
+    # load_onnx_model_via_http). Mounted into the proxy so DB-side UTL_HTTP can
+    # fetch models over the already-trusted HTTPS endpoint.
+    mkdir -p "$ONNX_MODELS_DIR"
+
     # check_container_state: returns 0 = running (reuse), 1 = missing/stale (recreate).
+    # A proxy container from before the onnx-models mount was added won't have it —
+    # detect that and recreate so upgrades pick up the new mount automatically.
     if check_container_state "$PROXY_CONTAINER"; then
-        echo "  Proxy container already running — ensuring it is on $PROXY_NETWORK..."
-        docker network connect "$PROXY_NETWORK" "$PROXY_CONTAINER" 2>/dev/null || true
-        return 0
+        if docker inspect "$PROXY_CONTAINER" --format '{{range .Mounts}}{{.Destination}} {{end}}' \
+                | grep -q '/usr/share/nginx/html/onnx-models'; then
+            echo "  Proxy container already running — ensuring it is on $PROXY_NETWORK..."
+            docker network connect "$PROXY_NETWORK" "$PROXY_CONTAINER" 2>/dev/null || true
+            return 0
+        fi
+        echo "  Proxy container predates onnx-models mount — recreating..."
+        docker rm -f "$PROXY_CONTAINER"
     fi
     docker run -d \
         --name "$PROXY_CONTAINER" \
@@ -671,6 +700,7 @@ start_ollama_proxy() {
         -v "$RUN_DIR/ollama-proxy/nginx.conf:/etc/nginx/conf.d/default.conf:ro" \
         -v "$PROXY_CERT:/etc/nginx/certs/proxy.crt:ro" \
         -v "$PROXY_KEY:/etc/nginx/certs/proxy.key:ro" \
+        -v "$ONNX_MODELS_DIR:/usr/share/nginx/html/onnx-models:ro" \
         --add-host "host.docker.internal:host-gateway" \
         nginx:alpine
     echo "  Proxy started: https://ollama-proxy:443 → http://host.docker.internal:11434"
@@ -787,19 +817,22 @@ PROXY_KEY="$RUN_DIR/ollama-proxy.key"
 PROXY_CONTAINER="ollama-proxy"
 PROXY_PORT=11435
 PROXY_NETWORK="oracle-ai-net"
+ONNX_MODELS_DIR="$RUN_DIR/onnx-models"
 
-detect_platform
-
-# Source common utilities (ini_val, avail_kb_for_dir, colour helpers).
-# CONFIG_FILE not yet set — common.sh functions that use it are called later.
+# Source common utilities (detect_platform, ini_val, platform_val, select_docker_image,
+# resolve_instant_client, avail_kb_for_dir, colour helpers) before anything else runs.
 # shellcheck source=common.sh
 source "$RUN_DIR/common.sh"
+detect_platform
 
 # Source platform-specific helpers.
 if [ "$PLATFORM" = "darwin" ]; then
-    # Read CONTAINER_RUNTIME early (before full read_config) so set_docker_host_mac gets the right value.
-    CONTAINER_RUNTIME=$(grep -m1 "^CONTAINER_RUNTIME=" "$RUN_DIR/config.ini" 2>/dev/null | cut -d'=' -f2- | tr -d ' \n\r')
+    # Read CONTAINER_RUNTIME early (before full read_config) so set_docker_host_mac gets
+    # the right value. Config is adb/.env (was config.ini); fall back for old checkouts.
+    _early_cfg="$RUN_DIR/.env"; [ -f "$_early_cfg" ] || _early_cfg="$RUN_DIR/config.ini"
+    CONTAINER_RUNTIME=$(grep -m1 "^CONTAINER_RUNTIME=" "$_early_cfg" 2>/dev/null | cut -d'=' -f2- | tr -d ' \n\r')
     CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-auto}"
+    unset _early_cfg
     # shellcheck source=mac_helpers.sh
     source "$RUN_DIR/mac_helpers.sh"
     set_docker_host_mac
@@ -906,6 +939,7 @@ configure_sql_access
 export TNS_ADMIN="$WALLET_DIR"
 echo "TNS_ADMIN is $TNS_ADMIN"
 
+ensure_host_firewall_allows_ollama
 start_ollama_proxy
 trust_proxy_cert
 
@@ -938,6 +972,14 @@ if [ -n "$_dbfs_path" ]; then
 else
     echo "  WARNING: Could not determine DBFS path — ONNX model load may fail (ORA-22288)."
 fi
+
+# Also stage the model where ollama-proxy can serve it over HTTPS at
+# /onnx-models/model.onnx. Apps load their own named models by fetching this URL
+# via UTL_HTTP into a BLOB — see sql-scripts/load-onnx-model.sql.tpl. This is the
+# reliable path on ADB-Free images where directory/BFILE-based loading hits
+# ORA-17676 ("failed to mount 'data'").
+cp "$MODEL_PATH" "$ONNX_MODELS_DIR/model.onnx"
+echo "  ONNX model staged for HTTPS serving: https://ollama-proxy:443/onnx-models/model.onnx"
 
 # Enable extended VARCHAR2(32767) support — ADB-Free typically has this already; will be a no-op.
 enable_extended_string_size

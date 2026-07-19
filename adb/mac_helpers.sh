@@ -255,14 +255,23 @@ _install_oc_mac() {
 _install_ollama_mac() {
     if command -v ollama &>/dev/null; then
         echo "Ollama already installed: $(ollama --version 2>/dev/null || echo 'unknown version')"
-        return
-    fi
-    if command -v brew &>/dev/null; then
+    elif command -v brew &>/dev/null; then
         echo "Installing Ollama via Homebrew..."
         brew install ollama
     else
         echo "Ollama not found. Install it from https://ollama.com/download or: brew install ollama"
         exit 1
+    fi
+
+    # The DB runs in a Colima VM and reaches host Ollama via
+    # host.docker.internal:11434 — that only works if Ollama listens on all
+    # interfaces, not just 127.0.0.1. Persist OLLAMA_HOST=0.0.0.0 for the GUI app
+    # and future `ollama serve` (launchctl user domain), then note the restart.
+    if command -v launchctl &>/dev/null; then
+        launchctl setenv OLLAMA_HOST "0.0.0.0" 2>/dev/null || true
+        echo "Set OLLAMA_HOST=0.0.0.0 (launchctl). Restart Ollama for it to take effect:"
+        echo "  - Quit the Ollama menu-bar app and relaunch it, OR"
+        echo "  - if running headless: OLLAMA_HOST=0.0.0.0 ollama serve"
     fi
 }
 
