@@ -74,6 +74,12 @@ result_output*/
 aust_audio_train/
 
 ###############################################
+######### DATA-GATHERING IGNORES ###############
+###############################################
+data-gathering/huggingface/convokit-reddit/convokit-env/
+data-gathering/huggingface/convokit-reddit/conversation_samples/
+
+###############################################
 ############### PYTHON IGNORES ################
 ###############################################
 # Byte-compiled / optimized / DLL files

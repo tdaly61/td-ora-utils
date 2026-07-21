@@ -5,9 +5,15 @@
 -- no OCI-specific client library required), then registers it as a named mining
 -- model. Idempotent: skips the load if the model already exists.
 --
--- Substitute the two tokens before running (sed, or via a wrapper script):
+-- Substitute before running (sed, or via a wrapper script):
 --   __MODEL_NAME__   the mining-model name your app references, e.g. MY_EMBED_MODEL
---   __ONNX_URL__     HTTPS URL to the .onnx file
+--                    (build-time fact — baked in wherever this is rendered)
+--
+-- __ONNX_URL__ below is rendered as a DEFINE, not inline-substituted, so it can
+-- be left deferred to deploy time (e.g. bundle-apex-for-oci.sh defaults it to
+-- CHANGE_ME_ONNX_URL when no --onnx-url is given, matching how LLM_HOST is
+-- deferred in oci-admin-grants.sql.tpl) — edit the DEFINE line below before
+-- running if it still reads a CHANGE_ME placeholder.
 --
 -- Run connected AS THE SCHEMA OWNER (not ADMIN) — user_mining_models is scoped
 -- per-account, and the owner needs CREATE MINING MODEL + EXECUTE ON DBMS_VECTOR
@@ -16,9 +22,13 @@
 -- statement of its own so it composes cleanly whether invoked interactively,
 -- via `sqlplus ... @this_file`, or wrapped by another script.
 --
--- Requires: outbound network ACL for the schema owner to the __ONNX_URL__ host
+-- Requires: outbound network ACL for the schema owner to the ONNX_URL host
 -- (UTL_HTTP privilege + DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE — see the generic
--- admin-grants template).
+-- admin-grants template). Note: admin-grants only grants an ACL for LLM_HOST —
+-- if ONNX_URL's host differs, grant a second ACL for it by hand before running
+-- this, or UTL_HTTP will fail with ORA-24247.
+
+DEFINE ONNX_URL = __ONNX_URL__
 
 SET SERVEROUTPUT ON SIZE UNLIMITED
 
@@ -40,7 +50,7 @@ BEGIN
 
   DBMS_LOB.CREATETEMPORARY(l_blob, TRUE);
 
-  l_http_req := UTL_HTTP.BEGIN_REQUEST('__ONNX_URL__');
+  l_http_req := UTL_HTTP.BEGIN_REQUEST('&ONNX_URL');
   UTL_HTTP.SET_HEADER(l_http_req, 'User-Agent', 'td-ora-utils/load-onnx-model');
   l_http_resp := UTL_HTTP.GET_RESPONSE(l_http_req);
 
@@ -54,7 +64,7 @@ BEGIN
       UTL_HTTP.END_RESPONSE(l_http_resp);
   END;
 
-  DBMS_OUTPUT.PUT_LINE('Fetched ' || DBMS_LOB.GETLENGTH(l_blob) || ' bytes from __ONNX_URL__');
+  DBMS_OUTPUT.PUT_LINE('Fetched ' || DBMS_LOB.GETLENGTH(l_blob) || ' bytes from &ONNX_URL');
 
   DBMS_VECTOR.LOAD_ONNX_MODEL(
     model_name => '__MODEL_NAME__',

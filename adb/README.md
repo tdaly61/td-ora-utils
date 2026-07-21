@@ -243,17 +243,35 @@ generated `README-OCI.md`: run the ADMIN grants in Database Actions, import the
 app in APEX Builder with Supporting Objects checked, run the numbered post-import
 SQL, then `./check-prereqs.sh` before starting any payload.
 
+`--onnx-model`'s model *name* is a build-time fact (baked in — it has to match
+what the app's PL/SQL already references), but its `--onnx-url` is optional
+and deploy-time by default: pass it explicitly to bake in a known-good URL,
+or omit it (falls back to `.env`'s `ONNX_MODEL_URL` if set) to leave
+`sql/0N_load_onnx_model.sql` with `DEFINE ONNX_URL = CHANGE_ME_ONNX_URL` for
+the deployer to fill in later — the same deferred pattern `--admin-sql`'s
+default already uses for `LLM_HOST`. `check-prereqs.sh` catches either
+unedited placeholder with the same generic `CHANGE_ME` scan.
+
 **Automated push (optional — needs the `oci` CLI configured):**
 
 ```bash
 ./deploy-apex-to-oci.sh -f apex-exports/app_<timestamp>.sql \
-    --db-ocid ocid1.autonomousdatabase.oc1..xxxx --llm-host api.x.ai
+    --db-ocid ocid1.autonomousdatabase.oc1..xxxx --llm-host api.x.ai \
+    --write-connection-info /tmp/conn.env
 ```
 
 Downloads the instance wallet, runs the ADMIN grants, and imports the app —
 `load-apex-app.sh` is target-agnostic, so the same importer used locally works
 against a cloud wallet. If the `oci` CLI isn't installed/configured, this script
 tells you and exits; the manual bundle above always works as a fallback.
+
+`--write-connection-info <file>` writes the resolved `WALLET_DIR`/
+`SERVICE_NAME`/`SCHEMA_USER` as plain `key=value` lines (no passwords) — for
+an app-side wrapper that needs those facts to generate its own worker config
+without re-deriving the OCID lookup / wallet download / `tnsnames.ora` parse
+a second time (see CaseWeave's `deploy-caseweave-to-oci.sh` for a worked
+example: it sources this file to write a correctly-pointed `.env` for its
+Python workers).
 
 Neither of these scripts ever runs `git commit` or `git push`.
 

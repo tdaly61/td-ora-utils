@@ -26,7 +26,12 @@
 #                         name -> the next numbered sql/ script (before --post-sql)
 #   --onnx-url <url>      URL for --onnx-model (default: ONNX_MODEL_URL from .env —
 #                         Oracle's public pre-authenticated object-storage URL works
-#                         from OCI with no credential)
+#                         from OCI with no credential). Optional: if omitted and no
+#                         .env default exists, the generated script is left with
+#                         DEFINE ONNX_URL = CHANGE_ME_ONNX_URL for the deployer to
+#                         edit at deploy time (same deferred pattern as LLM_HOST in
+#                         sql/01_admin_grants.sql) — check-prereqs.sh already flags
+#                         any unedited CHANGE_ME placeholder.
 #   --payload-dir <dir>   Directory copied verbatim into payload/ (e.g. worker
 #                         scripts + their own requirements/README)
 #   --readme-fragment <f> Markdown appended to the generic README-OCI.md
@@ -62,7 +67,8 @@ Options:
   --admin-sql <file>    -> sql/01_admin_grants.sql (default: generated, generic)
   --post-sql <file>     -> sql/0N_*.sql, in order given (repeatable)
   --onnx-model <name>   Render the generic ONNX loader for this model name
-  --onnx-url <url>      URL for --onnx-model (default: .env ONNX_MODEL_URL)
+  --onnx-url <url>      URL for --onnx-model (default: .env ONNX_MODEL_URL,
+                        else deferred to a deploy-time DEFINE — see below)
   --payload-dir <dir>   Copied verbatim into payload/
   --readme-fragment <f> Appended to the generic README-OCI.md
   --check-prereqs <f>   Override the generic check-prereqs.sh
@@ -174,15 +180,15 @@ fi
 # ── Remaining numbered SQL: ONNX loader (if requested), then --post-sql in order ──
 _next_num=2
 if [ -n "$ONNX_MODEL" ]; then
-  if [ -z "$ONNX_URL" ]; then
-    echo "ERROR: --onnx-model given but no --onnx-url and no ONNX_MODEL_URL in .env"
-    exit 1
-  fi
   _num=$(printf '%02d' "$_next_num")
   sed -e "s/__MODEL_NAME__/$ONNX_MODEL/g" \
-      -e "s|__ONNX_URL__|$ONNX_URL|g" \
+      -e "s|__ONNX_URL__|${ONNX_URL:-CHANGE_ME_ONNX_URL}|g" \
       "$RUN_DIR/sql-scripts/load-onnx-model.sql.tpl" > "$STAGE/sql/${_num}_load_onnx_model.sql"
-  echo "  sql/${_num}_load_onnx_model.sql : generated (model=$ONNX_MODEL)"
+  if [ -z "$ONNX_URL" ]; then
+    echo "  sql/${_num}_load_onnx_model.sql : generated (model=$ONNX_MODEL, URL deferred — edit DEFINE before running)"
+  else
+    echo "  sql/${_num}_load_onnx_model.sql : generated (model=$ONNX_MODEL)"
+  fi
   _next_num=$((_next_num + 1))
 fi
 

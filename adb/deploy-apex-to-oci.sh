@@ -54,6 +54,11 @@ Options:
   --profile <name>      OCI CLI profile (default: DEFAULT)
   -v <file>              Vector/model setup SQL, passed through to load-apex-app.sh -v
   -r STATIC_ID=URL       Remote-server override, passed through to load-apex-app.sh -r
+  --write-connection-info <file>
+                        Write the resolved WALLET_DIR/SERVICE_NAME/SCHEMA_USER as
+                        plain key=value lines to this file (no passwords) — lets a
+                        caller-side wrapper generate its own app-specific worker
+                        config without re-deriving the wallet download / DSN lookup
   -h                     Show this help and exit
 
 Example:
@@ -109,6 +114,7 @@ WALLET_DIR=""
 SERVICE_ALIAS="high"
 OCI_PROFILE="DEFAULT"
 VECTOR_SQL=""
+CONN_INFO_FILE=""
 declare -a RS_ARGS=()
 
 while [ $# -gt 0 ]; do
@@ -127,6 +133,7 @@ while [ $# -gt 0 ]; do
     --profile) OCI_PROFILE="$2"; shift 2 ;;
     -v) VECTOR_SQL="$2"; shift 2 ;;
     -r) RS_ARGS+=("-r" "$2"); shift 2 ;;
+    --write-connection-info) CONN_INFO_FILE="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) echo "ERROR: Unknown option $1"; exit 1 ;;
   esac
@@ -230,6 +237,19 @@ declare -a LOAD_ARGS=(-f "$APEX_SQL" -u "$SCHEMA_USER" -p "$SCHEMA_PASS" -s "$SE
 LOAD_ARGS+=("${RS_ARGS[@]+"${RS_ARGS[@]}"}")
 
 "$RUN_DIR/load-apex-app.sh" "${LOAD_ARGS[@]}"
+
+# ── Optional: expose what we resolved for a caller-side wrapper ───────────────
+if [ -n "$CONN_INFO_FILE" ]; then
+  ( umask 077; cat > "$CONN_INFO_FILE" <<EOF
+WALLET_DIR=$WALLET_DIR
+SERVICE_NAME=$SERVICE_NAME
+SCHEMA_USER=$SCHEMA_USER
+EOF
+  )
+  chmod 600 "$CONN_INFO_FILE"
+  echo ""
+  echo "  Wrote connection info -> $CONN_INFO_FILE"
+fi
 
 echo ""
 echo "=== Deploy to OCI complete ==="
