@@ -1,0 +1,7 @@
+.env
+oradata/
+ords_config/
+apex-install/
+ords-install/
+test/reports/
+*.log

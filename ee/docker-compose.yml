@@ -1,0 +1,74 @@
+# Two-container topology: plain Oracle DB (Free, swap-ready to Enterprise
+# Edition — see .env.sample) plus a separate ORDS container that auto-installs
+# APEX from a locally-downloaded zip on first boot. Revived and updated from
+# adb/legacy/compose-fullstack/docker-compose.yml — see ee/README.md for how
+# this differs from the single-container adb-free setup in adb/.
+
+services:
+  oracle-db:
+    # Phase 1 default: gvenzl/oracle-free (Docker Hub, no OTN registry login
+    # required) — a widely-used repackaging of the same official Oracle
+    # Database Free binaries, published specifically to avoid the
+    # container-registry.oracle.com login/license-click-through dance.
+    # PDB name is fixed at FREEPDB1 on this image (see .env.sample).
+    #
+    # Swap-in alternatives (official Oracle images, OTN-account gated — see
+    # .env.sample and README.md for what else changes: env var names and the
+    # default PDB name both differ):
+    #   container-registry.oracle.com/database/free:23.26.1.0       (plain Free)
+    #   container-registry.oracle.com/database/enterprise:23.26.1.0 (Enterprise Edition)
+    image: ${DOCKER_IMAGE:-gvenzl/oracle-free:23.26.2}
+    container_name: ${CONTAINER_NAME:-caseweave-ee-db}
+    hostname: ${DB_HOSTNAME:-ee.local}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - ORACLE_PASSWORD=${ORACLE_PWD}
+    ports:
+      # Host ports are configurable because ../adb/'s adb-free container
+      # commonly occupies 1521/1522 on the same host — see .env.sample.
+      - "${DB_HOST_PORT:-1523}:1521"
+      - "${EM_EXPRESS_HOST_PORT:-5500}:5500"
+    volumes:
+      - ${DB_DATA_DIR:-./oradata}:/opt/oracle/oradata
+      # Read-only access to the extracted APEX distribution so apexins.sql /
+      # apex_rest_config.sql can be run via `docker exec` (needs the real
+      # $ORACLE_HOME on the DB container, e.g. for apex_rest_config.sql's
+      # catcon.pl shell-out — a thin host Instant Client doesn't have that).
+      - ${APEX_INSTALL_DIR:-./apex-install}:/tmp/apex:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 150
+
+  ords:
+    # No official ords container image here: container-registry.oracle.com/database/ords
+    # requires the same OTN registry login as the official DB images, which
+    # Phase 1 is deliberately avoiding (see .env.sample). Instead this runs
+    # ORDS standalone from the zip distribution (download-ords.sh — a plain,
+    # unauthenticated download.oracle.com URL) inside a generic, unauthenticated
+    # JRE base image. See ords-entrypoint.sh for the non-interactive install +
+    # serve sequence. APEX itself is installed separately, from the host, by
+    # run-ee.sh (apexins.sql / apex_rest_config.sql) — this container only
+    # needs to serve it once installed.
+    image: ${ORDS_JAVA_IMAGE:-eclipse-temurin:21-jre-jammy}
+    container_name: ${ORDS_CONTAINER_NAME:-caseweave-ee-ords}
+    working_dir: /opt/ords
+    entrypoint: ["/opt/ords-entrypoint.sh"]
+    environment:
+      - SYS_PASSWORD=${ORACLE_PWD}
+      - ORDS_PUBLIC_USER_PASSWORD=${ORACLE_PWD}
+      - DB_HOST=oracle-db
+      - DB_PORT=1521
+      - DB_SERVICENAME=${ORACLE_PDB:-FREEPDB1}
+    ports:
+      - "${APEX_PORT:-8080}:8080"
+    volumes:
+      - ${ORDS_INSTALL_DIR:-./ords-install}:/opt/ords
+      - ${ORDS_CONFIG_DIR:-./ords_config}:/etc/ords/config   # persists ORDS config + install marker across restarts
+      - ${APEX_INSTALL_DIR:-./apex-install}:/opt/oracle/apex:ro
+      - ./ords-entrypoint.sh:/opt/ords-entrypoint.sh:ro
+    depends_on:
+      oracle-db:
+        condition: service_healthy
