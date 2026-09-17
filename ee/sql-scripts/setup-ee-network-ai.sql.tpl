@@ -1,8 +1,8 @@
 -- setup-ee-network-ai.sql.tpl
 -- Configures outbound network access so this database can call a local
 -- Ollama instance on the host, without the ollama-proxy TLS-termination
--- layer the adb-free setup needs (neither Database Free nor Enterprise
--- Edition force REQUIRE_OUT_HTTPS=Y the way ADB-Free does).
+-- layer the adb-free setup needs (Enterprise Edition does not force
+-- REQUIRE_OUT_HTTPS=Y the way ADB-Free does).
 --
 -- Scope note: this script is DB-layer only (ACLs + grants + a shared
 -- credential on ADMIN) — it does NOT register an APEX Generative AI service
@@ -107,9 +107,13 @@ SET SERVEROUTPUT ON;
 DECLARE
   v_result CLOB;
 BEGIN
+  -- "host" must literally be the string "local" for a self-hosted Ollama —
+  -- it is NOT where the endpoint goes (that was the bug here: passing the
+  -- actual URL as "host" raises ORA-20003 invalid HOST value). The real
+  -- endpoint, including the /api/generate path, goes in "url".
   v_result := DBMS_VECTOR_CHAIN.UTL_TO_GENERATE_TEXT(
     'Reply with the single word: OK',
-    JSON('{"provider":"ollama","host":"__OLLAMA_BASE_URL__","model":"__OLLAMA_MODEL__"}')
+    JSON('{"provider":"ollama","host":"local","url":"__OLLAMA_BASE_URL__/api/generate","model":"__OLLAMA_MODEL__"}')
   );
   DBMS_OUTPUT.PUT_LINE('Ollama connectivity test response: ' || SUBSTR(v_result, 1, 200));
 EXCEPTION

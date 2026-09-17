@@ -62,7 +62,7 @@ fi
 
 # ── Bring the stack up ────────────────────────────────────────────────────
 ORACLE_PWD="$(ini_val ORACLE_PWD)"
-ORACLE_PDB="$(ini_val ORACLE_PDB)"; ORACLE_PDB="${ORACLE_PDB:-FREEPDB1}"
+ORACLE_PDB="$(ini_val ORACLE_PDB)"; ORACLE_PDB="${ORACLE_PDB:-ORCLPDB1}"
 CONTAINER_NAME="$(ini_val CONTAINER_NAME)"; CONTAINER_NAME="${CONTAINER_NAME:-caseweave-ee-db}"
 ORDS_CONTAINER_NAME="$(ini_val ORDS_CONTAINER_NAME)"; ORDS_CONTAINER_NAME="${ORDS_CONTAINER_NAME:-caseweave-ee-ords}"
 APEX_PORT="$(ini_val APEX_PORT)"; APEX_PORT="${APEX_PORT:-8080}"
@@ -97,6 +97,8 @@ while true; do
     [ "$status" = "unhealthy" ] && die "$CONTAINER_NAME reported unhealthy — check: docker logs $CONTAINER_NAME"
     sleep 10
 done
+
+enable_extended_string_size "$CONTAINER_NAME" "$ORACLE_PDB" "$DB_HEALTHY_TIMEOUT"
 
 # Password-based EZConnect straight at the PDB service (not OS-authenticated
 # bequeath "/") — this lands directly inside the PDB with no CDB$ROOT/ALTER
@@ -141,6 +143,45 @@ else
     echo "$APEXINS_OUT" | grep -qiE "SP2-|ORA-|PLS-" && die "apexins.sql failed — see sqlplus output above."
     ok "APEX installed"
 
+    hdr "Creating the APEX instance administrator"
+    # A database user named ADMIN (create-admin-compat-user.sql.tpl, above)
+    # is NOT the same thing as APEX's own INTERNAL-workspace instance
+    # administrator — that's a separate record in wwv_flow_fnd_user, normally
+    # created by apxchpwd.sql. Without one, apex_instance_admin.add_workspace
+    # (used by adb/load-apex-app.sh for every app import) fails with
+    # ORA-20987 ("User ADMIN requires ADMIN privilege") even though the DB
+    # user ADMIN already has DBA.
+    #
+    # apxchpwd.sql itself is NOT used here: its `ACCEPT ... HIDE` prompt for
+    # the password does not correctly read piped (non-TTY) stdin on this
+    # SQL*Plus version — it silently returns an empty string instead of the
+    # piped value, which both raises ORA-20001 (blank password rejected) AND
+    # leaves the real password line unconsumed, so it gets misinterpreted as
+    # a stray top-level SQL*Plus command afterwards (SP2-0734). Confirmed
+    # empirically: the identical password succeeds when passed as a literal
+    # PL/SQL argument (below) instead of through the ACCEPT/HIDE prompt.
+    # This calls the exact same underlying procedure apxchpwd.sql itself
+    # calls, just without the broken prompt in between.
+    APXADMIN_OUT="$(cd "$APEX_INSTALL_DIR" && "$EE_SQLPLUS" -s "sys/$ORACLE_PWD@$EZCONNECT as sysdba" <<SQLEOF 2>&1
+WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK
+@@core/scripts/set_appun.sql
+ALTER SESSION SET CURRENT_SCHEMA = &APPUN;
+BEGIN
+  wwv_flow_instance_admin.create_or_update_admin_user(
+    p_username => 'ADMIN',
+    p_email    => 'admin@example.com',
+    p_password => '$ADMIN_COMPAT_PASSWORD'
+  );
+  COMMIT;
+END;
+/
+exit
+SQLEOF
+)"
+    echo "$APXADMIN_OUT"
+    echo "$APXADMIN_OUT" | grep -qiE "SP2-|ORA-|PLS-" && die "Creating the APEX instance administrator failed — see sqlplus output above."
+    ok "APEX instance administrator ready"
+
     hdr "Configuring APEX_LISTENER / APEX_REST_PUBLIC_USER (apex_rest_config.sql)"
     # This one DOES need to run inside the container via docker exec: on a
     # CDB, apex_rest_config.sql shells out to $ORACLE_HOME/perl/.../catcon.pl
@@ -172,6 +213,8 @@ while true; do
     fi
     sleep 10
 done
+
+ensure_host_firewall_allows_ollama
 
 hdr "Network/AI setup"
 NET_SQL="$(mktemp /tmp/ee_net_XXXXXX.sql)"

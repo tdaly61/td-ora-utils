@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # download-ords.sh — fetch + extract Oracle REST Data Services (ORDS) into
-# ORDS_INSTALL_DIR. Downloaded directly from download.oracle.com (no OTN
-# registry login needed, unlike the official ords container image), so this
-# is what keeps the whole ee/ pipeline credential-free for Phase 1.
+# ORDS_INSTALL_DIR. Downloaded directly from download.oracle.com — no OTN
+# registry login needed here, unlike the official ords container image (or
+# the Enterprise Edition DB image itself, which does need one — see
+# .env.sample).
 #
 # There is no versioned direct-download URL Oracle publishes for ORDS (only
 # "ords-latest.zip") — unlike the Docker image tags elsewhere in this

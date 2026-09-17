@@ -15,7 +15,7 @@ set -euo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source "$SCRIPT_DIR/../lib.sh"
 
-ORACLE_PDB="$(ini_val ORACLE_PDB)"; ORACLE_PDB="${ORACLE_PDB:-FREEPDB1}"
+ORACLE_PDB="$(ini_val ORACLE_PDB)"; ORACLE_PDB="${ORACLE_PDB:-ORCLPDB1}"
 APEX_PORT="$(ini_val APEX_PORT)"; APEX_PORT="${APEX_PORT:-8080}"
 DB_HOST_PORT="$(ini_val DB_HOST_PORT)"; DB_HOST_PORT="${DB_HOST_PORT:-1523}"
 ADMIN_COMPAT_PASSWORD="$(ini_val ADMIN_COMPAT_PASSWORD)"

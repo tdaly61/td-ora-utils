@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ords-entrypoint.sh — runs inside the plain-JRE "ords" container (see
 # docker-compose.yml). Not part of any official Oracle image: the official
-# ords container requires an OTN registry login, so Phase 1 runs ORDS
+# ords container requires an OTN registry login, so this toolkit runs ORDS
 # standalone from the zip distribution instead (see download-ords.sh).
 #
 # First boot: installs the ORDS schema/connection pool non-interactively

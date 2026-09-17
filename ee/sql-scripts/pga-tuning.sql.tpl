@@ -1,15 +1,14 @@
 -- pga-tuning.sql.tpl
 -- OPTIONAL. Not run automatically by run-ee.sh or the full-cycle test.
 --
--- Explicit PGA/SGA tuning — only useful once/if the DOCKER_IMAGE has been
--- swapped to Enterprise Edition (see ee/.env.sample). Plain Database Free's
--- 2GB combined SGA+PGA cap is a hard vendor limit that ALTER SYSTEM cannot
--- raise; running this against Free will simply hit ORA-02097/ORA-00384 or
--- silently be capped back down.
+-- Explicit PGA/SGA tuning for Enterprise Edition (see ee/.env.sample).
+-- Database Free's 2GB combined SGA+PGA cap is a hard vendor limit that
+-- ALTER SYSTEM cannot raise (running this against Free would simply hit
+-- ORA-02097/ORA-00384 or silently be capped back down) — Enterprise Edition
+-- has no such ceiling, which is why this toolkit runs EE.
 --
--- Run manually as SYS/SYSDBA if load testing (see the ee POC plan's
--- Validation section) shows PGA pressure is still a problem on EE with its
--- own default AUTO_MEM_CALCULATION sizing:
+-- Run manually as SYS/SYSDBA if load testing shows PGA pressure is still a
+-- problem on EE with its own default AUTO_MEM_CALCULATION sizing:
 --   sqlplus -s "sys/<ORACLE_PWD>@//localhost:1521/<ORACLE_PDB> as sysdba" @pga-tuning.sql
 --
 -- Substitution tokens (replaced by hand, or by run-ee.sh if invoked with -v):

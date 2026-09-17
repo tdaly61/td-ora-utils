@@ -3,7 +3,7 @@
 -- adb/load-apex-app.sh (which always connects as
 -- admin/$DEFAULT_PASSWORD@$SERVICE_NAME for its bootstrap/ACL/AI-service
 -- steps) works completely unmodified against this two-container stack.
--- Plain Oracle (Free or Enterprise Edition) has no ADMIN user by default —
+-- Plain Oracle Database (Enterprise Edition here) has no ADMIN user by default —
 -- only SYS/SYSTEM/PDBADMIN — unlike ADB-Free where ADMIN is the universal
 -- top-level account.
 --
@@ -31,6 +31,15 @@ BEGIN
     EXECUTE IMMEDIATE 'ALTER USER ADMIN IDENTIFIED BY "__ADMIN_PASSWORD__"';
     DBMS_OUTPUT.PUT_LINE('Compat ADMIN user already exists — password resynced.');
   END IF;
+
+  -- Plain DBA is not enough for apex_instance_admin.add_workspace (called
+  -- by adb/load-apex-app.sh for every app import) — that specifically
+  -- checks for APEX_ADMINISTRATOR_ROLE, not just DBA, and fails with
+  -- ORA-20987 ("User ADMIN requires ADMIN privilege") without it. Granted
+  -- unconditionally so this also self-heals pre-existing installs that
+  -- predate this fix.
+  EXECUTE IMMEDIATE 'GRANT APEX_ADMINISTRATOR_ROLE TO ADMIN';
+  DBMS_OUTPUT.PUT_LINE('APEX_ADMINISTRATOR_ROLE granted to ADMIN.');
 END;
 /
 
