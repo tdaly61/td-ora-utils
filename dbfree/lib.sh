@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# lib.sh — shared helpers for the ee/ (Oracle Database Enterprise Edition)
-# POC scripts. Sourced by every ee/*.sh script.
+# lib.sh — shared helpers for the dbfree/ (Oracle Database Free) POC
+# scripts. Sourced by every dbfree/*.sh script.
 #
 # Scope note: this is a proof-of-concept toolkit, not the generic
 # adb/-equivalent library (that library doesn't exist yet). It intentionally
 # reuses adb/common.sh's ini_val/platform_val/detect_platform/colour helpers
 # instead of duplicating them, but keeps its own .env schema — see
-# ee/.env.sample.
+# dbfree/.env.sample.
 
-EE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-ADB_DIR="$( cd "$EE_DIR/../adb" && pwd )"
+DBFREE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+ADB_DIR="$( cd "$DBFREE_DIR/../adb" && pwd )"
 
-CONFIG_FILE="$EE_DIR/.env"
+CONFIG_FILE="$DBFREE_DIR/.env"
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "ERROR: $CONFIG_FILE not found — copy ee/.env.sample to ee/.env first." >&2
+    echo "ERROR: $CONFIG_FILE not found — copy dbfree/.env.sample to dbfree/.env first." >&2
     exit 1
 fi
 
@@ -21,7 +21,7 @@ fi
 source "$ADB_DIR/common.sh"
 detect_platform
 
-# Read a value from adb/.env instead of ee/.env — used only for host tooling
+# Read a value from adb/.env instead of dbfree/.env — used only for host tooling
 # genuinely shared with the adb-free setup (Instant Client location,
 # DEFAULT_PASSWORD to seed the compat ADMIN user). Never writes to adb/.env.
 adb_val() {
@@ -33,22 +33,32 @@ adb_val() {
     printf '%s' "$v"
 }
 
-# Resolve a host path from ee/.env relative to EE_DIR, and require that it
-# stays under EE_DIR — used before any rm -rf so a misconfigured .env can
+# Resolve a host path from dbfree/.env relative to DBFREE_DIR, and require that it
+# stays under DBFREE_DIR — used before any rm -rf so a misconfigured .env can
 # never point cleanup at something outside this toolkit's own directory.
-resolve_ee_path() {
-    local key="$1" default="$2" raw resolved
+resolve_dbfree_path() {
+    local key="$1" default="$2" raw resolved realpath_bin
     raw="$(ini_val "$key")"
     raw="${raw:-$default}"
-    resolved="$(cd "$EE_DIR" && realpath -m "$raw")"
+    # macOS's built-in BSD realpath has no -m (resolve without requiring the
+    # path to exist yet, needed here since setup-for-dbfree.sh calls this before
+    # creating the directories) — use GNU realpath (grealpath, via `brew
+    # install coreutils`) on macOS instead.
+    if [ "$PLATFORM" = "darwin" ]; then
+        command -v grealpath &>/dev/null || die "grealpath not found — run: brew install coreutils"
+        realpath_bin="grealpath"
+    else
+        realpath_bin="realpath"
+    fi
+    resolved="$(cd "$DBFREE_DIR" && "$realpath_bin" -m "$raw")"
     case "$resolved" in
-        "$EE_DIR"/*) printf '%s' "$resolved" ;;
-        *) die "$key resolves outside ee/ ($resolved) — refusing to use it for cleanup." ;;
+        "$DBFREE_DIR"/*) printf '%s' "$resolved" ;;
+        *) die "$key resolves outside dbfree/ ($resolved) — refusing to use it for cleanup." ;;
     esac
 }
 
 # Exports TNS_ADMIN (cleared)/LD_LIBRARY_PATH/DYLD_LIBRARY_PATH and sets
-# EE_SQLPLUS to the resolved sqlplus binary, for callers that need a genuine
+# DBFREE_SQLPLUS to the resolved sqlplus binary, for callers that need a genuine
 # `sqlplus conn @script arg1 arg2` command-line invocation (positional args,
 # correct @@-relative path resolution inside the script) rather than a
 # heredoc-embedded one — apexins.sql specifically requires this: its nested
@@ -61,8 +71,8 @@ sqlplus_setup_env() {
     export TNS_ADMIN=""
     export LD_LIBRARY_PATH="$oracle_client_dir/$instant_client${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export DYLD_LIBRARY_PATH="$oracle_client_dir/$instant_client${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
-    EE_SQLPLUS="$(SQLPLUS_BIN)"
-    export EE_SQLPLUS
+    DBFREE_SQLPLUS="$(SQLPLUS_BIN)"
+    export DBFREE_SQLPLUS
 }
 
 # Ensure the host firewall lets Docker containers reach Ollama on 11434.
@@ -77,7 +87,7 @@ sqlplus_setup_env() {
 # Unlike adb's version, this one does NOT modify the host firewall silently:
 # inserting an iptables rule is a host-level, persistent change, so it
 # requires an explicit one-time opt-in via ALLOW_FIREWALL_AUTOFIX=true in
-# ee/.env (see .env.sample). Without it, this prints the exact command
+# dbfree/.env (see .env.sample). Without it, this prints the exact command
 # needed and how to enable auto-fix, but changes nothing — safe to run
 # unattended (e.g. from full-cycle-test.sh) without surprising a host that's
 # never seen this before.
@@ -103,7 +113,7 @@ ensure_host_firewall_allows_ollama() {
     if [ "$can_root" != "true" ]; then
         echo "  Not root and no passwordless sudo — cannot read iptables rules to check."
         echo "  If Ollama calls from the DB container fail with ORA-29273, this host may"
-        echo "  need: sudo iptables -I INPUT 1 -p tcp -s <ee_default subnet> --dport 11434 -j ACCEPT"
+        echo "  need: sudo iptables -I INPUT 1 -p tcp -s <dbfree_default subnet> --dport 11434 -j ACCEPT"
         return 0
     fi
 
@@ -113,9 +123,9 @@ ensure_host_firewall_allows_ollama() {
     fi
 
     local subnets
-    subnets=$(docker network inspect ee_default \
+    subnets=$(docker network inspect dbfree_default \
         --format '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' 2>/dev/null | sort -u)
-    [ -z "$subnets" ] && { echo "  ee_default network not found — skipping (run-ee.sh not up yet?)."; return 0; }
+    [ -z "$subnets" ] && { echo "  dbfree_default network not found — skipping (run-dbfree.sh not up yet?)."; return 0; }
 
     local needed=() _subnet
     while IFS= read -r _subnet; do
@@ -131,7 +141,7 @@ ensure_host_firewall_allows_ollama() {
 
     local autofix; autofix="$(ini_val ALLOW_FIREWALL_AUTOFIX)"
     if [ "$autofix" != "true" ]; then
-        warn "Host firewall has a catch-all REJECT/DROP and NO exception yet for ee's"
+        warn "Host firewall has a catch-all REJECT/DROP and NO exception yet for dbfree's"
         warn "docker network (${needed[*]}) on port 11434 — DBMS_VECTOR_CHAIN/UTL_HTTP"
         warn "calls to Ollama from inside the DB container will fail with ORA-29273"
         warn "(HTTP request failed) until this is opened, even though Ollama itself"
@@ -145,7 +155,7 @@ ensure_host_firewall_allows_ollama() {
         echo "  (insert before your existing catch-all REJECT/DROP line — check with"
         echo "   'sudo iptables -L INPUT -n --line-numbers' if line 1 isn't right)."
         echo ""
-        echo "  Or set ALLOW_FIREWALL_AUTOFIX=true in ee/.env to have this script do"
+        echo "  Or set ALLOW_FIREWALL_AUTOFIX=true in dbfree/.env to have this script do"
         echo "  it for you (needs root or passwordless sudo) on the next run."
         return 0
     fi
@@ -212,9 +222,18 @@ STARTUP UPGRADE;
 EXIT;
 SQLEOF
 
+    # utl32k.sql must run in CDB$ROOT AND every PDB that needs to open
+    # normally afterwards — PDB$SEED included. Skipping PDB$SEED here left it
+    # unable to complete its own migration, so plain STARTUP afterwards
+    # couldn't reopen it (ORA-14696) and it stayed MOUNTED forever — which
+    # the Database Free image's own healthcheck (checkDBStatus.sh) treats as
+    # unhealthy for ANY PDB, permanently failing the container's health
+    # status even though the actual app PDB was fine. Confirmed empirically.
     docker exec -i "$container_name" sqlplus -s / as sysdba <<SQLEOF
 @?/rdbms/admin/utl32k.sql
 ALTER PLUGGABLE DATABASE ALL OPEN UPGRADE;
+ALTER SESSION SET CONTAINER=PDB\$SEED;
+@?/rdbms/admin/utl32k.sql
 ALTER SESSION SET CONTAINER=$oracle_pdb;
 @?/rdbms/admin/utl32k.sql
 ALTER SESSION SET CONTAINER=CDB\$ROOT;
@@ -237,6 +256,43 @@ SQLEOF
     echo "  MAX_STRING_SIZE=EXTENDED configured successfully."
 }
 
+# Raise PGA_AGGREGATE_LIMIT above Database Free's 2G default — this is the
+# specific fix ADB-Free cannot provide (ALTER SYSTEM fails there with
+# ORA-01031 even as ADMIN/DBA, confirmed empirically; it's what broke
+# caseweave's vector-embedding workers with ORA-04036 against ADB-Free).
+# Plain Database Free allows this as an ordinary DBA-adjustable init
+# parameter — confirmed empirically (2G -> 4G, took effect immediately).
+# SCOPE=BOTH so it applies now AND survives the container restart.
+# Usage: set_pga_aggregate_limit <container_name> <limit e.g. 3G>
+set_pga_aggregate_limit() {
+    local container_name="$1" limit="$2"
+
+    echo "=== Setting PGA_AGGREGATE_LIMIT=$limit ==="
+
+    local current
+    current=$(docker exec -i "$container_name" sqlplus -s / as sysdba 2>/dev/null <<'SQLEOF' | tr -d '[:space:]'
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMOUT ON TRIMSPOOL ON
+SELECT value FROM v$parameter WHERE name='pga_aggregate_limit';
+EXIT;
+SQLEOF
+    )
+
+    if [ "$(echo "$current" | tr '[:lower:]' '[:upper:]')" = "$(echo "$limit" | tr '[:lower:]' '[:upper:]')" ]; then
+        echo "  PGA_AGGREGATE_LIMIT already $limit — skipping."
+        return 0
+    fi
+
+    local out
+    out=$(docker exec -i "$container_name" sqlplus -s / as sysdba <<SQLEOF 2>&1
+ALTER SYSTEM SET pga_aggregate_limit=$limit SCOPE=BOTH;
+EXIT;
+SQLEOF
+    )
+    echo "$out"
+    echo "$out" | grep -qiE "ORA-|SP2-" && die "Failed to set PGA_AGGREGATE_LIMIT=$limit — see sqlplus output above (if this is ORA-01031, $container_name is ADB-Free, not plain Database Free — check DOCKER_IMAGE in dbfree/.env)."
+    echo "  PGA_AGGREGATE_LIMIT=$limit configured successfully."
+}
+
 SQLPLUS_BIN() {
     local instant_client oracle_client_dir sqlplus
     instant_client="$(adb_instant_client)"
@@ -252,7 +308,7 @@ SQLPLUS_BIN() {
 }
 
 # Instant Client dir name, read from adb/.env via the same _MAC-aware logic
-# common.sh already provides — just pointed at adb/.env instead of ee/.env.
+# common.sh already provides — just pointed at adb/.env instead of dbfree/.env.
 adb_instant_client() {
     local saved="$CONFIG_FILE"
     CONFIG_FILE="$ADB_DIR/.env"

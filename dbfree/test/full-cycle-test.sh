@@ -4,7 +4,7 @@
 # gets an equivalent unattended cycle later, once this layer is proven).
 #
 # Runs, in order, with no prompts anywhere in the chain:
-#   run-ee.sh -c  ->  setup-for-ee.sh  ->  download-apex.sh  ->  download-ords.sh  ->  run-ee.sh  ->  smoke-ee.sh
+#   run-dbfree.sh -c  ->  setup-for-dbfree.sh (pulls images, downloads APEX/ORDS)  ->  run-dbfree.sh  ->  smoke-dbfree.sh
 #
 # Every step's output is logged to a timestamped report file under
 # test/reports/. Exits 0 only if every step passed; the report states which
@@ -12,7 +12,7 @@
 # a hung terminal.
 #
 # Usage: ./test/full-cycle-test.sh [--skip-clean]
-#   --skip-clean   Skip the initial run-ee.sh -c (reuse whatever's already
+#   --skip-clean   Skip the initial run-dbfree.sh -c (reuse whatever's already
 #                   running/present) — useful for iterating on later steps
 #                   without waiting through a full DB re-init each time.
 
@@ -20,7 +20,7 @@ set -uo pipefail   # deliberately not -e: we want to run every step, log it,
                     # and decide pass/fail ourselves rather than aborting on
                     # the first non-zero exit.
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-EE_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
+DBFREE_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 
 SKIP_CLEAN=0
 [ "${1:-}" = "--skip-clean" ] && SKIP_CLEAN=1
@@ -62,29 +62,21 @@ run_step() {
 OVERALL_RC=0
 
 if [ "$SKIP_CLEAN" -eq 0 ]; then
-    run_step "clean (run-ee.sh -c)" "$EE_DIR/run-ee.sh" -c || OVERALL_RC=1
+    run_step "clean (run-dbfree.sh -c)" "$DBFREE_DIR/run-dbfree.sh" -c || OVERALL_RC=1
 else
     echo "Skipping clean step (--skip-clean)" | tee -a "$REPORT_FILE"
 fi
 
 if [ "$OVERALL_RC" -eq 0 ]; then
-    run_step "setup (setup-for-ee.sh)" "$EE_DIR/setup-for-ee.sh" || OVERALL_RC=1
+    run_step "setup (setup-for-dbfree.sh — pulls images, downloads APEX/ORDS)" "$DBFREE_DIR/setup-for-dbfree.sh" || OVERALL_RC=1
 fi
 
 if [ "$OVERALL_RC" -eq 0 ]; then
-    run_step "download APEX (download-apex.sh)" "$EE_DIR/download-apex.sh" || OVERALL_RC=1
+    run_step "deploy (run-dbfree.sh)" "$DBFREE_DIR/run-dbfree.sh" || OVERALL_RC=1
 fi
 
 if [ "$OVERALL_RC" -eq 0 ]; then
-    run_step "download ORDS (download-ords.sh)" "$EE_DIR/download-ords.sh" || OVERALL_RC=1
-fi
-
-if [ "$OVERALL_RC" -eq 0 ]; then
-    run_step "deploy (run-ee.sh)" "$EE_DIR/run-ee.sh" || OVERALL_RC=1
-fi
-
-if [ "$OVERALL_RC" -eq 0 ]; then
-    run_step "verify (test/smoke-ee.sh)" "$SCRIPT_DIR/smoke-ee.sh" || OVERALL_RC=1
+    run_step "verify (test/smoke-dbfree.sh)" "$SCRIPT_DIR/smoke-dbfree.sh" || OVERALL_RC=1
 fi
 
 {

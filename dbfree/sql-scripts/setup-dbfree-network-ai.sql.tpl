@@ -1,7 +1,7 @@
--- setup-ee-network-ai.sql.tpl
+-- setup-dbfree-network-ai.sql.tpl
 -- Configures outbound network access so this database can call a local
 -- Ollama instance on the host, without the ollama-proxy TLS-termination
--- layer the adb-free setup needs (Enterprise Edition does not force
+-- layer the adb-free setup needs (plain Database Free does not force
 -- REQUIRE_OUT_HTTPS=Y the way ADB-Free does).
 --
 -- Scope note: this script is DB-layer only (ACLs + grants + a shared
@@ -15,7 +15,7 @@
 -- Run as: ADMIN (the compat user created by create-admin-compat-user.sql.tpl)
 -- against the target PDB.
 --
--- Substitution tokens (replaced by run-ee.sh):
+-- Substitution tokens (replaced by run-dbfree.sh):
 --   __OLLAMA_BASE_URL__ — Ollama endpoint from inside Docker (e.g. http://host.docker.internal:11434)
 --   __OLLAMA_MODEL__    — Ollama model name (e.g. llama3.2:3b)
 
@@ -53,25 +53,13 @@ END;
 /
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 2. Grant UTL_HTTP and DBMS_VECTOR_CHAIN to ADMIN (smoke-test callable)
+-- 2. UTL_HTTP and DBMS_VECTOR_CHAIN execute privileges — granted to ADMIN by
+--    run-dbfree.sh as a SYS pre-step immediately before this script runs, NOT
+--    here: this script connects AS ADMIN, and `GRANT ... TO ADMIN` while
+--    connected as ADMIN is a self-grant, which Oracle rejects unconditionally
+--    with ORA-01749 regardless of whether the grant already took effect —
+--    confirmed empirically. Nothing to do in this step.
 -- ─────────────────────────────────────────────────────────────────────────────
-BEGIN
-  EXECUTE IMMEDIATE 'GRANT EXECUTE ON SYS.UTL_HTTP TO ADMIN';
-  DBMS_OUTPUT.PUT_LINE('GRANT EXECUTE ON UTL_HTTP to ADMIN succeeded.');
-EXCEPTION
-  WHEN OTHERS THEN
-    DBMS_OUTPUT.PUT_LINE('UTL_HTTP grant note: ' || SQLERRM);
-END;
-/
-
-BEGIN
-  EXECUTE IMMEDIATE 'GRANT EXECUTE ON CTXSYS.DBMS_VECTOR_CHAIN TO ADMIN';
-  DBMS_OUTPUT.PUT_LINE('GRANT EXECUTE ON DBMS_VECTOR_CHAIN to ADMIN succeeded.');
-EXCEPTION
-  WHEN OTHERS THEN
-    DBMS_OUTPUT.PUT_LINE('DBMS_VECTOR_CHAIN grant note: ' || SQLERRM);
-END;
-/
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 3. Create DB credential for Ollama (used by DBMS_VECTOR_CHAIN).

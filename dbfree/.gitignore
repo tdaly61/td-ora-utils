@@ -3,5 +3,6 @@ oradata/
 ords_config/
 apex-install/
 ords-install/
+ords-entrypoint.sh
 test/reports/
 *.log

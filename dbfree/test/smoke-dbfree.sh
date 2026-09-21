@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# smoke-ee.sh — post-deploy verification for the ee/ stack. Checks:
+# smoke-dbfree.sh — post-deploy verification for the dbfree/ stack. Checks:
 #   1. sqlplus connectivity as the compat ADMIN user (plain EZConnect)
 #   2. v$pgastat / v$resource_limit baseline (logged, not pass/failed —
-#      see the ee POC plan's Validation section for what to do with these
-#      numbers once real load testing happens)
+#      see the dbfree POC plan's Validation section for what to do with
+#      these numbers once real load testing happens)
 #   3. ORDS responds on /ords/
 #   4. APEX serves a styled login page (not a raw/unstyled error page)
 #
 # Exits non-zero on the first failed check, naming it. Safe to run repeatedly.
 #
-# Usage: ./test/smoke-ee.sh
+# Usage: ./test/smoke-dbfree.sh
 
 set -euo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source "$SCRIPT_DIR/../lib.sh"
 
-ORACLE_PDB="$(ini_val ORACLE_PDB)"; ORACLE_PDB="${ORACLE_PDB:-ORCLPDB1}"
-APEX_PORT="$(ini_val APEX_PORT)"; APEX_PORT="${APEX_PORT:-8080}"
-DB_HOST_PORT="$(ini_val DB_HOST_PORT)"; DB_HOST_PORT="${DB_HOST_PORT:-1523}"
+ORACLE_PDB="$(ini_val ORACLE_PDB)"; ORACLE_PDB="${ORACLE_PDB:-FREEPDB1}"
+APEX_PORT="$(ini_val APEX_PORT)"; APEX_PORT="${APEX_PORT:-8092}"
+DB_HOST_PORT="$(ini_val DB_HOST_PORT)"; DB_HOST_PORT="${DB_HOST_PORT:-15216}"
 ADMIN_COMPAT_PASSWORD="$(ini_val ADMIN_COMPAT_PASSWORD)"
 [ -z "$ADMIN_COMPAT_PASSWORD" ] && ADMIN_COMPAT_PASSWORD="$(adb_val DEFAULT_PASSWORD)"
 EZCONNECT="//localhost:$DB_HOST_PORT/$ORACLE_PDB"
@@ -33,7 +33,7 @@ check() {
     fi
 }
 
-hdr "smoke-ee.sh"
+hdr "smoke-dbfree.sh"
 
 # ── 1. sqlplus connectivity ────────────────────────────────────────────────
 CONN_SQL="$(mktemp /tmp/ee_smoke_conn_XXXXXX.sql)"
