@@ -17,9 +17,14 @@ detect_platform() {
 
 # Read a single KEY=VALUE entry from CONFIG_FILE by exact key name.
 # Handles values containing '=' (e.g. URLs). Strips inline comments and whitespace.
+# A missing key is a normal, expected case (most keys are optional, with
+# callers falling back via ${VAR:-default}) — always return 0 so that a
+# non-matching grep doesn't trip `set -e`/`pipefail` in the calling script
+# and abort it before that fallback ever runs.
 ini_val() {
     local key="$1"
-    grep -m1 "^${key}=" "$CONFIG_FILE" | cut -d'=' -f2- | sed 's/[[:space:]]*#.*//' | tr -d ' \n\r'
+    grep -m1 "^${key}=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | sed 's/[[:space:]]*#.*//' | tr -d ' \n\r'
+    return 0
 }
 
 # Read a config value with a platform override. On macOS (PLATFORM=darwin) prefer

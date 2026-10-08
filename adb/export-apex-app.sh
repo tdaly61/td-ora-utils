@@ -183,7 +183,11 @@ echo ""
 # ── Step 1: Export APEX application ──────────────────────────────────────────
 echo "=== Step 1: Exporting APEX application $APP_ID ==="
 
-APEX_EXPORT_SQL=$(mktemp /tmp/apexexport_XXXXXX.sql)
+# mktemp with a literal suffix after XXXXXX is not portable: macOS/BSD
+# mktemp doesn't randomize in that form and returns the same fixed name
+# every call, colliding once the file exists — mktemp with no template,
+# then rename, works on both.
+APEX_EXPORT_SQL=$(mktemp); mv "$APEX_EXPORT_SQL" "$APEX_EXPORT_SQL.sql"; APEX_EXPORT_SQL="$APEX_EXPORT_SQL.sql"
 TEMP_FILES+=("$APEX_EXPORT_SQL")
 
 # apex_export.get_application returns apex_t_export_files (a table of CLOBs).

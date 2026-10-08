@@ -395,7 +395,12 @@ echo "Bootstrap step complete."
 echo ""
 echo "=== Step 2: Importing APEX application as $SCHEMA_USER_UPPER ==="
 
-WRAPPER_SQL=$(mktemp /tmp/apex_import_XXXXXX.sql)
+# mktemp with a literal suffix after XXXXXX is not portable: macOS/BSD
+# mktemp doesn't randomize in that form and returns the same fixed name
+# every call, colliding once the file exists (see dbfree/run-dbfree.sh's
+# bootstrap_compat_admin_user() for the same fix) — mktemp with no
+# template, then rename, works on both.
+WRAPPER_SQL=$(mktemp); mv "$WRAPPER_SQL" "$WRAPPER_SQL.sql"; WRAPPER_SQL="$WRAPPER_SQL.sql"
 trap 'rm -f "$WRAPPER_SQL"' EXIT
 
 cat > "$WRAPPER_SQL" << WRAPPER_EOF

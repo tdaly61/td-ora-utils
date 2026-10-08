@@ -177,7 +177,11 @@ echo ""
 # ── Step 1: Download and unzip the wallet ──────────────────────────────────────
 echo "=== Step 1: Downloading instance wallet ==="
 mkdir -p "$WALLET_DIR"
-WALLET_ZIP=$(mktemp /tmp/oci_wallet_XXXXXX.zip)
+# mktemp with a literal suffix after XXXXXX is not portable: macOS/BSD
+# mktemp doesn't randomize in that form and returns the same fixed name
+# every call, colliding once the file exists — mktemp with no template,
+# then rename, works on both.
+WALLET_ZIP=$(mktemp); mv "$WALLET_ZIP" "$WALLET_ZIP.zip"; WALLET_ZIP="$WALLET_ZIP.zip"
 trap 'rm -f "$WALLET_ZIP"' EXIT
 
 oci db autonomous-database generate-wallet \
@@ -207,7 +211,7 @@ if [ -z "$LLM_HOST" ]; then
   echo "           In-app AI / outbound HTTP calls will fail until you grant it manually"
   echo "           (see sql-scripts/oci-admin-grants.sql.tpl)."
 fi
-ADMIN_GRANTS_SQL=$(mktemp /tmp/oci_admin_grants_XXXXXX.sql)
+ADMIN_GRANTS_SQL=$(mktemp); mv "$ADMIN_GRANTS_SQL" "$ADMIN_GRANTS_SQL.sql"; ADMIN_GRANTS_SQL="$ADMIN_GRANTS_SQL.sql"
 trap 'rm -f "$WALLET_ZIP" "$ADMIN_GRANTS_SQL"' EXIT
 sed -e "s/__SCHEMA__/$SCHEMA_USER/g" \
     -e "s/__LLM_HOST__/${LLM_HOST:-CHANGE_ME_LLM_HOST}/g" \

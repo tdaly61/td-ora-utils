@@ -36,7 +36,12 @@ check() {
 hdr "smoke-dbfree.sh"
 
 # ── 1. sqlplus connectivity ────────────────────────────────────────────────
-CONN_SQL="$(mktemp /tmp/ee_smoke_conn_XXXXXX.sql)"
+# mktemp with a literal suffix after XXXXXX is not portable: macOS/BSD
+# mktemp doesn't randomize in that form and returns the same fixed name
+# every call, colliding once the file exists (see run-dbfree.sh's
+# bootstrap_compat_admin_user() for the same fix) — mktemp with no
+# template, then rename, works on both.
+CONN_SQL="$(mktemp)"; mv "$CONN_SQL" "$CONN_SQL.sql"; CONN_SQL="$CONN_SQL.sql"
 trap 'rm -f "$CONN_SQL"' EXIT
 cat > "$CONN_SQL" <<'SQL'
 SET PAGESIZE 0 FEEDBACK OFF HEADING OFF VERIFY OFF
@@ -54,7 +59,7 @@ fi
 
 # ── 2. PGA/session baseline (informational, logged for the Validation phase) ─
 hdr "PGA / session baseline"
-BASELINE_SQL="$(mktemp /tmp/ee_smoke_pga_XXXXXX.sql)"
+BASELINE_SQL="$(mktemp)"; mv "$BASELINE_SQL" "$BASELINE_SQL.sql"; BASELINE_SQL="$BASELINE_SQL.sql"
 trap 'rm -f "$BASELINE_SQL"' EXIT
 cat > "$BASELINE_SQL" <<'SQL'
 SET PAGESIZE 100 LINESIZE 200 FEEDBACK OFF
@@ -78,7 +83,7 @@ check "ORDS responds on /ords/" curl -sf -o /dev/null "http://localhost:$APEX_PO
 # between sign-in URLs until it hits its redirect limit and gives up.
 # (/ords/apex/ WITH a trailing slash is a different, unmapped path and 404s —
 # not the one to check.)
-APEX_COOKIEJAR="$(mktemp /tmp/ee_smoke_apex_cookies_XXXXXX.txt)"
+APEX_COOKIEJAR="$(mktemp)"; mv "$APEX_COOKIEJAR" "$APEX_COOKIEJAR.txt"; APEX_COOKIEJAR="$APEX_COOKIEJAR.txt"
 trap 'rm -f "$APEX_COOKIEJAR"' EXIT
 APEX_BODY="$(curl -sL -c "$APEX_COOKIEJAR" -b "$APEX_COOKIEJAR" "http://localhost:$APEX_PORT/ords/apex" 2>/dev/null || true)"
 if echo "$APEX_BODY" | grep -qi "Oracle APEX"; then
