@@ -1,0 +1,641 @@
+#!/usr/bin/env bash
+# load-apex-app.sh
+# Loads an APEX application export SQL file into a running dbfree/ stack.
+#
+# Ported from adb/load-apex-app.sh so dbfree/ is a fully standalone toolkit
+# (no adb/ dependency) — this is the generic "import any APEX app" script,
+# not caseweave-specific, same as the adb/ original. Differences from the
+# adb/ version: defaults to dbfree's FREEPDB1 service name instead of
+# ADB-Free's myatp_high, uses plain EZConnect with no wallet (dbfree has no
+# TCPS/wallet layer), and reads dbfree/.env instead of adb/.env.
+#
+# The parsing schema and APEX workspace are auto-detected from the export file.
+# If the schema or workspace do not exist they are created automatically.
+#
+# Usage:
+#   ./load-apex-app.sh [-f <apex_export.sql>] [-u <schema_user>] [-p <password>]
+#                      [-s <service_name>] [-r STATIC_ID=https://...] [-h]
+#
+# Options:
+#   -f  Path to the APEX export SQL file (prompted if not supplied)
+#   -u  Override the Oracle schema / APEX workspace user
+#       (default: auto-detected from p_default_owner in the export file)
+#   -p  Password for the schema user
+#       (default: APEX_PASSWORD from dbfree/.env, else DEFAULT_PASSWORD)
+#   -s  Oracle service name  (default: SERVICE_NAME, else FREEPDB1)
+#   -r  Override base URL for a remote server marked prompt_on_install in the export
+#       Format: STATIC_ID=https://endpoint  (repeat for multiple servers)
+#       (default: URLs extracted from LLM_<STATIC_ID> entries in dbfree/.env)
+#   -v  Path to an app-specific vector/model setup SQL file (run as ADMIN after import)
+#       Use this to load ONNX models the app needs — see your app's own
+#       vector-setup SQL for how it sources the model file.
+#   -h  Show this help message
+#
+# Prerequisites:
+#   - dbfree stack is running  (./run-dbfree.sh completed)
+#   - Oracle Instant Client (sqlplus) installed — run ./setup-for-dbfree.sh if not
+
+set -euo pipefail
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# ── Usage / Help ──────────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Loads an APEX application export SQL file into a running dbfree/ stack.
+The parsing schema and APEX workspace are auto-detected from the export file.
+If the schema or workspace do not exist they are created automatically.
+
+Options:
+  -f <file>           Path to the APEX export SQL file
+                      (prompted interactively if not supplied)
+  -u <schema_user>    Override the Oracle schema / APEX workspace user
+                      (default: auto-detected from p_default_owner in the export)
+  -p <password>       Password for the schema user
+                      (default: APEX_PASSWORD from dbfree/.env, else DEFAULT_PASSWORD)
+  -s <service_name>   Oracle service name
+                      (default: SERVICE_NAME from dbfree/.env, else FREEPDB1)
+  -r STATIC_ID=URL    Override the base URL for a remote server at install time.
+                      Repeat the flag for multiple servers.
+                      Default URLs come from LLM_<STATIC_ID> entries in dbfree/.env.
+                      Example: -r OCI_GROK_BIG=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com
+  -v <file>           App-specific vector/model setup SQL (run as ADMIN after import).
+                      See your app's own vector-setup SQL for how it sources the
+                      ONNX model file (e.g. served over HTTP by a sidecar).
+                      Example: -v /path/to/your-app/vector-setup.sql
+  -h                  Show this help message and exit
+
+Prerequisites:
+  - dbfree stack is running  (./run-dbfree.sh completed)
+  - Oracle Instant Client (sqlplus) installed — run ./setup-for-dbfree.sh if not
+
+Examples:
+  $(basename "$0") -f /tmp/f316.sql
+  $(basename "$0") -f /tmp/f316.sql -u MYSCHEMA -p MyPass1
+  $(basename "$0") -f /tmp/f316.sql -r OCI_GROK_BIG=https://inference.generativeai.eu-frankfurt-1.oci.oraclecloud.com
+EOF
+  exit 0
+}
+
+# Early -h check: must come before lib.sh is sourced, since lib.sh requires
+# dbfree/.env to exist — a user just wanting help shouldn't need it set up yet.
+for _arg in "$@"; do
+  [[ "$_arg" == "-h" ]] && usage
+  [[ "$_arg" == "--" ]] && break
+done
+unset _arg
+
+source "$SCRIPT_DIR/lib.sh"
+
+DEFAULT_PASSWORD=$(ini_val DEFAULT_PASSWORD)
+SERVICE_NAME=$(ini_val SERVICE_NAME); SERVICE_NAME=${SERVICE_NAME:-FREEPDB1}
+DB_HOST_PORT=$(ini_val DB_HOST_PORT); DB_HOST_PORT=${DB_HOST_PORT:-15216}
+# EZConnect, not a plain TNS alias — dbfree has no tnsnames.ora entry for
+# FREEPDB1 on the host side, only the container's own internal one.
+SERVICE_NAME="//localhost:$DB_HOST_PORT/$SERVICE_NAME"
+
+INSTANT_CLIENT="$(resolve_instant_client)"
+
+APEX_PORT=$(ini_val APEX_PORT);     APEX_PORT=${APEX_PORT:-8092}
+APEX_USER=$(ini_val APEX_USER);     APEX_USER=${APEX_USER:-TRACKER1}
+APEX_PASSWORD=$(ini_val APEX_PASSWORD); APEX_PASSWORD=${APEX_PASSWORD:-$DEFAULT_PASSWORD}
+# Read LLM_<STATIC_ID>=<url>|<model>|<type> entries from dbfree/.env.
+# An optional LLM_<STATIC_ID>_MAC line overrides the base entry on Apple Silicon.
+# We parse every LLM_ line into a raw map first, then resolve _MAC per platform so
+# the override maps back onto the base STATIC_ID (never a phantom "..._MAC" server).
+declare -A _LLM_RAW=()
+while IFS= read -r _cfg_line; do
+  if [[ "$_cfg_line" =~ ^LLM_([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*([^|]+\|[^|]+\|[^|[:space:]]+) ]]; then
+    _LLM_RAW["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+  fi
+done < "$CONFIG_FILE"
+
+declare -A LLM_URL=()
+declare -A LLM_MODEL=()
+declare -A LLM_TYPE=()
+for _raw_id in "${!_LLM_RAW[@]}"; do
+  # Skip _MAC variants here; they're pulled in when resolving their base id.
+  [[ "$_raw_id" == *_MAC ]] && continue
+  _spec="${_LLM_RAW[$_raw_id]}"
+  # On macOS, prefer the _MAC override spec if present and non-empty.
+  if [ "$PLATFORM" = "darwin" ] && [ -n "${_LLM_RAW[${_raw_id}_MAC]:-}" ]; then
+    _spec="${_LLM_RAW[${_raw_id}_MAC]}"
+  fi
+  LLM_URL["$_raw_id"]="${_spec%%|*}"
+  LLM_MODEL["$_raw_id"]="$(printf '%s' "$_spec" | cut -d'|' -f2)"
+  LLM_TYPE["$_raw_id"]="${_spec##*|}"
+done
+
+# ── Parse options ─────────────────────────────────────────────────────────────
+APEX_SQL=""
+OVERRIDE_USER=""
+OVERRIDE_PASS=""
+VECTOR_SQL=""
+declare -A RS_OVERRIDES=()
+
+while getopts ":f:u:p:s:r:v:h" opt; do
+  case $opt in
+    f) APEX_SQL="$OPTARG" ;;
+    u) OVERRIDE_USER="$OPTARG" ;;
+    p) OVERRIDE_PASS="$OPTARG" ;;
+    s) SERVICE_NAME="$OPTARG" ;;
+    r) # FORMAT:  STATIC_ID=https://...
+       _rs_id="${OPTARG%%=*}"
+       _rs_url="${OPTARG#*=}"
+       RS_OVERRIDES["$_rs_id"]="$_rs_url" ;;
+    v) VECTOR_SQL="$OPTARG" ;;
+    h) usage ;;
+    :) die "-$OPTARG requires an argument." ;;
+    \?) die "Unknown option -$OPTARG" ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+# The APEX app's Supporting Objects are the source of the DB schema and are always
+# installed at import. Keep them current in APEX Builder (Supporting Objects >
+# Installation) before exporting, so the export carries an up-to-date schema.
+
+# Merge LLM config URLs with any -r overrides (overrides win), then build Step 2 PL/SQL
+declare -A RS_FINAL=()
+for _rs_key in "${!LLM_URL[@]}"; do
+  RS_FINAL["$_rs_key"]="${RS_OVERRIDES[$_rs_key]:-${LLM_URL[$_rs_key]}}"
+done
+for _rs_key in "${!RS_OVERRIDES[@]}"; do
+  RS_FINAL["$_rs_key"]="${RS_OVERRIDES[$_rs_key]}"
+done
+
+_RS_BLOCK=""
+for _rs_key in "${!RS_FINAL[@]}"; do
+  [ -z "$_RS_BLOCK" ] && _RS_BLOCK="BEGIN"$'\n'
+  _rs_url="${RS_FINAL[$_rs_key]%/}"
+  # OpenAI-compatible providers (Ollama local) need /v1 appended so APEX calls
+  # /v1/chat/completions rather than /chat/completions.
+  [ "${LLM_TYPE[$_rs_key]:-}" = "local" ] && _rs_url="${_rs_url}/v1"
+  _rs_model="${LLM_MODEL[$_rs_key]:-}"
+  # p_ai_model_name is a real, documented parameter of set_remote_server (position 7) —
+  # this is the supported way to apply the declared model at install time.
+  if [ -n "$_rs_model" ]; then
+    _RS_BLOCK+="  apex_application_install.set_remote_server(p_static_id => '${_rs_key}', p_base_url => '${_rs_url}', p_ai_model_name => '${_rs_model}');"$'\n'
+  else
+    _RS_BLOCK+="  apex_application_install.set_remote_server(p_static_id => '${_rs_key}', p_base_url => '${_rs_url}');"$'\n'
+  fi
+done
+[ -n "$_RS_BLOCK" ] && _RS_BLOCK+="  DBMS_OUTPUT.PUT_LINE('Remote server base URLs and models set.');"$'\n'"END;"$'\n'"/"
+
+# ── Resolve APEX export file ──────────────────────────────────────────────────
+if [ -z "$APEX_SQL" ]; then
+  _cfg_export="$(platform_val APEX_EXPORT_FILE)"
+  if [ -n "$_cfg_export" ]; then
+    APEX_SQL="$_cfg_export"
+    echo "Using APEX export file from dbfree/.env: $APEX_SQL"
+  else
+    echo ""
+    read -r -p "Enter path to APEX export SQL file: " APEX_SQL
+  fi
+fi
+
+if [ -z "$VECTOR_SQL" ]; then
+  _cfg_vector="$(platform_val APEX_VECTOR_SQL)"
+  if [ -n "$_cfg_vector" ]; then
+    VECTOR_SQL="$_cfg_vector"
+    echo "Using vector setup SQL from dbfree/.env: $VECTOR_SQL"
+  fi
+fi
+
+APEX_SQL="${APEX_SQL/#\~/$HOME}"
+APEX_SQL="$(realpath -m "$APEX_SQL" 2>/dev/null || echo "$APEX_SQL")"
+
+[ -f "$APEX_SQL" ] || die "APEX export file not found: $APEX_SQL"
+
+# ── Auto-detect parsing schema and app ID from export header ──────────────────
+DETECTED_OWNER=$(apex_detect_owner "$APEX_SQL")
+DETECTED_APP_ID=$(apex_detect_app_id "$APEX_SQL")
+
+if [ -n "$OVERRIDE_USER" ]; then
+  SCHEMA_USER="$OVERRIDE_USER"
+elif [ -n "$DETECTED_OWNER" ]; then
+  SCHEMA_USER="$DETECTED_OWNER"
+else
+  # Fall back to APEX_USER from config
+  SCHEMA_USER="$APEX_USER"
+  warn "Could not detect p_default_owner from export — using APEX_USER from dbfree/.env: $SCHEMA_USER"
+fi
+
+SCHEMA_USER_UPPER="${SCHEMA_USER^^}"
+
+# Password: explicit override → config APEX_PASSWORD → DEFAULT_PASSWORD
+if [ -n "$OVERRIDE_PASS" ]; then
+  SCHEMA_PASS="$OVERRIDE_PASS"
+else
+  SCHEMA_PASS="$APEX_PASSWORD"
+fi
+
+# ── Locate sqlplus ────────────────────────────────────────────────────────────
+ORACLE_CLIENT_DIR="$HOME/oraclient"
+SQLPLUS="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT/sqlplus"
+
+if [ ! -x "$SQLPLUS" ]; then
+  if command -v sqlplus &>/dev/null; then
+    SQLPLUS="sqlplus"
+  else
+    die "sqlplus not found at $SQLPLUS and not on PATH. Run ./setup-for-dbfree.sh first (it installs the Instant Client)."
+  fi
+fi
+
+# dbfree uses plain EZConnect, no wallet/TCPS — explicitly clear TNS_ADMIN so a
+# stray wallet sqlnet.ora from an adb-free setup on the same machine (which
+# enforces TCPS) never leaks into this connection (see dbfree/lib.sh's
+# sqlplus_setup_env() for the same guard).
+export TNS_ADMIN=""
+export LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export DYLD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+hdr "load-apex-app.sh"
+echo "  APEX export  : $APEX_SQL"
+if [ -n "$DETECTED_OWNER" ] && [ -z "$OVERRIDE_USER" ]; then
+  echo "  Schema user  : $SCHEMA_USER_UPPER  (auto-detected from export)"
+else
+  echo "  Schema user  : $SCHEMA_USER_UPPER"
+fi
+echo "  App ID       : ${DETECTED_APP_ID:-unknown}"
+echo "  Service      : $SERVICE_NAME"
+echo "  SQLPlus      : $SQLPLUS"
+echo ""
+
+# ── Step 1: Bootstrap schema + APEX workspace as admin (idempotent) ───────────
+# Creates the Oracle DB user and APEX workspace/admin user only if they don't
+# already exist. Safe to re-run — all operations are guarded by existence checks.
+hdr "Step 1: Bootstrapping schema and APEX workspace for $SCHEMA_USER_UPPER"
+
+ADMIN_OUT="$("$SQLPLUS" -s "admin/$DEFAULT_PASSWORD@$SERVICE_NAME" << SYSDBA_EOF
+SET SERVEROUTPUT ON SIZE UNLIMITED
+WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK
+
+DECLARE
+  v_user_exists    NUMBER;
+  v_apex_installed NUMBER;
+  v_ws_exists      NUMBER;
+  v_ws_id          NUMBER;
+BEGIN
+
+  -- ── 1a. Create Oracle schema if it does not exist ──────────────────────────
+  SELECT COUNT(*) INTO v_user_exists
+  FROM   dba_users
+  WHERE  username = UPPER('$SCHEMA_USER_UPPER');
+
+  IF v_user_exists = 0 THEN
+    EXECUTE IMMEDIATE
+      'CREATE USER $SCHEMA_USER_UPPER IDENTIFIED BY "$SCHEMA_PASS"';
+    EXECUTE IMMEDIATE
+      'GRANT CONNECT, RESOURCE, UNLIMITED TABLESPACE TO $SCHEMA_USER_UPPER';
+    EXECUTE IMMEDIATE
+      'GRANT CREATE VIEW, CREATE MATERIALIZED VIEW, CREATE PROCEDURE TO $SCHEMA_USER_UPPER';
+    EXECUTE IMMEDIATE
+      'GRANT DB_DEVELOPER_ROLE, CREATE MINING MODEL TO $SCHEMA_USER_UPPER';
+    EXECUTE IMMEDIATE
+      'GRANT READ, WRITE ON DIRECTORY DATA_PUMP_DIR TO $SCHEMA_USER_UPPER';
+    DBMS_OUTPUT.PUT_LINE('Oracle schema $SCHEMA_USER_UPPER created.');
+  ELSE
+    DBMS_OUTPUT.PUT_LINE('Oracle schema $SCHEMA_USER_UPPER already exists — skipped.');
+  END IF;
+
+  -- ── 1b. Create APEX workspace + admin user if APEX is installed ────────────
+  SELECT COUNT(*) INTO v_apex_installed
+  FROM   dba_users
+  WHERE  username LIKE 'APEX_%'
+  AND    oracle_maintained = 'Y'
+  AND    username NOT IN ('APEX_PUBLIC_USER','APEX_LISTENER','APEX_REST_PUBLIC_USER','APEX_PUBLIC_ROUTER');
+
+  IF v_apex_installed = 0 THEN
+    DBMS_OUTPUT.PUT_LINE('APEX not installed — skipping workspace setup.');
+    RETURN;
+  END IF;
+
+  SELECT COUNT(*) INTO v_ws_exists
+  FROM   apex_workspaces
+  WHERE  workspace = UPPER('$SCHEMA_USER_UPPER');
+
+  IF v_ws_exists = 0 THEN
+    EXECUTE IMMEDIATE
+      'BEGIN apex_instance_admin.add_workspace(' ||
+      '  p_workspace => ''$SCHEMA_USER_UPPER'',' ||
+      '  p_primary_schema => ''$SCHEMA_USER_UPPER''); END;';
+    DBMS_OUTPUT.PUT_LINE('APEX workspace $SCHEMA_USER_UPPER created.');
+  ELSE
+    DBMS_OUTPUT.PUT_LINE('APEX workspace $SCHEMA_USER_UPPER already exists — skipped.');
+  END IF;
+
+  -- Resolve workspace ID for use in set_security_group_id below.
+  SELECT workspace_id INTO v_ws_id
+  FROM   apex_workspaces
+  WHERE  workspace = UPPER('$SCHEMA_USER_UPPER');
+
+  -- ── 1c. Create APEX admin user in the workspace if not present ─────────────
+  -- set_security_group_id is more reliable than set_workspace when called from
+  -- a plain SQL*Plus admin session (set_workspace via EXECUTE IMMEDIATE does not
+  -- always propagate the package-level context before create_user runs).
+  apex_util.set_security_group_id(p_security_group_id => v_ws_id);
+
+  DECLARE
+    v_apex_user_exists NUMBER;
+  BEGIN
+    SELECT COUNT(*) INTO v_apex_user_exists
+    FROM   apex_workspace_apex_users
+    WHERE  workspace_name = UPPER('$SCHEMA_USER_UPPER')
+    AND    user_name      = UPPER('$SCHEMA_USER_UPPER');
+
+    IF v_apex_user_exists = 0 THEN
+      apex_util.create_user(
+        p_user_name                    => '$SCHEMA_USER_UPPER',
+        p_web_password                 => '$SCHEMA_PASS',
+        p_developer_privs              => 'ADMIN:CREATE:DATA_LOADER:EDIT:HELP:MONITOR:SQL',
+        p_email_address                => '$SCHEMA_USER_UPPER@local',
+        p_default_schema               => '$SCHEMA_USER_UPPER',
+        p_account_expiry               => SYSDATE + 36500,
+        p_change_password_on_first_use => 'N');
+      DBMS_OUTPUT.PUT_LINE('APEX admin user $SCHEMA_USER_UPPER created in workspace.');
+    ELSE
+      DBMS_OUTPUT.PUT_LINE('APEX admin user $SCHEMA_USER_UPPER already exists — skipped.');
+    END IF;
+  END;
+
+  COMMIT;
+  DBMS_OUTPUT.PUT_LINE('Bootstrap complete.');
+
+EXCEPTION WHEN OTHERS THEN
+  DBMS_OUTPUT.PUT_LINE('Bootstrap FAILED: ' || SQLERRM);
+  RAISE;
+END;
+/
+exit
+SYSDBA_EOF
+2>&1)"
+echo "$ADMIN_OUT"
+echo "$ADMIN_OUT" | grep -qiE "SP2-|ORA-|PLS-" && die "Step 1 (schema/workspace bootstrap) failed — see sqlplus output above. If this is ORA-01017/ORA-01005, check DEFAULT_PASSWORD in dbfree/.env matches what the compat ADMIN user was actually created with (run-dbfree.sh bootstraps it from the same key, so a mismatch usually means dbfree/.env changed after the stack was already up — re-run run-dbfree.sh to resync, or wipe and redeploy)."
+ok "Bootstrap complete."
+
+# ── Step 2: Import the APEX application as the parsing schema user ─────────────
+# The export's p_default_workspace_id is from the source environment and won't
+# match the target. We must call apex_application_install.set_workspace_id with
+# the actual workspace_id in this environment before running the import, otherwise
+# wwv_flow_imp.import_begin raises ORA-20001: g_security_group_id must be set.
+#
+# A temporary wrapper SQL is generated, used, then deleted.
+hdr "Step 2: Importing APEX application as $SCHEMA_USER_UPPER"
+
+# mktemp with a literal suffix after XXXXXX is not portable: macOS/BSD
+# mktemp doesn't randomize in that form and returns the same fixed name
+# every call, colliding once the file exists — mktemp with no template,
+# then rename, works on both.
+WRAPPER_SQL=$(mktemp); mv "$WRAPPER_SQL" "$WRAPPER_SQL.sql"; WRAPPER_SQL="$WRAPPER_SQL.sql"
+trap 'rm -f "$WRAPPER_SQL"' EXIT
+
+cat > "$WRAPPER_SQL" << WRAPPER_EOF
+WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK
+SET DEFINE OFF VERIFY OFF FEEDBACK OFF SERVEROUTPUT ON SIZE UNLIMITED
+
+-- 1. Resolve the workspace ID in this environment and set it so that
+--    wwv_flow_imp.import_begin can populate g_security_group_id correctly.
+DECLARE
+  l_ws_id NUMBER;
+BEGIN
+  SELECT workspace_id INTO l_ws_id
+  FROM   apex_workspaces
+  WHERE  workspace = UPPER('$SCHEMA_USER_UPPER');
+  apex_application_install.set_workspace_id(l_ws_id);
+  DBMS_OUTPUT.PUT_LINE('Workspace ID set: ' || l_ws_id);
+END;
+/
+
+-- 2. Always install the app's Supporting Objects — they are the source of the DB
+--    schema (tables, sequences, indexes, views, PL/SQL, property graphs). Keep them
+--    current in APEX Builder (Supporting Objects > Installation) before exporting.
+BEGIN
+  apex_application_install.set_auto_install_sup_obj(p_auto_install_sup_obj => true);
+  DBMS_OUTPUT.PUT_LINE('Auto-install supporting objects: true');
+END;
+/
+
+-- 3. Pre-supply base URLs for remote servers marked p_prompt_on_install=>true.
+--    Without this, wwv_imp_workspace.create_remote_server raises ORA-20001.
+--    Entries are read from LLM_* keys in dbfree/.env; override with -r flags.
+$_RS_BLOCK
+
+@$APEX_SQL
+exit
+WRAPPER_EOF
+
+"$SQLPLUS" -s "$SCHEMA_USER_UPPER/$SCHEMA_PASS@$SERVICE_NAME" "@$WRAPPER_SQL"
+ok "Import complete."
+
+# ── Step 3: Grant ADMINISTRATOR role to the workspace admin user ───────────────
+# The app uses APEX_ACL role-based authorization. Without a role assignment the
+# workspace admin gets APEX.AUTHORIZATION.ACCESS_DENIED on first login.
+# We grant ADMINISTRATOR to SCHEMA_USER so the install is immediately usable.
+hdr "Step 3: Granting ADMINISTRATOR role to $SCHEMA_USER_UPPER in app $DETECTED_APP_ID"
+
+"$SQLPLUS" -s "$SCHEMA_USER_UPPER/$SCHEMA_PASS@$SERVICE_NAME" << ACL_EOF
+SET SERVEROUTPUT ON SIZE UNLIMITED
+WHENEVER SQLERROR CONTINUE
+
+BEGIN
+  apex_util.set_workspace(p_workspace => '$SCHEMA_USER_UPPER');
+END;
+/
+
+DECLARE
+  v_exists NUMBER;
+BEGIN
+  -- Idempotent: only add if not already present
+  SELECT COUNT(*) INTO v_exists
+  FROM   apex_appl_acl_user_roles
+  WHERE  application_id = $DETECTED_APP_ID
+  AND    user_name      = UPPER('$SCHEMA_USER_UPPER')
+  AND    role_static_id = 'ADMINISTRATOR';
+
+  IF v_exists = 0 THEN
+    APEX_ACL.ADD_USER_ROLE(
+      p_application_id => $DETECTED_APP_ID,
+      p_user_name      => '$SCHEMA_USER_UPPER',
+      p_role_static_id => 'ADMINISTRATOR'
+    );
+    COMMIT;
+    DBMS_OUTPUT.PUT_LINE('ADMINISTRATOR role granted to $SCHEMA_USER_UPPER.');
+  ELSE
+    DBMS_OUTPUT.PUT_LINE('$SCHEMA_USER_UPPER already has ADMINISTRATOR role — skipped.');
+  END IF;
+EXCEPTION WHEN OTHERS THEN
+  DBMS_OUTPUT.PUT_LINE('Role grant warning: ' || SQLERRM);
+  DBMS_OUTPUT.PUT_LINE('App may not use ACL roles — this is non-fatal.');
+END;
+/
+exit
+ACL_EOF
+ok "Role step complete."
+
+# ── Step 3b: Grant outbound network ACL to schema user ───────────────────────
+# Required for Generative AI HTTP calls: APEX makes UTL_HTTP requests using the
+# workspace schema's identity, so the schema user needs connect+resolve on '*'.
+hdr "Step 3b: Granting network ACL to $SCHEMA_USER_UPPER"
+"$SQLPLUS" -s "admin/$DEFAULT_PASSWORD@$SERVICE_NAME" << NET_ACL_EOF
+SET SERVEROUTPUT ON SIZE UNLIMITED
+WHENEVER SQLERROR CONTINUE
+BEGIN
+  DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
+    host => '*',
+    ace  => xs\$ace_type(
+              privilege_list => xs\$name_list('connect', 'resolve'),
+              principal_name => '$SCHEMA_USER_UPPER',
+              principal_type => xs_acl.ptype_db));
+  DBMS_OUTPUT.PUT_LINE('Network ACL granted to $SCHEMA_USER_UPPER.');
+EXCEPTION WHEN OTHERS THEN
+  DBMS_OUTPUT.PUT_LINE('Network ACL note: ' || SQLERRM);
+END;
+/
+exit
+NET_ACL_EOF
+ok "Network ACL step complete."
+
+# ── Step 4: Load app-specific ONNX model (if -v supplied) ────────────────────
+# Runs the app's vector setup SQL as ADMIN so it can call DBMS_VECTOR.LOAD_ONNX_MODEL
+# and grant the resulting mining model to the app's schema. How the ONNX file
+# itself gets to where this SQL can read it (local staging, HTTP sidecar, etc.)
+# is entirely up to that SQL file / the caller — not this script's concern.
+if [ -n "$VECTOR_SQL" ]; then
+  VECTOR_SQL="${VECTOR_SQL/#\~/$HOME}"
+  VECTOR_SQL="$(realpath -m "$VECTOR_SQL" 2>/dev/null || echo "$VECTOR_SQL")"
+  [ -f "$VECTOR_SQL" ] || die "Vector setup SQL not found: $VECTOR_SQL"
+  hdr "Step 4: Loading ONNX model from $VECTOR_SQL"
+  # Pass schema user + password as positional args (&1 &2 in the SQL file)
+  # so the script can CONNECT as the app schema without hardcoding credentials.
+  "$SQLPLUS" -s "admin/$DEFAULT_PASSWORD@$SERVICE_NAME" \
+    "@$VECTOR_SQL" "$SCHEMA_USER" "$SCHEMA_PASS" "$SERVICE_NAME"
+  ok "Vector setup step complete."
+else
+  hdr "Step 4: Skipped — no vector setup SQL supplied (-v)"
+fi
+
+# ── Step 5: Configure local LLM AI services for the app workspace ──────────────
+# Runs for each LLM_* entry with type=local in dbfree/.env.
+# Creates (or updates) an encrypted APEX workspace credential and Generative AI
+# remote server entry.  The credential secret is stored via the APEX API so it
+# is properly encrypted — direct SQL INSERT leaves plaintext and causes ORA-28817.
+_local_llm_count=0
+for _LLM_ID in "${!LLM_TYPE[@]}"; do
+  [ "${LLM_TYPE[$_LLM_ID]}" != "local" ] && continue
+  _local_llm_count=$((_local_llm_count + 1))
+  _LLM_API_URL="${LLM_URL[$_LLM_ID]%/}/v1"
+  _LLM_MODEL="${LLM_MODEL[$_LLM_ID]}"
+  _LLM_CRED_SID="${_LLM_ID}_CRED"
+  hdr "Step 5: Configuring local LLM '${_LLM_ID}' for $SCHEMA_USER_UPPER"
+
+  "$SQLPLUS" -s "admin/$DEFAULT_PASSWORD@$SERVICE_NAME" << OLLAMA_EOF
+SET SERVEROUTPUT ON SIZE UNLIMITED
+WHENEVER SQLERROR CONTINUE
+
+-- wwv_credentials is VPD-protected: use apex_credential.set_persistent_credentials
+-- (definer-rights, owned by the APEX schema) which bypasses the VPD policy.
+-- The remote server base_url AND model name were both already set by
+-- set_remote_server in Step 2 (p_base_url, p_ai_model_name — _RS_BLOCK appends
+-- /v1 to the URL for local-type LLMs). A direct UPDATE on wwv_remote_servers
+-- from here would fail with ORA-41900 (missing UPDATE privilege) even after
+-- set_workspace/set_security_group_id — only Step 2, running inside the actual
+-- app import (wwv_flow_imp.import_begin), has write access to this table.
+--
+-- The credential's value genuinely matters here, not just its existence —
+-- confirmed empirically: apex_ai.generate() against a credential left with
+-- no value set returns HTTP-400 from Ollama (not an auth failure — Ollama
+-- ignores the Authorization header entirely, but APEX's own request
+-- construction behaves differently with an unset credential). So the
+-- naming-convention guess below (<LLM_ID>_CRED) is NOT enough on its own:
+-- an app export inherited from an ADB-Free deployment may have the actual
+-- credential object under an opaque Builder-generated static ID instead
+-- (e.g. "credentials_for_<id>_5_") that has nothing to do with the
+-- STATIC_ID used here. Find the REAL one by matching VALID_FOR_URLS
+-- against this exact base_url — confirmed empirically that Builder sets
+-- VALID_FOR_URLS to the linked remote server's base_url at creation time,
+-- which makes it a reliable match key independent of naming.
+DECLARE
+  v_ws_id    NUMBER;
+  v_cred_sid VARCHAR2(100) := '$_LLM_CRED_SID';
+  v_base_url VARCHAR2(500) := '$_LLM_API_URL';
+  v_model    VARCHAR2(100) := '$_LLM_MODEL';
+  v_real_sid VARCHAR2(255);
+BEGIN
+  SELECT workspace_id INTO v_ws_id
+    FROM apex_workspaces
+   WHERE workspace = UPPER('$SCHEMA_USER_UPPER');
+
+  EXECUTE IMMEDIATE 'BEGIN
+    apex_util.set_workspace(p_workspace => UPPER(''$SCHEMA_USER_UPPER''));
+    apex_util.set_security_group_id(p_security_group_id => ' || v_ws_id || ');
+  END;';
+
+  -- Encrypt the Ollama credential secret imported from the APEX export —
+  -- try the naming-convention guess first (works when load-apex-app.sh
+  -- itself created the credential, e.g. OLLAMA_LOCAL_CRED).
+  BEGIN
+    apex_credential.set_persistent_credentials(
+      p_credential_static_id => v_cred_sid,
+      p_key                  => 'Authorization',
+      p_value                => 'Bearer ollama-no-auth-needed'
+    );
+    DBMS_OUTPUT.PUT_LINE('Credential secret encrypted: ' || v_cred_sid);
+  EXCEPTION
+    WHEN OTHERS THEN
+      DBMS_OUTPUT.PUT_LINE('Credential note (' || v_cred_sid || '): ' || SQLERRM);
+  END;
+
+  -- Also find and set any credential actually scoped to this exact URL,
+  -- in case it's a different, Builder-generated static ID — harmless to
+  -- run even when the guess above already succeeded on the same object.
+  BEGIN
+    -- VALID_FOR_URLS is newline-delimited (a credential can be scoped to
+    -- more than one URL) — confirmed empirically it had a trailing
+    -- newline even for a single entry, so exact equality silently never
+    -- matches; INSTR against the whole field is the robust check.
+    SELECT static_id INTO v_real_sid
+      FROM apex_workspace_credentials
+     WHERE workspace = UPPER('$SCHEMA_USER_UPPER')
+       AND INSTR(valid_for_urls, v_base_url) > 0
+       AND static_id != v_cred_sid
+       AND ROWNUM = 1;
+    apex_credential.set_persistent_credentials(
+      p_credential_static_id => v_real_sid,
+      p_key                  => 'Authorization',
+      p_value                => 'Bearer ollama-no-auth-needed'
+    );
+    DBMS_OUTPUT.PUT_LINE('Also found + set credential scoped to this URL: ' || v_real_sid);
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN NULL;  -- no other credential scoped to this URL — fine
+    WHEN OTHERS THEN
+      DBMS_OUTPUT.PUT_LINE('URL-matched credential note: ' || SQLERRM);
+  END;
+
+  DBMS_OUTPUT.PUT_LINE('AI service expected: $_LLM_ID -> ' || v_base_url || ' (model: ' || v_model || ')');
+  COMMIT;
+END;
+/
+exit
+OLLAMA_EOF
+  ok "Step 5 complete: $_LLM_ID"
+done
+if [ "$_local_llm_count" -eq 0 ]; then
+  hdr "Step 5: Skipped — no local LLM entries (type=local) in dbfree/.env"
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+echo ""
+ok "APEX application loaded successfully"
+echo "  Browse to : http://localhost:$APEX_PORT/ords/r/${SCHEMA_USER_UPPER,,}/$DETECTED_APP_ID"
+echo ""
+echo "  APEX Login:"
+echo "    Workspace : $SCHEMA_USER_UPPER"
+echo "    Username  : $SCHEMA_USER_UPPER"
+echo "    Password  : $SCHEMA_PASS"
+echo ""
+echo "  SSH tunnel (if remote):"
+echo "    ssh -L $APEX_PORT:localhost:$APEX_PORT -N ubuntu@<server-ip>"

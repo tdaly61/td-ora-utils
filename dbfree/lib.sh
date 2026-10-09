@@ -2,14 +2,13 @@
 # lib.sh — shared helpers for the dbfree/ (Oracle Database Free) POC
 # scripts. Sourced by every dbfree/*.sh script.
 #
-# Scope note: this is a proof-of-concept toolkit, not the generic
-# adb/-equivalent library (that library doesn't exist yet). It intentionally
-# reuses adb/common.sh's ini_val/platform_val/detect_platform/colour helpers
-# instead of duplicating them, but keeps its own .env schema — see
-# dbfree/.env.sample.
+# dbfree/ is fully standalone — it does not read anything under adb/ (no
+# adb/common.sh, no adb/.env). It carries its own common.sh (generic
+# ini_val/platform_val/detect_platform/select_docker_image/colour helpers,
+# a deliberate duplicate — see common.sh's own header) and its own
+# load-apex-app.sh + Instant Client installer.
 
 DBFREE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-ADB_DIR="$( cd "$DBFREE_DIR/../adb" && pwd )"
 
 CONFIG_FILE="$DBFREE_DIR/.env"
 if [ ! -f "$CONFIG_FILE" ]; then
@@ -17,21 +16,9 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 1
 fi
 
-# shellcheck source=../adb/common.sh
-source "$ADB_DIR/common.sh"
+# shellcheck source=./common.sh
+source "$DBFREE_DIR/common.sh"
 detect_platform
-
-# Read a value from adb/.env instead of dbfree/.env — used only for host tooling
-# genuinely shared with the adb-free setup (Instant Client location,
-# DEFAULT_PASSWORD to seed the compat ADMIN user). Never writes to adb/.env.
-adb_val() {
-    local key="$1" saved="$CONFIG_FILE" v
-    CONFIG_FILE="$ADB_DIR/.env"
-    [ -f "$CONFIG_FILE" ] || CONFIG_FILE="$ADB_DIR/config.ini"
-    v="$(ini_val "$key")"
-    CONFIG_FILE="$saved"
-    printf '%s' "$v"
-}
 
 # Resolve a host path from dbfree/.env relative to DBFREE_DIR, and require that it
 # stays under DBFREE_DIR — used before any rm -rf so a misconfigured .env can
@@ -66,7 +53,7 @@ resolve_dbfree_path() {
 # itself was invoked as a real command-line "@script" argument.
 sqlplus_setup_env() {
     local instant_client oracle_client_dir
-    instant_client="$(adb_instant_client)"
+    instant_client="$(resolve_instant_client)"
     oracle_client_dir="$HOME/oraclient"
     export TNS_ADMIN=""
     export LD_LIBRARY_PATH="$oracle_client_dir/$instant_client${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -295,7 +282,7 @@ SQLEOF
 
 SQLPLUS_BIN() {
     local instant_client oracle_client_dir sqlplus
-    instant_client="$(adb_instant_client)"
+    instant_client="$(resolve_instant_client)"
     oracle_client_dir="$HOME/oraclient"
     sqlplus="$oracle_client_dir/$instant_client/sqlplus"
     if [ -x "$sqlplus" ]; then
@@ -303,25 +290,13 @@ SQLPLUS_BIN() {
     elif command -v sqlplus &>/dev/null; then
         printf '%s' "sqlplus"
     else
-        die "sqlplus not found at $sqlplus and not on PATH. Run adb/setup-for-adb-26ai.sh first (shared Instant Client install)."
+        die "sqlplus not found at $sqlplus and not on PATH. Run ./setup-for-dbfree.sh first (it installs the Instant Client)."
     fi
 }
 
-# Instant Client dir name, read from adb/.env via the same _MAC-aware logic
-# common.sh already provides — just pointed at adb/.env instead of dbfree/.env.
-adb_instant_client() {
-    local saved="$CONFIG_FILE"
-    CONFIG_FILE="$ADB_DIR/.env"
-    [ -f "$CONFIG_FILE" ] || CONFIG_FILE="$ADB_DIR/config.ini"
-    local v
-    v="$(platform_val INSTANT_CLIENT)"
-    CONFIG_FILE="$saved"
-    printf '%s' "$v"
-}
-
 # Run a SQL file via plain EZConnect (no wallet). Explicitly clears TNS_ADMIN
-# so a stray adb-free wallet sqlnet.ora (which enforces TCPS) never leaks into
-# a plain connection here.
+# so a stray wallet sqlnet.ora (e.g. left over from an adb-free setup on the
+# same machine, which enforces TCPS) never leaks into a plain connection here.
 # Usage: run_sql_ezconnect <user> <password> <ezconnect> <sql_file> [role]
 #   role: optional, e.g. "sysdba" — appended as " as sysdba" after the
 #   connect string (sqlplus requires the role outside the user/pass@dsn part,
@@ -329,7 +304,7 @@ adb_instant_client() {
 run_sql_ezconnect() {
     local user="$1" pass="$2" ezconnect="$3" sql_file="$4" role="${5:-}"
     local instant_client oracle_client_dir sqlplus connect_str
-    instant_client="$(adb_instant_client)"
+    instant_client="$(resolve_instant_client)"
     oracle_client_dir="$HOME/oraclient"
     sqlplus="$(SQLPLUS_BIN)"
     [ -f "$sql_file" ] || die "SQL file not found: $sql_file"

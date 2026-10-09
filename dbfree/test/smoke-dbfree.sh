@@ -18,8 +18,7 @@ source "$SCRIPT_DIR/../lib.sh"
 ORACLE_PDB="$(ini_val ORACLE_PDB)"; ORACLE_PDB="${ORACLE_PDB:-FREEPDB1}"
 APEX_PORT="$(ini_val APEX_PORT)"; APEX_PORT="${APEX_PORT:-8092}"
 DB_HOST_PORT="$(ini_val DB_HOST_PORT)"; DB_HOST_PORT="${DB_HOST_PORT:-15216}"
-ADMIN_COMPAT_PASSWORD="$(ini_val ADMIN_COMPAT_PASSWORD)"
-[ -z "$ADMIN_COMPAT_PASSWORD" ] && ADMIN_COMPAT_PASSWORD="$(adb_val DEFAULT_PASSWORD)"
+DEFAULT_PASSWORD="$(ini_val DEFAULT_PASSWORD)"
 EZCONNECT="//localhost:$DB_HOST_PORT/$ORACLE_PDB"
 
 FAIL=0
@@ -48,7 +47,7 @@ SET PAGESIZE 0 FEEDBACK OFF HEADING OFF VERIFY OFF
 SELECT 'CONNECT_OK' FROM dual;
 exit;
 SQL
-CONN_OUT="$(run_sql_ezconnect "ADMIN" "$ADMIN_COMPAT_PASSWORD" "$EZCONNECT" "$CONN_SQL" 2>&1 || true)"
+CONN_OUT="$(run_sql_ezconnect "ADMIN" "$DEFAULT_PASSWORD" "$EZCONNECT" "$CONN_SQL" 2>&1 || true)"
 if echo "$CONN_OUT" | grep -q "CONNECT_OK"; then
     ok "sqlplus connectivity as ADMIN via $EZCONNECT"
 else
@@ -71,7 +70,7 @@ SELECT resource_name, current_utilization, max_utilization, limit_value
   FROM v$resource_limit WHERE resource_name IN ('processes','sessions','pga_aggregate_limit');
 exit;
 SQL
-run_sql_ezconnect "ADMIN" "$ADMIN_COMPAT_PASSWORD" "$EZCONNECT" "$BASELINE_SQL" 2>&1 | sed 's/^/    /' || true
+run_sql_ezconnect "ADMIN" "$DEFAULT_PASSWORD" "$EZCONNECT" "$BASELINE_SQL" 2>&1 | sed 's/^/    /' || true
 
 # ── 3. ORDS responds ───────────────────────────────────────────────────────
 check "ORDS responds on /ords/" curl -sf -o /dev/null "http://localhost:$APEX_PORT/ords/"

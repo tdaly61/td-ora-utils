@@ -6,7 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **td-ora-utils** automates the deployment of Oracle Database Free (26ai) with APEX/ORDS in Docker containers, plus local AI integration via Ollama. Intended for demo and POC use only — not production-hardened.
 
-## Setup Workflow
+Two independent toolkits live here, each fully standalone (neither reads the other's config or scripts):
+
+- **`adb/`** — single-container **ADB-Free** image (bundles ORDS/APEX, TCPS/mTLS only). `ALTER SYSTEM` is blocked even as DBA, so `PGA_AGGREGATE_LIMIT`/`MAX_STRING_SIZE` can't be adjusted.
+- **`dbfree/`** — two-container plain **Database Free** + standalone ORDS. Plain TCP/HTTP, no wallet, and `ALTER SYSTEM` works — use this when a workload needs an adjustable PGA limit or extended string size (this is why `dbfree/` exists at all: ADB-Free's workers were hitting `ORA-04036` with no way to raise the limit). See `dbfree/README.md` for its own quick start, architecture notes, and a full comparison table against `adb/`.
+
+Pick one per project — don't mix the two against the same app. The rest of this file documents `adb/`; `dbfree/` documents itself in `dbfree/README.md`.
+
+## Setup Workflow (adb/)
 
 The canonical setup order (from `README.md`):
 

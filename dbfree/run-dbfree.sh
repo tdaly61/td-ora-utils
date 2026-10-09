@@ -123,14 +123,13 @@ APEX_PORT="$(ini_val APEX_PORT)"; APEX_PORT="${APEX_PORT:-8092}"
 DB_HOST_PORT="$(ini_val DB_HOST_PORT)"; DB_HOST_PORT="${DB_HOST_PORT:-15216}"
 DB_HEALTHY_TIMEOUT="$(ini_val DB_HEALTHY_TIMEOUT)"; DB_HEALTHY_TIMEOUT="${DB_HEALTHY_TIMEOUT:-900}"
 ORDS_HEALTHY_TIMEOUT="$(ini_val ORDS_HEALTHY_TIMEOUT)"; ORDS_HEALTHY_TIMEOUT="${ORDS_HEALTHY_TIMEOUT:-600}"
-ADMIN_COMPAT_PASSWORD="$(ini_val ADMIN_COMPAT_PASSWORD)"
-[ -z "$ADMIN_COMPAT_PASSWORD" ] && ADMIN_COMPAT_PASSWORD="$(adb_val DEFAULT_PASSWORD)"
+DEFAULT_PASSWORD="$(ini_val DEFAULT_PASSWORD)"
 OLLAMA_BASE_URL="$(ini_val OLLAMA_BASE_URL)"; OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
 OLLAMA_MODEL="$(ini_val OLLAMA_MODEL)"; OLLAMA_MODEL="${OLLAMA_MODEL:-llama3.2:3b}"
 EZCONNECT="//localhost:$DB_HOST_PORT/$ORACLE_PDB"
 
-[ -n "$ORACLE_PWD" ] || die "ORACLE_PWD not set in dbfree/.env"
-[ -n "$ADMIN_COMPAT_PASSWORD" ] || die "ADMIN_COMPAT_PASSWORD not set in dbfree/.env and adb/.env has no DEFAULT_PASSWORD to fall back on."
+[ -n "$ORACLE_PWD" ] || die "ORACLE_PWD not set — add ORACLE_PWD=<password> to dbfree/.env (see .env.sample)."
+[ -n "$DEFAULT_PASSWORD" ] || die "DEFAULT_PASSWORD not set — add DEFAULT_PASSWORD=<password> to dbfree/.env (see .env.sample). This is the one password used for the compat ADMIN user and load-apex-app.sh."
 
 # Fail fast if the extracted APEX/ORDS distributions aren't there yet.
 APEX_INSTALL_DIR="$(resolve_dbfree_path APEX_INSTALL_DIR ./apex-install)"
@@ -148,7 +147,7 @@ while true; do
     [ "$elapsed" -ge "$DB_HEALTHY_TIMEOUT" ] && die "Timeout waiting for $CONTAINER_NAME to become healthy."
     status=$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "starting")
     [ "$status" = "healthy" ] && { ok "$CONTAINER_NAME is healthy (${elapsed}s)"; break; }
-    [ "$status" = "unhealthy" ] && die "$CONTAINER_NAME reported unhealthy — check: docker logs $CONTAINER_NAME"
+    [ "$status" = "unhealthy" ] && die "$CONTAINER_NAME reported unhealthy — check: docker logs $CONTAINER_NAME. Common causes: Colima/Docker Desktop has too little memory allocated (the DB wants a few GB headroom beyond its own SGA/PGA), the host is out of disk space, or (on macOS/Colima) a stuck NAT state on DB_HOST_PORT — see README.md's stuck-port gotcha."
     sleep 10
 done
 
@@ -177,13 +176,13 @@ bootstrap_compat_admin_user() {
     # on both.
     local admin_sql
     admin_sql="$(mktemp)"; mv "$admin_sql" "$admin_sql.sql"; admin_sql="$admin_sql.sql"
-    sed -e "s/__ADMIN_PASSWORD__/$ADMIN_COMPAT_PASSWORD/g" \
+    sed -e "s/__ADMIN_PASSWORD__/$DEFAULT_PASSWORD/g" \
         "$SCRIPT_DIR/sql-scripts/create-admin-compat-user.sql.tpl" > "$admin_sql"
     local admin_out
     admin_out="$("$DBFREE_SQLPLUS" -s "sys/$ORACLE_PWD@$EZCONNECT as sysdba" "@$admin_sql" 2>&1)"
     rm -f "$admin_sql"
     echo "$admin_out"
-    echo "$admin_out" | grep -qiE "SP2-|ORA-|PLS-" && die "Failed to bootstrap the compat ADMIN user — see sqlplus output above."
+    echo "$admin_out" | grep -qiE "SP2-|ORA-|PLS-" && die "Failed to bootstrap the compat ADMIN user — see sqlplus output above. If this is ORA-01017/ORA-01005 (invalid credential), DEFAULT_PASSWORD in dbfree/.env was probably changed after this ADMIN user was first created — either change it back, or wipe oradata/ with ./run-dbfree.sh -c and redeploy with the new password."
     ok "Compat ADMIN user ready"
 }
 bootstrap_compat_admin_user
@@ -211,7 +210,7 @@ else
     # need to run inside the container — just cd into its directory on the host.
     APEXINS_OUT="$(cd "$APEX_INSTALL_DIR" && "$DBFREE_SQLPLUS" -s "sys/$ORACLE_PWD@$EZCONNECT as sysdba" "@apexins.sql" SYSAUX SYSAUX TEMP /i/ 2>&1)"
     echo "$APEXINS_OUT"
-    echo "$APEXINS_OUT" | grep -qiE "SP2-|ORA-|PLS-" && die "apexins.sql failed — see sqlplus output above."
+    echo "$APEXINS_OUT" | grep -qiE "SP2-|ORA-|PLS-" && die "apexins.sql failed — see sqlplus output above. This step is pure SQL and runs for 15-30 minutes; a failure partway through usually means disk space ran out (check df -h) or the container was killed/restarted mid-install (check docker logs $CONTAINER_NAME). A partial install can leave APEX in a broken state — if in doubt, ./run-dbfree.sh -c and redeploy from scratch."
     ok "APEX installed"
 
     hdr "Creating the APEX instance administrator"
@@ -219,7 +218,7 @@ else
     # is NOT the same thing as APEX's own INTERNAL-workspace instance
     # administrator — that's a separate record in wwv_flow_fnd_user, normally
     # created by apxchpwd.sql. Without one, apex_instance_admin.add_workspace
-    # (used by adb/load-apex-app.sh for every app import) fails with
+    # (used by load-apex-app.sh (this directory) for every app import) fails with
     # ORA-20987 ("User ADMIN requires ADMIN privilege") even though the DB
     # user ADMIN already has DBA.
     #
@@ -241,7 +240,7 @@ BEGIN
   wwv_flow_instance_admin.create_or_update_admin_user(
     p_username => 'ADMIN',
     p_email    => 'admin@example.com',
-    p_password => '$ADMIN_COMPAT_PASSWORD'
+    p_password => '$DEFAULT_PASSWORD'
   );
   COMMIT;
 END;
@@ -250,7 +249,7 @@ exit
 SQLEOF
 )"
     echo "$APXADMIN_OUT"
-    echo "$APXADMIN_OUT" | grep -qiE "SP2-|ORA-|PLS-" && die "Creating the APEX instance administrator failed — see sqlplus output above."
+    echo "$APXADMIN_OUT" | grep -qiE "SP2-|ORA-|PLS-" && die "Creating the APEX instance administrator failed — see sqlplus output above. If this is ORA-20001 (blank password rejected), something fed an empty DEFAULT_PASSWORD through — double check it's actually set in dbfree/.env, not just present as an empty key."
     ok "APEX instance administrator ready"
 
     hdr "Configuring APEX_LISTENER / APEX_REST_PUBLIC_USER (apex_rest_config.sql)"
@@ -266,7 +265,7 @@ SQLEOF
     RESTCFG_OUT="$(printf '%s\n%s\n' "$ORACLE_PWD" "$ORACLE_PWD" \
         | docker exec -i -w /tmp/apex "$CONTAINER_NAME" sqlplus -s "sys/$ORACLE_PWD@localhost:1521/$ORACLE_PDB as sysdba" "@apex_rest_config.sql" 2>&1)"
     echo "$RESTCFG_OUT"
-    echo "$RESTCFG_OUT" | grep -qiE "SP2-|ORA-|PLS-" && die "apex_rest_config.sql failed — see sqlplus output above."
+    echo "$RESTCFG_OUT" | grep -qiE "SP2-|ORA-|PLS-" && die "apex_rest_config.sql failed — see sqlplus output above. This one runs inside the container via docker exec and shells out to catcon.pl — if the error is about a missing file/cwd, check the container is actually healthy (docker ps); if it's a password prompt issue, this reuses ORACLE_PWD for both APEX_LISTENER and APEX_REST_PUBLIC_USER, so a non-ASCII or oddly-quoted ORACLE_PWD in dbfree/.env is worth checking."
     ok "APEX REST config complete"
 fi
 
@@ -316,14 +315,14 @@ NET_SQL="$(mktemp)"; mv "$NET_SQL" "$NET_SQL.sql"; NET_SQL="$NET_SQL.sql"
 sed -e "s|__OLLAMA_BASE_URL__|$OLLAMA_BASE_URL|g" \
     -e "s/__OLLAMA_MODEL__/$OLLAMA_MODEL/g" \
     "$SCRIPT_DIR/sql-scripts/setup-dbfree-network-ai.sql.tpl" > "$NET_SQL"
-run_sql_ezconnect "ADMIN" "$ADMIN_COMPAT_PASSWORD" "$EZCONNECT" "$NET_SQL" \
-    || warn "Network/AI setup script reported an error — review sqlplus output above (Ollama connectivity failure is non-fatal for this step)."
+run_sql_ezconnect "ADMIN" "$DEFAULT_PASSWORD" "$EZCONNECT" "$NET_SQL" \
+    || warn "Network/AI setup script reported an error — review sqlplus output above (Ollama connectivity failure is non-fatal for this step). If it's ORA-29273 (HTTP request failed) on Linux, see the firewall check earlier in this run — a hardened host's iptables INPUT chain is the usual cause, not Ollama itself."
 rm -f "$NET_SQL"
 
 echo ""
 ok "Stack is up."
 echo "  APEX      : http://localhost:$APEX_PORT/ords/apex"
 echo "  ORDS      : http://localhost:$APEX_PORT/ords/"
-echo "  SQL*Net   : $EZCONNECT (ADMIN / <ADMIN_COMPAT_PASSWORD from dbfree/.env or adb/.env DEFAULT_PASSWORD>)"
+echo "  SQL*Net   : $EZCONNECT (ADMIN / <DEFAULT_PASSWORD from dbfree/.env>)"
 echo ""
 echo "  Verify with: ./test/smoke-dbfree.sh"

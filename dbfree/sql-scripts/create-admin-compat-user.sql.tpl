@@ -1,6 +1,6 @@
 -- create-admin-compat-user.sql.tpl
 -- Mints a compatibility ADMIN DBA user in the target PDB so that
--- adb/load-apex-app.sh (which always connects as
+-- load-apex-app.sh (this directory, which always connects as
 -- admin/$DEFAULT_PASSWORD@$SERVICE_NAME for its bootstrap/ACL/AI-service
 -- steps) works completely unmodified against this two-container stack.
 -- Plain Oracle Database Free has no ADMIN user by default — only
@@ -33,7 +33,7 @@ BEGIN
   END IF;
 
   -- Plain DBA is not enough for apex_instance_admin.add_workspace (called
-  -- by adb/load-apex-app.sh for every app import) — that specifically
+  -- by load-apex-app.sh (this directory) for every app import — that specifically
   -- checks for APEX_ADMINISTRATOR_ROLE, not just DBA, and fails with
   -- ORA-20987 ("User ADMIN requires ADMIN privilege") without it. Granted
   -- unconditionally so this also self-heals pre-existing installs that

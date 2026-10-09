@@ -9,7 +9,7 @@
 -- for a workspace, because at this stage of the POC no app/workspace exists
 -- yet. Per-app AI service registration (wwv_remote_servers/wwv_credentials)
 -- happens later, at app-import time, the same way
--- adb/load-apex-app.sh's Step 5 already does it for the adb-free setup —
+-- load-apex-app.sh's (this directory) Step 5 already does it —
 -- reuse that pattern once an app is actually being imported.
 --
 -- Run as: ADMIN (the compat user created by create-admin-compat-user.sql.tpl)
@@ -49,6 +49,44 @@ BEGIN
 EXCEPTION
   WHEN OTHERS THEN
     DBMS_OUTPUT.PUT_LINE('SYSTEM ACL note: ' || SQLERRM);
+END;
+/
+
+-- The native APEX Generative AI feature (apex_ai.generate, used by apps'
+-- own "Execute Server-Side Code" processes/dynamic actions) makes its
+-- UTL_HTTP call from inside a definer-rights package OWNED BY THE APEX
+-- SCHEMA ITSELF (e.g. APEX_260100) — not the calling workspace schema, and
+-- not ADMIN. Granting ACL to WEAVE32/ADMIN/SYSTEM is NOT enough for this
+-- specific feature: without this grant it fails with ORA-29273 wrapping
+-- ORA-24247 ("network access denied by access control list (ACL)"), which
+-- reads like a generic HTTP failure and is easy to mistake for a bad
+-- Ollama URL or a firewall problem — confirmed empirically (caseweave's
+-- "ISet Analyser RAG+" page's apex_ai.generate() call). DBMS_VECTOR_CHAIN
+-- calls (the connectivity test below, and the Step 4 vector/ONNX path in
+-- load-apex-app.sh) don't need this — only the newer native AI Config
+-- feature does. The schema name is version-specific, so detect it rather
+-- than hardcode it.
+DECLARE
+  v_apex_schema VARCHAR2(128);
+BEGIN
+  SELECT username INTO v_apex_schema
+    FROM dba_users
+   WHERE username LIKE 'APEX\_2%' ESCAPE '\'
+     AND oracle_maintained = 'Y'
+     AND username NOT IN ('APEX_PUBLIC_USER','APEX_LISTENER','APEX_REST_PUBLIC_USER','APEX_PUBLIC_ROUTER')
+     AND ROWNUM = 1;
+  DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
+    host => '*',
+    ace  => xs$ace_type(
+              privilege_list => xs$name_list('connect', 'resolve'),
+              principal_name => v_apex_schema,
+              principal_type => xs_acl.ptype_db));
+  DBMS_OUTPUT.PUT_LINE('Network ACL granted to ' || v_apex_schema || ' (the APEX owning schema — needed for apex_ai.generate()).');
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    DBMS_OUTPUT.PUT_LINE('APEX owning schema not found (APEX not installed yet?) — skipping, this step will need to be re-run after APEX installs.');
+  WHEN OTHERS THEN
+    DBMS_OUTPUT.PUT_LINE('APEX schema ACL note: ' || SQLERRM);
 END;
 /
 
