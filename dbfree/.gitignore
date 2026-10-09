@@ -6,3 +6,4 @@ ords-install/
 ords-entrypoint.sh
 test/reports/
 *.log
+onnx-models/

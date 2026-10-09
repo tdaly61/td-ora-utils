@@ -1,9 +1,7 @@
 # Two-container topology: plain Oracle Database Free (see
 # .env.sample/DOCKER_IMAGE_ARM/DOCKER_IMAGE_AMD) plus a separate ORDS
 # container that auto-installs APEX from a locally-downloaded zip on first
-# boot. Revived and updated from
-# adb/legacy/compose-fullstack/docker-compose.yml — see dbfree/README.md for
-# how this differs from the single-container adb-free setup in adb/.
+# boot. See dbfree/README.md.
 
 services:
   oracle-db:
@@ -26,8 +24,7 @@ services:
     environment:
       - ORACLE_PWD=${ORACLE_PWD}
     ports:
-      # Host ports are configurable because ../adb/'s adb-free container
-      # commonly occupies 1521/1522 on the same host — see .env.sample.
+      # Host ports are configurable (default off 1521) — see .env.sample.
       - "${DB_HOST_PORT:-15216}:1521"
       - "${EM_EXPRESS_HOST_PORT:-5500}:5500"
     volumes:
@@ -38,9 +35,8 @@ services:
       # catcon.pl shell-out — a thin host Instant Client doesn't have that).
       - ${APEX_INSTALL_DIR:-./apex-install}:/tmp/apex:ro
     # No explicit healthcheck: block here — plain Database Free/Enterprise
-    # Edition images don't ship `healthcheck.sh` (that's an ADB-Free-only
-    # script; confirmed empirically it's not on PATH here, which made any
-    # override using it hang at "starting" forever even once the DB was
+    # Edition images don't ship `healthcheck.sh` (confirmed empirically it's
+    # not on PATH here, which made any override using it hang at "starting" forever even once the DB was
     # actually OPEN). This image already declares its own correct
     # HEALTHCHECK in its metadata (checkDBStatus.sh) — just inherit it.
 

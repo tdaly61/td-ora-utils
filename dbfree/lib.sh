@@ -2,11 +2,8 @@
 # lib.sh — shared helpers for the dbfree/ (Oracle Database Free) POC
 # scripts. Sourced by every dbfree/*.sh script.
 #
-# dbfree/ is fully standalone — it does not read anything under adb/ (no
-# adb/common.sh, no adb/.env). It carries its own common.sh (generic
-# ini_val/platform_val/detect_platform/select_docker_image/colour helpers,
-# a deliberate duplicate — see common.sh's own header) and its own
-# load-apex-app.sh + Instant Client installer.
+# Sources common.sh (generic ini_val/platform_val/detect_platform/
+# select_docker_image/colour helpers).
 
 DBFREE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
@@ -63,17 +60,15 @@ sqlplus_setup_env() {
 }
 
 # Ensure the host firewall lets Docker containers reach Ollama on 11434.
-# Ported from adb/run-adb-26ai.sh's ensure_host_firewall_allows_ollama() —
-# some HARDENED LINUX HOSTS (typically cloud VMs) run an iptables INPUT chain
+# Some HARDENED LINUX HOSTS (typically cloud VMs) run an iptables INPUT chain
 # that only allows loopback/ICMP/established/SSH and REJECTs everything else,
 # which silently breaks oracle-db -> host.docker.internal:11434 even though
 # Ollama itself is up (curl to localhost works, container traffic gets "No
 # route to host"). This does NOT apply on macOS/Colima or any host with a
 # permissive default firewall policy — the check below is a no-op there.
 #
-# Unlike adb's version, this one does NOT modify the host firewall silently:
-# inserting an iptables rule is a host-level, persistent change, so it
-# requires an explicit one-time opt-in via ALLOW_FIREWALL_AUTOFIX=true in
+# This does NOT modify the host firewall silently: inserting an iptables
+# rule is a host-level, persistent change, so it requires an explicit one-time opt-in via ALLOW_FIREWALL_AUTOFIX=true in
 # dbfree/.env (see .env.sample). Without it, this prints the exact command
 # needed and how to enable auto-fix, but changes nothing — safe to run
 # unattended (e.g. from full-cycle-test.sh) without surprising a host that's
@@ -164,10 +159,8 @@ ensure_host_firewall_allows_ollama() {
 }
 
 # Enable MAX_STRING_SIZE=EXTENDED so VARCHAR2(32767) columns are supported.
-# Ported from adb/run-adb-26ai.sh's enable_extended_string_size() —
-# ADB-Free has this pre-configured; plain Oracle Database (Enterprise
-# Edition here) does NOT, and defaults to STANDARD (4000-byte VARCHAR2
-# limit). Without this,
+# Plain Oracle Database defaults to STANDARD (4000-byte VARCHAR2 limit).
+# Without this,
 # any app whose schema declares a VARCHAR2 column over 4000 bytes fails
 # CREATE TABLE with ORA-00910 ("specified length too long for its
 # datatype") — discovered when caseweave's Supporting Objects install
@@ -243,11 +236,8 @@ SQLEOF
     echo "  MAX_STRING_SIZE=EXTENDED configured successfully."
 }
 
-# Raise PGA_AGGREGATE_LIMIT above Database Free's 2G default — this is the
-# specific fix ADB-Free cannot provide (ALTER SYSTEM fails there with
-# ORA-01031 even as ADMIN/DBA, confirmed empirically; it's what broke
-# caseweave's vector-embedding workers with ORA-04036 against ADB-Free).
-# Plain Database Free allows this as an ordinary DBA-adjustable init
+# Raise PGA_AGGREGATE_LIMIT above Database Free's 2G default (vector-embedding
+# workers hit ORA-04036 at the default). It's an ordinary DBA-adjustable init
 # parameter — confirmed empirically (2G -> 4G, took effect immediately).
 # SCOPE=BOTH so it applies now AND survives the container restart.
 # Usage: set_pga_aggregate_limit <container_name> <limit e.g. 3G>
@@ -276,7 +266,7 @@ EXIT;
 SQLEOF
     )
     echo "$out"
-    echo "$out" | grep -qiE "ORA-|SP2-" && die "Failed to set PGA_AGGREGATE_LIMIT=$limit — see sqlplus output above (if this is ORA-01031, $container_name is ADB-Free, not plain Database Free — check DOCKER_IMAGE in dbfree/.env)."
+    echo "$out" | grep -qiE "ORA-|SP2-" && die "Failed to set PGA_AGGREGATE_LIMIT=$limit — see sqlplus output above (if this is ORA-01031, $container_name is not plain Database Free — check DOCKER_IMAGE_ARM/DOCKER_IMAGE_AMD in dbfree/.env)."
     echo "  PGA_AGGREGATE_LIMIT=$limit configured successfully."
 }
 
@@ -295,8 +285,7 @@ SQLPLUS_BIN() {
 }
 
 # Run a SQL file via plain EZConnect (no wallet). Explicitly clears TNS_ADMIN
-# so a stray wallet sqlnet.ora (e.g. left over from an adb-free setup on the
-# same machine, which enforces TCPS) never leaks into a plain connection here.
+# so a stray wallet sqlnet.ora never leaks into a plain connection here.
 # Usage: run_sql_ezconnect <user> <password> <ezconnect> <sql_file> [role]
 #   role: optional, e.g. "sysdba" — appended as " as sysdba" after the
 #   connect string (sqlplus requires the role outside the user/pass@dsn part,

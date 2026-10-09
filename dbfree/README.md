@@ -3,13 +3,9 @@
 Fully standalone toolkit: two-container stack (plain **Oracle Database
 Free**, official image, OTN registry login required, plus a **standalone
 ORDS** container serving APEX from a locally downloaded distribution) and
-everything needed to deploy any APEX app into it. This directory reads
-nothing under `../adb/` — no shared `common.sh`, no shared `.env`, no
-dependency on an `adb/` script having run first. `adb/` runs the
-single-container **ADB-Free** image instead, which blocks `ALTER SYSTEM` (so
-`PGA_AGGREGATE_LIMIT`/`MAX_STRING_SIZE` can't be adjusted) — this stack
-exists for workloads that need those adjustable, and `adb/` is untouched by
-anything here.
+everything needed to deploy any APEX app into it. `ALTER SYSTEM` works, so
+`PGA_AGGREGATE_LIMIT` and `MAX_STRING_SIZE` are adjustable — `run-dbfree.sh`
+sets both on first start.
 
 Oracle Database Free ships native arm64 images; Enterprise Edition works too
 (point `DOCKER_IMAGE_ARM`/`DOCKER_IMAGE_AMD` at it) but is amd64-only and
@@ -34,8 +30,6 @@ one password used both for the compat `ADMIN` user and by
 why this is deliberately a single key), and `DB_HOST_PORT`/`APEX_PORT` if the
 defaults collide with something already running.
 
-`.env.sample` is this directory's own config schema — not `../adb/.env`'s.
-
 ## Quick start
 
 ```bash
@@ -56,8 +50,7 @@ present, so this script alone is enough to go from a brand-new machine to a
 running stack.
 
 `DB_HOST_PORT`/`APEX_PORT` default to **15216**/**8092** (not 1521/8080) so
-they don't collide with a long-running `adb-free` container on the same
-host — and because a host port held by a long-running prior container can
+they don't collide with other services on the same host — and because a host port held by a long-running prior container can
 develop a stuck macOS-side NAT state even after that container stops and
 after a full Colima restart (confirmed empirically — raw TCP connects, no
 payload ever crosses). If SQL*Net/HTTP mysteriously hangs on whatever ports
@@ -77,6 +70,18 @@ the schema), grants the `ADMINISTRATOR` ACL role, grants network ACL for
 `UTL_HTTP`, and configures any `LLM_<STATIC_ID>` remote-server/credential
 entries from `.env` (overridable per-import with `-r STATIC_ID=URL`). Run
 `./load-apex-app.sh -h` for the full flag list.
+
+## Deploying CaseWeave
+
+From the sibling `caseweave` repo (after `./run-dbfree.sh` has finished):
+
+```bash
+cd ../../caseweave && ./deploy-caseweave-to-dbfree.sh
+```
+
+It reads this directory's `.env`, imports the app via `load-apex-app.sh`,
+and serves the ONNX embedding model from `onnx-models/` (downloaded from
+`ONNX_MODEL_URLS` (checksum-verified) on first use).
 
 ## Access
 
@@ -131,12 +136,12 @@ Unattended clean → deploy → verify cycle:
   since plain Database Free defaults to `STANDARD`/2G.
 - A compat `ADMIN` database user (`create-admin-compat-user.sql.tpl`) is
   minted with `APEX_ADMINISTRATOR_ROLE` so `load-apex-app.sh` works —
-  Database Free has no built-in `ADMIN` user the way ADB-Free does. The
+  Database Free has no built-in `ADMIN` user. The
   role grant has to wait until APEX itself is installed, so `run-dbfree.sh`
   bootstraps this user twice (once early to create it, once more after APEX
   installs to apply the role).
-- Ollama reachability from the DB container: unlike ADB-Free, this stack
-  allows plain outbound HTTP, so no TLS proxy is needed. On hardened Linux
+- Ollama reachability from the DB container: this stack allows plain
+  outbound HTTP, so no TLS proxy is needed. On hardened Linux
   hosts with a default-deny `iptables` INPUT chain, `run-dbfree.sh` detects
   the block and prints the exact rule to add (`ALLOW_FIREWALL_AUTOFIX=true`
   in `.env` to have it apply the rule itself).
@@ -152,7 +157,7 @@ Unattended clean → deploy → verify cycle:
   now grants this automatically (detecting the APEX schema name rather than
   hardcoding a version-specific one). `DBMS_VECTOR_CHAIN` calls don't need
   this grant — only the newer AI Config feature does.
-- An app export inherited from an ADB-Free deployment may have a
+- An app export from another deployment may have a
   Generative AI credential whose actual static ID doesn't match
   `load-apex-app.sh`'s `<LLM_ID>_CRED` convention (APEX Builder sometimes
   auto-generates an opaque name like `credentials_for_<id>_5_` instead).
@@ -167,20 +172,6 @@ Unattended clean → deploy → verify cycle:
   at creation time, which makes it a reliable match independent of naming)
   and sets that one too. `VALID_FOR_URLS` is newline-delimited even for a
   single entry, so the match uses `INSTR`, not exact equality.
-
-## Comparison with `../adb/`
-
-| | `../adb/` (adb-free) | `dbfree/` (this directory) |
-|---|---|---|
-| Containers | 1 (DB+ORDS+APEX bundled) | 2 (DB, plus ORDS standalone in a plain JRE container) |
-| Transport | TCPS/mTLS only | Plain TCP/HTTP |
-| Outbound HTTP | `REQUIRE_OUT_HTTPS=Y` forced — needs `ollama-proxy` | Unrestricted — direct `UTL_HTTP` to host Ollama |
-| SYS/SYSDBA | Disabled even via `docker exec` | Available |
-| `ALTER SYSTEM` | Blocked (`ORA-01031`, even as ADMIN/DBA) | Available |
-| Top-level user | `ADMIN` built in | No `ADMIN` — minted by `create-admin-compat-user.sql.tpl` |
-| Resource ceiling | 4 ECPU / 30 sessions / 20GB, PGA limit fixed | 2GB PGA+SGA default, DBA-adjustable |
-| Host ports | 1521/1522/8443 | 15216 (SQL*Net)/8092 (APEX/ORDS) by default |
-| APEX app import | `../adb/load-apex-app.sh` | `./load-apex-app.sh` (this directory — own copy, dbfree-specific defaults) |
 
 ## Known limitations
 
@@ -199,8 +190,7 @@ Unattended clean → deploy → verify cycle:
 - `docker-compose.yml` — the two-container topology
 - `.env.sample` — config schema; copy to `.env`
 - `common.sh` — generic shell helpers (`ini_val`, `platform_val`,
-  `detect_platform`, `select_docker_image`, `ok`/`fail`/`warn`/`hdr`/`die`) —
-  a deliberate standalone copy, not shared with `../adb/`
+  `detect_platform`, `select_docker_image`, `ok`/`fail`/`warn`/`hdr`/`die`)
 - `lib.sh` — dbfree-specific helpers (`resolve_dbfree_path`,
   `enable_extended_string_size`, `set_pga_aggregate_limit`,
   `ensure_host_firewall_allows_ollama`, `run_sql_ezconnect`, ...); sources
@@ -216,6 +206,7 @@ Unattended clean → deploy → verify cycle:
   stack down
 - `cleanup-for-dbfree.sh` — mirrors `setup-for-dbfree.sh`: stops the stack's
   containers and, with `-r`, removes the images it pulled
+- `onnx-models/` — ONNX embedding model served to the DB (gitignored)
 - `sql-scripts/*.sql.tpl` — compat ADMIN user, network/AI ACLs
 - `test/smoke-dbfree.sh` — post-deploy verification
 - `test/full-cycle-test.sh` — unattended clean → deploy → verify orchestrator

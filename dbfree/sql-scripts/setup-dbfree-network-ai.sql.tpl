@@ -1,8 +1,7 @@
 -- setup-dbfree-network-ai.sql.tpl
 -- Configures outbound network access so this database can call a local
--- Ollama instance on the host, without the ollama-proxy TLS-termination
--- layer the adb-free setup needs (plain Database Free does not force
--- REQUIRE_OUT_HTTPS=Y the way ADB-Free does).
+-- Ollama instance on the host over plain HTTP (plain Database Free does not
+-- force REQUIRE_OUT_HTTPS=Y, so no TLS proxy is needed).
 --
 -- Scope note: this script is DB-layer only (ACLs + grants + a shared
 -- credential on ADMIN) — it does NOT register an APEX Generative AI service
@@ -102,7 +101,7 @@ END;
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 3. Create DB credential for Ollama (used by DBMS_VECTOR_CHAIN).
 --    Ollama has no auth, but Oracle requires a credential object. On a real
---    DBA-privileged ADMIN (unlike ADB-Free's constrained account) this should
+--    DBA-privileged ADMIN this should
 --    just succeed — a failure here is worth investigating, not expected.
 -- ─────────────────────────────────────────────────────────────────────────────
 DECLARE

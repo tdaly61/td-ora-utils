@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
 # install-instant-client.sh — one-time (idempotent) Oracle Instant Client
-# install, ported from adb/setup-for-adb-26ai.sh + mac_helpers.sh/
-# linux_helpers.sh so dbfree/ never has to run an adb/ script first.
-#
-# Installs to the same ~/oraclient/<INSTANT_CLIENT> layout adb/ uses — that's
-# just a shared directory convention, not a code dependency, so a machine
-# that already ran adb/setup-for-adb-26ai.sh sees this skip immediately
-# (idempotency check is directory-existence, same as adb/'s installer).
+# install. Installs to ~/oraclient/<INSTANT_CLIENT>; skipped if that
+# directory already exists.
 #
 # Usage: ./install-instant-client.sh   (normally called by setup-for-dbfree.sh)
 
@@ -70,9 +65,8 @@ if [ "$PLATFORM" = "darwin" ]; then
 
     oracle_home="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT"
     shell_rc="$HOME/.zshrc"
-    # Deliberately NOT exporting TNS_ADMIN here (unlike adb/'s installer,
-    # which points it at a wallet dir) — dbfree uses plain EZConnect, no
-    # wallet, and dbfree/lib.sh's sqlplus_setup_env() explicitly clears
+    # Deliberately NOT exporting TNS_ADMIN here — dbfree uses plain
+    # EZConnect, no wallet, and dbfree/lib.sh's sqlplus_setup_env() explicitly clears
     # TNS_ADMIN before every sqlplus call for exactly this reason.
     grep -q "export ORACLE_HOME=$oracle_home" "$shell_rc" 2>/dev/null || echo "export ORACLE_HOME=$oracle_home" >> "$shell_rc"
     grep -q "export DYLD_LIBRARY_PATH=$oracle_home" "$shell_rc" 2>/dev/null || echo "export DYLD_LIBRARY_PATH=$oracle_home" >> "$shell_rc"

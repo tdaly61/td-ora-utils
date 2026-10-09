@@ -2,12 +2,9 @@
 # load-apex-app.sh
 # Loads an APEX application export SQL file into a running dbfree/ stack.
 #
-# Ported from adb/load-apex-app.sh so dbfree/ is a fully standalone toolkit
-# (no adb/ dependency) — this is the generic "import any APEX app" script,
-# not caseweave-specific, same as the adb/ original. Differences from the
-# adb/ version: defaults to dbfree's FREEPDB1 service name instead of
-# ADB-Free's myatp_high, uses plain EZConnect with no wallet (dbfree has no
-# TCPS/wallet layer), and reads dbfree/.env instead of adb/.env.
+# This is the generic "import any APEX app" script, not caseweave-specific.
+# Defaults to dbfree's FREEPDB1 service name, uses plain EZConnect with no
+# wallet (dbfree has no TCPS/wallet layer), and reads dbfree/.env.
 #
 # The parsing schema and APEX workspace are auto-detected from the export file.
 # If the schema or workspace do not exist they are created automatically.
@@ -245,8 +242,7 @@ if [ ! -x "$SQLPLUS" ]; then
 fi
 
 # dbfree uses plain EZConnect, no wallet/TCPS — explicitly clear TNS_ADMIN so a
-# stray wallet sqlnet.ora from an adb-free setup on the same machine (which
-# enforces TCPS) never leaks into this connection (see dbfree/lib.sh's
+# stray wallet sqlnet.ora never leaks into this connection (see dbfree/lib.sh's
 # sqlplus_setup_env() for the same guard).
 export TNS_ADMIN=""
 export LD_LIBRARY_PATH="$ORACLE_CLIENT_DIR/$INSTANT_CLIENT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -551,7 +547,7 @@ WHENEVER SQLERROR CONTINUE
 -- ignores the Authorization header entirely, but APEX's own request
 -- construction behaves differently with an unset credential). So the
 -- naming-convention guess below (<LLM_ID>_CRED) is NOT enough on its own:
--- an app export inherited from an ADB-Free deployment may have the actual
+-- an app export from another deployment may have the actual
 -- credential object under an opaque Builder-generated static ID instead
 -- (e.g. "credentials_for_<id>_5_") that has nothing to do with the
 -- STATIC_ID used here. Find the REAL one by matching VALID_FOR_URLS

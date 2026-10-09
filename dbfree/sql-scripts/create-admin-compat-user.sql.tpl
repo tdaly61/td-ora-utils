@@ -4,8 +4,7 @@
 -- admin/$DEFAULT_PASSWORD@$SERVICE_NAME for its bootstrap/ACL/AI-service
 -- steps) works completely unmodified against this two-container stack.
 -- Plain Oracle Database Free has no ADMIN user by default — only
--- SYS/SYSTEM/PDBADMIN — unlike ADB-Free where ADMIN is the universal
--- top-level account.
+-- SYS/SYSTEM/PDBADMIN.
 --
 -- Run as: SYS/SYSDBA against the target PDB (e.g. via
 --   sqlplus -s "sys/<ORACLE_PWD>@//localhost:1521/<ORACLE_PDB> as sysdba"

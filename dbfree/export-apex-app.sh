@@ -4,10 +4,8 @@
 # versioned SQL file + manifest. Generic — works for any APEX app/workspace, not
 # tied to any one application.
 #
-# Ported from adb/export-apex-app.sh so dbfree/ is a fully standalone toolkit —
-# the export-side counterpart to load-apex-app.sh (this directory). Same
-# changes as that port: FREEPDB1 default instead of myatp_high, no
-# wallet/TNS_ADMIN default, reads dbfree/.env instead of adb/.env.
+# The export-side counterpart to load-apex-app.sh (this directory). Defaults
+# to the FREEPDB1 service, plain EZConnect (no wallet), reads dbfree/.env.
 #
 # Usage:
 #   ./export-apex-app.sh -u <schema_user> [-a <app_id>] [-p <password>]

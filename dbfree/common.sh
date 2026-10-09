@@ -3,12 +3,8 @@
 # Requires: CONFIG_FILE set by the calling script before ini_val/platform_val are used.
 # detect_platform (below) sets PLATFORM/ARCH — call it right after sourcing this file.
 #
-# This is a deliberate standalone copy of adb/common.sh, not a shared
-# dependency on it — dbfree/ used to source adb/common.sh directly (and read
-# adb/.env for DEFAULT_PASSWORD/INSTANT_CLIENT), which meant dbfree/ could
-# not be used on a machine that hadn't also set up adb/. Every function here
-# is used by dbfree/ (lib.sh, load-apex-app.sh, install-instant-client.sh),
-# so the duplication is a one-time cost, not dead weight.
+# Every function here is used by dbfree/ (lib.sh, load-apex-app.sh,
+# install-instant-client.sh).
 
 # Detect PLATFORM (linux|darwin) and ARCH (x86_64|arm64|aarch64) from uname.
 # Every dbfree script should source common.sh then call this once, instead of
