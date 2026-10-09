@@ -172,6 +172,18 @@ Unattended clean → deploy → verify cycle:
   at creation time, which makes it a reliable match independent of naming)
   and sets that one too. `VALID_FOR_URLS` is newline-delimited even for a
   single entry, so the match uses `INSTR`, not exact equality.
+- **`apexins.sql` (Oracle's own file) has no trailing `EXIT`** — it chains
+  into `apexins_cdb.sql`/`apexins_nocdb.sql` via `@@` and simply ends.
+  Every sqlplus call in this toolkit that invokes a script via a bare
+  command-line `"@script"` argument (not a heredoc) now redirects
+  `< /dev/null`, because without it sqlplus drops into interactive mode
+  once the script runs out of input and hangs waiting on whatever stdin
+  the call inherited — confirmed empirically (hangs indefinitely without
+  the redirect, returns in well under a second with it). This stayed
+  hidden during development because backgrounded runs
+  (`./run-dbfree.sh > log 2>&1 &`) happen to get a non-interactive stdin
+  already; running the same command in the foreground of a real terminal
+  is what triggers it.
 
 ## Known limitations
 

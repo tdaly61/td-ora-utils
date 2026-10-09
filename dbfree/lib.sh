@@ -299,8 +299,12 @@ run_sql_ezconnect() {
     [ -f "$sql_file" ] || die "SQL file not found: $sql_file"
     connect_str="$user/$pass@$ezconnect"
     [ -n "$role" ] && connect_str="$connect_str as $role"
+    # < /dev/null: if the script ever lacked a trailing EXIT, sqlplus would
+    # otherwise drop into interactive mode and hang on whatever stdin this
+    # call inherited — forces immediate EOF instead (same fix applied to
+    # every other positional "@script" sqlplus call in this toolkit).
     TNS_ADMIN="" \
     LD_LIBRARY_PATH="$oracle_client_dir/$instant_client${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     DYLD_LIBRARY_PATH="$oracle_client_dir/$instant_client${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
-        "$sqlplus" -s "$connect_str" "@$sql_file"
+        "$sqlplus" -s "$connect_str" "@$sql_file" < /dev/null
 }

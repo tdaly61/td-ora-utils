@@ -233,7 +233,7 @@ END;
 EXIT
 APEX_EOF
 
-"$SQLPLUS" -s "$SCHEMA_USER_UPPER/$SCHEMA_PASS@$SERVICE_NAME" "@$APEX_EXPORT_SQL"
+"$SQLPLUS" -s "$SCHEMA_USER_UPPER/$SCHEMA_PASS@$SERVICE_NAME" "@$APEX_EXPORT_SQL" < /dev/null
 
 if [ ! -f "$APEX_OUT" ] || [ ! -s "$APEX_OUT" ]; then
   die "APEX export failed — $APEX_OUT is missing or empty. Verify the DB is running and app $APP_ID exists in workspace $SCHEMA_USER_UPPER."

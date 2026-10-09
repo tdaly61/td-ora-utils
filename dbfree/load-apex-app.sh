@@ -424,7 +424,7 @@ $_RS_BLOCK
 exit
 WRAPPER_EOF
 
-"$SQLPLUS" -s "$SCHEMA_USER_UPPER/$SCHEMA_PASS@$SERVICE_NAME" "@$WRAPPER_SQL"
+"$SQLPLUS" -s "$SCHEMA_USER_UPPER/$SCHEMA_PASS@$SERVICE_NAME" "@$WRAPPER_SQL" < /dev/null
 ok "Import complete."
 
 # ── Step 3: Grant ADMINISTRATOR role to the workspace admin user ───────────────

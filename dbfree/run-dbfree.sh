@@ -179,7 +179,7 @@ bootstrap_compat_admin_user() {
     sed -e "s/__ADMIN_PASSWORD__/$DEFAULT_PASSWORD/g" \
         "$SCRIPT_DIR/sql-scripts/create-admin-compat-user.sql.tpl" > "$admin_sql"
     local admin_out
-    admin_out="$("$DBFREE_SQLPLUS" -s "sys/$ORACLE_PWD@$EZCONNECT as sysdba" "@$admin_sql" 2>&1)"
+    admin_out="$("$DBFREE_SQLPLUS" -s "sys/$ORACLE_PWD@$EZCONNECT as sysdba" "@$admin_sql" 2>&1 < /dev/null)"
     rm -f "$admin_sql"
     echo "$admin_out"
     echo "$admin_out" | grep -qiE "SP2-|ORA-|PLS-" && die "Failed to bootstrap the compat ADMIN user — see sqlplus output above. If this is ORA-01017/ORA-01005 (invalid credential), DEFAULT_PASSWORD in dbfree/.env was probably changed after this ADMIN user was first created — either change it back, or wipe oradata/ with ./run-dbfree.sh -c and redeploy with the new password."
@@ -194,7 +194,7 @@ SET PAGESIZE 0 FEEDBACK OFF HEADING OFF VERIFY OFF
 SELECT COUNT(*) FROM dba_users WHERE username LIKE 'APEX\_2%' ESCAPE '\' AND oracle_maintained = 'Y';
 exit;
 SQL
-APEX_COUNT="$("$DBFREE_SQLPLUS" -s "sys/$ORACLE_PWD@$EZCONNECT as sysdba" "@$CHECK_SQL" | tr -d '[:space:]')"
+APEX_COUNT="$("$DBFREE_SQLPLUS" -s "sys/$ORACLE_PWD@$EZCONNECT as sysdba" "@$CHECK_SQL" < /dev/null | tr -d '[:space:]')"
 rm -f "$CHECK_SQL"
 
 if [ "$APEX_COUNT" != "0" ]; then
@@ -208,7 +208,18 @@ else
     # work here despite matching Oracle's documented @@ semantics (confirmed
     # empirically). apexins.sql is pure SQL (no shell-outs), so it doesn't
     # need to run inside the container — just cd into its directory on the host.
-    APEXINS_OUT="$(cd "$APEX_INSTALL_DIR" && "$DBFREE_SQLPLUS" -s "sys/$ORACLE_PWD@$EZCONNECT as sysdba" "@apexins.sql" SYSAUX SYSAUX TEMP /i/ 2>&1)"
+    #
+    # `< /dev/null`: apexins.sql is Oracle's own file, invoked via a bare
+    # command-line "@script" arg (not a heredoc) — unlike every other
+    # sqlplus call in this toolkit, we don't control its content and can't
+    # guarantee it ends with its own EXIT. Without a script-level EXIT,
+    # sqlplus drops into interactive mode once it finishes and waits on
+    # whatever stdin this command substitution inherited — which can hang
+    # indefinitely if that happens to be a real terminal. Redirecting from
+    # /dev/null forces immediate EOF the moment sqlplus tries to read more
+    # input, so it exits cleanly regardless of whether the script itself
+    # has an EXIT.
+    APEXINS_OUT="$(cd "$APEX_INSTALL_DIR" && "$DBFREE_SQLPLUS" -s "sys/$ORACLE_PWD@$EZCONNECT as sysdba" "@apexins.sql" SYSAUX SYSAUX TEMP /i/ 2>&1 < /dev/null)"
     echo "$APEXINS_OUT"
     echo "$APEXINS_OUT" | grep -qiE "SP2-|ORA-|PLS-" && die "apexins.sql failed — see sqlplus output above. This step is pure SQL and runs for 15-30 minutes; a failure partway through usually means disk space ran out (check df -h) or the container was killed/restarted mid-install (check docker logs $CONTAINER_NAME). A partial install can leave APEX in a broken state — if in doubt, ./run-dbfree.sh -c and redeploy from scratch."
     ok "APEX installed"
@@ -304,7 +315,7 @@ GRANT EXECUTE ON SYS.UTL_HTTP TO ADMIN;
 GRANT EXECUTE ON CTXSYS.DBMS_VECTOR_CHAIN TO ADMIN;
 exit;
 SQL
-GRANTS_OUT="$("$DBFREE_SQLPLUS" -s "sys/$ORACLE_PWD@$EZCONNECT as sysdba" "@$GRANTS_SQL" 2>&1)"
+GRANTS_OUT="$("$DBFREE_SQLPLUS" -s "sys/$ORACLE_PWD@$EZCONNECT as sysdba" "@$GRANTS_SQL" 2>&1 < /dev/null)"
 rm -f "$GRANTS_SQL"
 echo "$GRANTS_OUT"
 echo "$GRANTS_OUT" | grep -qiE "SP2-|ORA-|PLS-" && die "Failed to grant UTL_HTTP/DBMS_VECTOR_CHAIN to ADMIN — see sqlplus output above."
