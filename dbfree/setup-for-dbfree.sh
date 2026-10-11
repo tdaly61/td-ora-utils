@@ -2,10 +2,29 @@
 # setup-for-dbfree.sh — one-time (idempotent) host prep for the dbfree/ stack:
 # registry login, image pulls, host directories, APEX/ORDS download+extract.
 #
-# Usage: ./setup-for-dbfree.sh
+# Usage:
+#   ./setup-for-dbfree.sh      Preflight checks (Docker up + enough memory,
+#                              compose, disk, ports, credentials), Instant
+#                              Client install, registry login, image pulls,
+#                              host dirs, APEX/ORDS download+extract
+#   ./setup-for-dbfree.sh -h   Show this help
+#
+# Needs dbfree/.env (cp .env.sample .env). Next step: ./run-dbfree.sh
 
 set -euo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# Parsed before sourcing lib.sh, which exits if .env is missing — -h should
+# work on a fresh checkout too.
+while getopts ":h" opt; do
+    case $opt in
+        h) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
+        \?) echo "ERROR: Unknown option -$OPTARG (see -h)"; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 0 ] || { echo "ERROR: Unexpected argument: $1 (see -h)"; exit 1; }
+
 source "$SCRIPT_DIR/lib.sh"
 
 REGISTRY_HOST="container-registry.oracle.com"
@@ -331,4 +350,4 @@ main() {
     ok "Setup complete. Next: ./run-dbfree.sh"
 }
 
-main "$@"
+main

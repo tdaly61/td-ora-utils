@@ -14,16 +14,19 @@
 
 set -euo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-source "$SCRIPT_DIR/lib.sh"
 
 REMOVE_IMAGES=0
 while getopts ":rh" opt; do
     case $opt in
         r) REMOVE_IMAGES=1 ;;
-        h) grep '^#' "$0" | sed 's/^# \{0,1\}//; /^!/d'; exit 0 ;;
+        h) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
         \?) echo "ERROR: Unknown option -$OPTARG"; exit 1 ;;
     esac
 done
+
+# Sourced after option parsing: lib.sh exits if .env is missing, and -h
+# should work on a fresh checkout too.
+source "$SCRIPT_DIR/lib.sh"
 
 hdr "dbfree/cleanup-for-dbfree.sh"
 
