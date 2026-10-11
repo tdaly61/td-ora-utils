@@ -19,14 +19,57 @@ detect_platform() {
 }
 
 # Read a single KEY=VALUE entry from CONFIG_FILE by exact key name.
-# Handles values containing '=' (e.g. URLs). Strips inline comments and whitespace.
+# Handles values containing '=' (e.g. URLs). Strips inline comments and
+# leading/trailing whitespace from unquoted values; wrap a value in "..."
+# or '...' to take it 100% literally instead (see below) — the escape hatch
+# for passwords or any other value with special characters.
+#
 # A missing key is a normal, expected case (most keys are optional, with
 # callers falling back via ${VAR:-default}) — always return 0 so that a
 # non-matching grep doesn't trip `set -e`/`pipefail` in the calling script
-# and abort it before that fallback ever runs.
+# and abort it before that fallback ever runs. The `|| true` on the grep
+# assignment exists for the same reason: `raw=$(grep ...)` as a bare
+# statement would otherwise propagate grep's own exit 1 (no match) under
+# `set -e` and abort the CALLER right there, before this function ever
+# reaches its own `return 0`.
+#
+# Two real bugs fixed here (confirmed empirically against a password
+# containing '#' and a password containing a space):
+#   1. The old inline-comment strip (`sed 's/[[:space:]]*#.*//'`) matched
+#      on ANY '#', even with zero preceding whitespace — a password like
+#      "abc#def" was silently truncated to "abc" with no warning. Fixed to
+#      require real whitespace before '#' (still an inherent ambiguity for
+#      an unquoted value whose own content is " #something" — that's what
+#      the quoting escape hatch is for).
+#   2. The old whitespace-trim (`tr -d ' \n\r'`) deleted EVERY space in the
+#      value, not just leading/trailing ones — a password with an embedded
+#      space silently lost it. Fixed to trim only the ends.
 ini_val() {
-    local key="$1"
-    grep -m1 "^${key}=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | sed 's/[[:space:]]*#.*//' | tr -d ' \n\r'
+    local key="$1" raw
+    raw="$(grep -m1 "^${key}=" "$CONFIG_FILE" 2>/dev/null)" || true
+    raw="${raw#*=}"
+
+    # Quoted value: taken 100% literally between the matching quotes — no
+    # comment-stripping, no whitespace-trimming. Doesn't support escaping
+    # the quote character itself inside the value (out of scope for this
+    # lightweight format); if a password needs the exact same quote
+    # character it's wrapped in, use the other quote style instead.
+    if [[ "$raw" == \"*\" && "$raw" != '"' ]]; then
+        printf '%s' "${raw:1:${#raw}-2}"; return 0
+    fi
+    if [[ "$raw" == \'*\' && "$raw" != "'" ]]; then
+        printf '%s' "${raw:1:${#raw}-2}"; return 0
+    fi
+
+    # Unquoted value: strip a trailing CR (Windows line endings), strip an
+    # inline comment only when '#' is preceded by real whitespace, then
+    # trim leading/trailing whitespace only.
+    printf '%s' "$raw" | sed -E '
+        s/\r$//
+        s/[[:space:]]+#.*$//
+        s/^[[:space:]]+//
+        s/[[:space:]]+$//
+    '
     return 0
 }
 

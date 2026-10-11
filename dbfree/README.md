@@ -41,7 +41,7 @@ defaults collide with something already running.
 ```
 
 `setup-for-dbfree.sh` runs a `preflight` check first — Docker daemon up,
-`docker compose` wired, disk space, `grealpath` on macOS, registry
+enough Docker memory (see below), `docker compose` wired, disk space, `grealpath` on macOS, registry
 credentials not left as placeholders, and whether `DB_HOST_PORT`/`APEX_PORT`/
 `EM_EXPRESS_HOST_PORT` are already bound — and reports every problem it
 finds in one pass rather than failing on the first one. It also installs the
@@ -56,6 +56,36 @@ after a full Colima restart (confirmed empirically — raw TCP connects, no
 payload ever crosses). If SQL*Net/HTTP mysteriously hangs on whatever ports
 you pick instead, suspect this and move off whatever port a long-running
 prior container held.
+
+### Docker memory (Colima)
+
+On macOS the stack runs inside the Colima VM. What counts is the VM's
+memory, not the Mac's, and Colima defaults to only **2GB**. That's too little
+for Oracle: the DB gets OOM-killed or swaps so hard that `run-dbfree.sh`
+looks like it hangs. Give the VM at least 4GB (8GB recommended):
+
+```bash
+colima stop
+colima start --memory 8 --cpus 4    # add -p <profile> for a non-default profile
+colima list                         # confirm the new size
+```
+
+Restarting Colima stops every container running in it, not just this stack.
+
+Both `setup-for-dbfree.sh` and `run-dbfree.sh` check this before starting
+anything. They read the memory figure from `docker info`, so the check works
+with any Docker runtime. The thresholds are set in `.env`:
+
+| Key | Default | Effect |
+|-----|---------|--------|
+| `DOCKER_MIN_MEMORY_GB` | `4` | Below this: abort, printing the exact `colima` resize commands |
+| `DOCKER_RECOMMENDED_MEMORY_GB` | `8` | Below this: warn and continue |
+| `COLIMA_AUTO_RESIZE` | `false` | `true`: restart a too-small Colima VM at the recommended size automatically, capped to leave the Mac 4GB |
+
+While waiting for the DB to become healthy, `run-dbfree.sh` prints a progress
+line with the latest container log line every minute. It stops immediately
+if the container exits or is OOM-killed, showing the last 30 log lines,
+instead of waiting out `DB_HEALTHY_TIMEOUT`.
 
 ## Deploying an APEX app
 
@@ -204,6 +234,7 @@ Unattended clean → deploy → verify cycle:
 - `common.sh` — generic shell helpers (`ini_val`, `platform_val`,
   `detect_platform`, `select_docker_image`, `ok`/`fail`/`warn`/`hdr`/`die`)
 - `lib.sh` — dbfree-specific helpers (`resolve_dbfree_path`,
+  `check_docker_resources`, `wait_for_container_healthy`,
   `enable_extended_string_size`, `set_pga_aggregate_limit`,
   `ensure_host_firewall_allows_ollama`, `run_sql_ezconnect`, ...); sources
   `common.sh`

@@ -137,19 +137,13 @@ ORDS_INSTALL_DIR="$(resolve_dbfree_path ORDS_INSTALL_DIR ./ords-install)"
 [ -f "$APEX_INSTALL_DIR/apexins.sql" ] || die "APEX not found under $APEX_INSTALL_DIR — run ./setup-for-dbfree.sh first."
 [ -x "$ORDS_INSTALL_DIR/bin/ords" ] || die "ORDS not found under $ORDS_INSTALL_DIR — run ./setup-for-dbfree.sh first."
 
+hdr "Checking Docker memory/CPU"
+check_docker_resources || die "Not enough memory for the dbfree stack — fix the above and re-run."
+
 hdr "Starting oracle-db"
 docker compose up -d oracle-db
 
-echo "Waiting up to ${DB_HEALTHY_TIMEOUT}s for $CONTAINER_NAME to be healthy..."
-start=$(date +%s)
-while true; do
-    elapsed=$(( $(date +%s) - start ))
-    [ "$elapsed" -ge "$DB_HEALTHY_TIMEOUT" ] && die "Timeout waiting for $CONTAINER_NAME to become healthy."
-    status=$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "starting")
-    [ "$status" = "healthy" ] && { ok "$CONTAINER_NAME is healthy (${elapsed}s)"; break; }
-    [ "$status" = "unhealthy" ] && die "$CONTAINER_NAME reported unhealthy — check: docker logs $CONTAINER_NAME. Common causes: Colima/Docker Desktop has too little memory allocated (the DB wants a few GB headroom beyond its own SGA/PGA), the host is out of disk space, or (on macOS/Colima) a stuck NAT state on DB_HOST_PORT — see README.md's stuck-port gotcha."
-    sleep 10
-done
+wait_for_container_healthy "$CONTAINER_NAME" "$DB_HEALTHY_TIMEOUT"
 
 enable_extended_string_size "$CONTAINER_NAME" "$ORACLE_PDB" "$DB_HEALTHY_TIMEOUT"
 
@@ -294,6 +288,8 @@ start=$(date +%s)
 while true; do
     elapsed=$(( $(date +%s) - start ))
     [ "$elapsed" -ge "$ORDS_HEALTHY_TIMEOUT" ] && die "Timeout waiting for ORDS on port $APEX_PORT. Check: docker logs $ORDS_CONTAINER_NAME"
+    [ "$(docker inspect --format '{{.State.Status}}' "$ORDS_CONTAINER_NAME" 2>/dev/null)" = "running" ] \
+        || die "$ORDS_CONTAINER_NAME stopped before ORDS came up — check: docker logs $ORDS_CONTAINER_NAME (OOMKilled: $(docker inspect --format '{{.State.OOMKilled}}' "$ORDS_CONTAINER_NAME" 2>/dev/null || echo unknown))."
     if curl -sf -o /dev/null "http://localhost:$APEX_PORT/ords/"; then
         ok "ORDS responding on port $APEX_PORT (${elapsed}s)"
         break

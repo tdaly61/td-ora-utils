@@ -57,7 +57,7 @@ check_docker_daemon() {
     if docker info &>/dev/null; then
         ok "Docker daemon is reachable"
     else
-        preflight_fail "Docker daemon is not reachable — start Colima (\`colima start\`) or Docker Desktop, then re-run."
+        preflight_fail "Docker daemon is not reachable — start Colima (\`colima start --memory 8 --cpus 4\` — its 2GB default is too small for Oracle) or Docker Desktop, then re-run."
     fi
 }
 
@@ -126,6 +126,9 @@ check_ports_free() {
 preflight() {
     hdr "Preflight checks"
     check_docker_daemon
+    if docker info &>/dev/null; then
+        check_docker_resources || PREFLIGHT_FAILURES=$((PREFLIGHT_FAILURES + 1))
+    fi
     check_docker_compose
     check_grealpath
     check_disk_space

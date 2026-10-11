@@ -41,6 +41,133 @@ resolve_dbfree_path() {
     esac
 }
 
+# Colima profile behind the current docker context ("colima" -> default,
+# "colima-foo" -> foo). Prints nothing if the context isn't a Colima one
+# (Docker Desktop, plain Linux dockerd, ...).
+colima_profile() {
+    local ctx
+    ctx="$(docker context show 2>/dev/null || true)"
+    case "$ctx" in
+        colima)   printf 'default' ;;
+        colima-*) printf '%s' "${ctx#colima-}" ;;
+    esac
+}
+
+# Check the Docker engine has enough memory/CPUs for oracle-db + ords +
+# apexins.sql. On macOS that's the Colima VM's allocation, NOT the Mac's RAM —
+# Colima's out-of-the-box default (2GB/2 CPUs) is too small: the DB either
+# gets OOM-killed or swaps so hard that the health wait / apexins.sql looks
+# like a silent hang. `docker info` reports what the engine actually sees, so
+# this works for any runtime.
+#
+# Below DOCKER_MIN_MEMORY_GB: prints fix instructions and returns 1 (callers
+# die / preflight_fail). Below DOCKER_RECOMMENDED_MEMORY_GB: warns only.
+# With COLIMA_AUTO_RESIZE=true in dbfree/.env, a too-small Colima VM is
+# restarted at the recommended size instead — opt-in because restarting
+# Colima stops EVERY container running in it, not just this stack's.
+check_docker_resources() {
+    local min_gb rec_gb mem_bytes="" ncpu="" mem_mb profile host_gb target_gb cpus
+    min_gb="$(ini_val DOCKER_MIN_MEMORY_GB)"; min_gb="${min_gb:-4}"
+    rec_gb="$(ini_val DOCKER_RECOMMENDED_MEMORY_GB)"; rec_gb="${rec_gb:-8}"
+
+    read -r mem_bytes ncpu < <(docker info --format '{{.MemTotal}} {{.NCPU}}' 2>/dev/null) || true
+    if [ -z "$mem_bytes" ]; then
+        fail "Docker daemon is not reachable — start Colima (\`colima start --memory $rec_gb --cpus 4\`) or your Docker runtime, then re-run."
+        return 1
+    fi
+    mem_mb=$((mem_bytes / 1024 / 1024))
+    profile="$(colima_profile)"
+
+    # The engine reports a little less than the VM's configured size (an 8GB
+    # Colima VM shows ~7.7GiB), so compare against 90% of each threshold.
+    if [ "$mem_mb" -ge $((rec_gb * 1024 * 9 / 10)) ]; then
+        ok "Docker has ${mem_mb}MB memory / ${ncpu} CPUs${profile:+ (Colima profile '$profile')}"
+        return 0
+    fi
+
+    host_gb=""
+    if [ "$PLATFORM" = "darwin" ]; then
+        host_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 / 1024 / 1024 ))
+    fi
+    # Leave the Mac itself (and Ollama, which runs on the host) at least 4GB.
+    target_gb="$rec_gb"
+    if [ -n "$host_gb" ] && [ "$host_gb" -gt 0 ] && [ $((host_gb - 4)) -lt "$target_gb" ]; then
+        target_gb=$(( host_gb - 4 > min_gb ? host_gb - 4 : min_gb ))
+    fi
+    cpus=$(( ncpu > 4 ? ncpu : 4 ))
+    local pflag=""
+    [ -n "$profile" ] && [ "$profile" != "default" ] && pflag=" -p $profile"
+
+    if [ -n "$profile" ] && [ "$(ini_val COLIMA_AUTO_RESIZE)" = "true" ]; then
+        warn "Colima VM has only ${mem_mb}MB — COLIMA_AUTO_RESIZE=true, restarting it with ${target_gb}GB / ${cpus} CPUs (this stops every container in it)..."
+        # shellcheck disable=SC2086
+        colima stop$pflag && colima start$pflag --memory "$target_gb" --cpus "$cpus" \
+            || { fail "Colima resize failed — run it by hand: colima stop$pflag && colima start$pflag --memory $target_gb --cpus $cpus"; return 1; }
+        read -r mem_bytes ncpu < <(docker info --format '{{.MemTotal}} {{.NCPU}}' 2>/dev/null) || true
+        mem_mb=$(( ${mem_bytes:-0} / 1024 / 1024 ))
+        ok "Colima restarted: Docker now has ${mem_mb}MB memory / ${ncpu} CPUs"
+        [ "$mem_mb" -ge $((min_gb * 1024 * 9 / 10)) ] && return 0
+    fi
+
+    local fix
+    if [ -n "$profile" ]; then
+        fix="Colima's VM is too small (Colima defaults to 2GB). Resize it — this restarts the VM and every container in it:
+        colima stop$pflag
+        colima start$pflag --memory $target_gb --cpus $cpus
+     Check the result with: colima list   (or set COLIMA_AUTO_RESIZE=true in dbfree/.env to have this script do it)."
+    elif [ "$PLATFORM" = "darwin" ]; then
+        fix="Raise the memory limit for your Docker runtime's VM to ${target_gb}GB+ (e.g. Docker Desktop -> Settings -> Resources)."
+    else
+        fix="This host has too little RAM for the stack — free memory or use a larger machine."
+    fi
+    [ -n "$host_gb" ] && [ "$host_gb" -gt 0 ] && [ "$host_gb" -lt $((min_gb + 4)) ] \
+        && fix="$fix
+     Note: this Mac has only ${host_gb}GB RAM in total — with Ollama also running on the host it will be tight."
+
+    if [ "$mem_mb" -lt $((min_gb * 1024 * 9 / 10)) ]; then
+        fail "Docker has only ${mem_mb}MB memory — the dbfree stack needs at least ${min_gb}GB (${rec_gb}GB recommended). Without it the DB gets OOM-killed or swaps, and run-dbfree.sh appears to hang."
+        printf '     %s\n' "$fix" >&2
+        return 1
+    fi
+    warn "Docker has only ${mem_mb}MB memory / ${ncpu} CPUs — works, but ${rec_gb}GB is recommended (APEX install will be slow)."
+    printf '     %s\n' "$fix"
+    return 0
+}
+
+# Wait for a container to report healthy, failing fast (instead of spinning
+# until the timeout) if it exits or is OOM-killed, and printing progress every
+# minute so a slow first boot doesn't look like a hang.
+# Usage: wait_for_container_healthy <container_name> <timeout_seconds>
+wait_for_container_healthy() {
+    local name="$1" timeout="$2" start elapsed state health oom last_report=0
+    echo "Waiting up to ${timeout}s for $name to be healthy (first boot creates the DB — typically 3-10 minutes)..."
+    start=$(date +%s)
+    while true; do
+        elapsed=$(( $(date +%s) - start ))
+        read -r state health oom < <(docker inspect --format \
+            '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{.State.OOMKilled}}' \
+            "$name" 2>/dev/null) || true
+
+        if [ "${oom:-false}" = "true" ]; then
+            die "$name was OOM-killed — Docker doesn't have enough memory for Oracle. Re-run after resizing (see the memory check at the start of this script's output), e.g. on Colima: colima stop && colima start --memory 8 --cpus 4"
+        fi
+        case "${state:-missing}" in
+            exited|dead|missing)
+                docker logs --tail 30 "$name" 2>&1 | sed 's/^/     | /' >&2 || true
+                die "$name is no longer running (state: ${state:-missing}) — last log lines above. If they show memory errors (ORA-04031/ORA-27125/'Killed'), give Docker more memory." ;;
+        esac
+        [ "$health" = "healthy" ] && { ok "$name is healthy (${elapsed}s)"; return 0; }
+        [ "$health" = "unhealthy" ] && die "$name reported unhealthy — check: docker logs $name. Common causes: too little memory allocated to Colima/Docker (the DB wants a few GB headroom beyond its own SGA/PGA), the host is out of disk space, or (on macOS/Colima) a stuck NAT state on DB_HOST_PORT — see README.md's stuck-port gotcha."
+        [ "$elapsed" -ge "$timeout" ] && die "Timeout after ${timeout}s waiting for $name to become healthy (state: $state, health: $health). Check: docker logs $name — a DB that never finishes booting is most often starved of memory/CPU (see the memory check at the start of this script's output)."
+
+        if [ $((elapsed - last_report)) -ge 60 ]; then
+            last_report=$elapsed
+            echo "  ...${elapsed}s, $name is $state/$health. Last log: $(docker logs --tail 1 "$name" 2>&1 | cut -c1-120)"
+        fi
+        sleep 10
+    done
+}
+
 # Exports TNS_ADMIN (cleared)/LD_LIBRARY_PATH/DYLD_LIBRARY_PATH and sets
 # DBFREE_SQLPLUS to the resolved sqlplus binary, for callers that need a genuine
 # `sqlplus conn @script arg1 arg2` command-line invocation (positional args,
