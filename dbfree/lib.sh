@@ -41,6 +41,26 @@ resolve_dbfree_path() {
     esac
 }
 
+# Source for the DB container's /opt/oracle/oradata mount. On macOS it's a
+# Docker named volume (inside the Colima VM): a host bind mount goes through
+# virtiofs, where DBCA creates FREEPDB1 but can't open it (ORA-65009, then
+# ORA-27041 on control01.ctl) and the container exits on first boot. Linux
+# keeps the plain DB_DATA_DIR bind mount. Prints the compose volume key
+# "oradata" on macOS (see docker-compose.yml's top-level volumes:).
+db_data_source() {
+    if [ "$PLATFORM" = "darwin" ]; then
+        printf 'oradata'
+    else
+        resolve_dbfree_path DB_DATA_DIR ./oradata
+    fi
+}
+
+# Docker volume name behind db_data_source() on macOS.
+db_data_volume() {
+    local v; v="$(ini_val DB_DATA_VOLUME)"
+    printf '%s' "${v:-dbfree-oradata}"
+}
+
 # Colima profile behind the current docker context ("colima" -> default,
 # "colima-foo" -> foo). Prints nothing if the context isn't a Colima one
 # (Docker Desktop, plain Linux dockerd, ...).
@@ -132,6 +152,139 @@ check_docker_resources() {
     warn "Docker has only ${mem_mb}MB memory / ${ncpu} CPUs — works, but ${rec_gb}GB is recommended (APEX install will be slow)."
     printf '     %s\n' "$fix"
     return 0
+}
+
+# ── LLM: Ollama on the host ───────────────────────────────────────────────
+# OLLAMA_BASE_URL is how the DB container reaches Ollama; the host reaches the
+# same server on localhost.
+ollama_container_url() {
+    local url; url="$(platform_val OLLAMA_BASE_URL)"
+    printf '%s' "${url:-http://host.docker.internal:11434}"
+}
+ollama_host_url() {
+    local url; url="$(ollama_container_url)"
+    printf '%s' "${url/host.docker.internal/localhost}"
+}
+
+# Every Ollama model dbfree/.env names, one per line: OLLAMA_MODEL, the model
+# in each type=local LLM_<ID> entry, and WORKER_TEXT/VISION_MODEL when
+# WORKER_LLM_API_STYLE is ollama. _MAC variants win on macOS.
+llm_models() {
+    local key spec style
+    {
+        platform_val OLLAMA_MODEL; echo
+        for key in $(grep -oE '^LLM_[A-Za-z0-9_]+=' "$CONFIG_FILE" | tr -d '=' | grep -v '_MAC$'); do
+            spec="$(platform_val "$key")"
+            if [ "${spec##*|}" = "local" ]; then printf '%s\n' "$spec" | cut -d'|' -f2; fi
+        done
+        style="$(platform_val WORKER_LLM_API_STYLE)"
+        if [ "${style:-ollama}" = "ollama" ]; then
+            platform_val WORKER_TEXT_MODEL; echo
+            platform_val WORKER_VISION_MODEL; echo
+        fi
+    } | sed -E 's/^[[:space:]]+|[[:space:]]+$//g' | grep -v '^$' | awk '!seen[$0]++'
+}
+
+# Check Ollama is installed, running, reachable from Docker containers, and
+# has every model llm_models lists, printing the fix for each problem. Missing
+# models go in LLM_MISSING (pull_llm_models fetches them) and don't count as
+# problems; a model too big for this Mac's spare memory is a warning only.
+# Returns the number of problems.
+check_llm() {
+    local url inner tags model size biggest=0 biggest_name="" problems=0
+    url="$(ollama_host_url)"; inner="$(ollama_container_url)"
+    LLM_MISSING=()
+
+    if ! command -v ollama &>/dev/null && [[ "$url" == http://localhost* ]]; then
+        fail "Ollama is not installed — the database's AI calls and any app's LLM workers need it."
+        if [ "$PLATFORM" = "darwin" ]; then
+            echo "     Install: brew install ollama   (or the app from https://ollama.com/download)"
+        else
+            echo "     Install: curl -fsSL https://ollama.com/install.sh | sh"
+        fi
+        return 1
+    fi
+
+    if ! tags="$(curl -sf -m 5 "$url/api/tags")"; then
+        fail "Ollama is not answering at $url."
+        if [ "$PLATFORM" = "darwin" ]; then
+            echo "     Start it: open -a Ollama   (or in a terminal: ollama serve)"
+        else
+            echo "     Start it: sudo systemctl start ollama   (or in a terminal: ollama serve)"
+        fi
+        echo "     Using another server? Set OLLAMA_BASE_URL in dbfree/.env."
+        return 1
+    fi
+    ok "Ollama is running at $url"
+
+    # The DB container calls Ollama from inside Docker, which fails if Ollama
+    # only listens on the host's loopback (the Linux default) or a firewall
+    # blocks it, even though everything above passed.
+    if docker info &>/dev/null; then
+        if docker run --rm --add-host host.docker.internal:host-gateway alpine \
+                wget -q -T 5 -O /dev/null "$inner/api/version" &>/dev/null; then
+            ok "Docker containers can reach Ollama at $inner"
+        else
+            fail "Docker containers can't reach Ollama at $inner (the host can, so Ollama is probably listening on localhost only)."
+            if [ "$PLATFORM" = "darwin" ]; then
+                echo "     Quit the Ollama app, then run in a terminal: OLLAMA_HOST=0.0.0.0 ollama serve"
+            else
+                echo "     Make it listen on all interfaces, then restart it:"
+                echo "       sudo systemctl edit ollama      # add the two lines: [Service]  Environment=\"OLLAMA_HOST=0.0.0.0\""
+                echo "       sudo systemctl restart ollama"
+                echo "     If it still fails, see the firewall note for ALLOW_FIREWALL_AUTOFIX in dbfree/.env."
+            fi
+            problems=$((problems + 1))
+        fi
+    fi
+
+    # /api/tags lists each model's "name" followed (a few keys later) by its
+    # "size" in bytes; a name without a tag means ":latest".
+    while IFS= read -r model; do
+        [[ "$model" == *:* ]] || model="$model:latest"
+        size="$(printf '%s' "$tags" | grep -oE '"name":"[^"]+"|"size":[0-9]+' \
+            | grep -A1 -Fx "\"name\":\"$model\"" | sed -n 's/^"size"://p')"
+        if [ -n "$size" ]; then
+            ok "Model $model is pulled ($(( (size + 2**29) / 2**30 ))GB)"
+            if [ "$size" -gt "$biggest" ]; then biggest=$size; biggest_name=$model; fi
+        else
+            LLM_MISSING+=("$model")
+        fi
+    done < <(llm_models)
+
+    if [ "${#LLM_MISSING[@]}" -gt 0 ]; then
+        warn "Not pulled yet: ${LLM_MISSING[*]}"
+        echo "     ./setup-for-dbfree.sh -l pulls them (or by hand: ollama pull <model>)."
+        echo "     The models come from OLLAMA_MODEL, LLM_<ID> and WORKER_*_MODEL in dbfree/.env."
+    fi
+
+    # On a Mac, Ollama shares RAM with the Colima VM: a model bigger than what's
+    # left over loads very slowly, swaps, or fails with an out-of-memory error.
+    if [ "$PLATFORM" = "darwin" ] && [ "$biggest" -gt 0 ]; then
+        local host docker_mem spare
+        host="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+        docker_mem="$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)"
+        spare=$(( host - docker_mem - 4 * 2**30 ))
+        if [ "$biggest" -gt "$spare" ]; then
+            warn "$biggest_name needs at least $(( (biggest + 2**29) / 2**30 ))GB, but this Mac has $(( host / 2**30 ))GB with $(( docker_mem / 2**30 ))GB given to Docker — expect very slow answers or out-of-memory errors."
+            echo "     Pick a smaller model in dbfree/.env (e.g. WORKER_TEXT_MODEL_MAC=llama3.2:3b), or give Docker less memory."
+        fi
+    fi
+    return "$problems"
+}
+
+# Pull the models check_llm found missing (LLM_MISSING).
+pull_llm_models() {
+    local model
+    [ "${#LLM_MISSING[@]}" -gt 0 ] || return 0
+    command -v ollama &>/dev/null || die "The ollama command isn't installed here — pull these on the Ollama server instead: ${LLM_MISSING[*]}"
+    for model in "${LLM_MISSING[@]}"; do
+        echo "  ollama pull $model   (large models take a while)"
+        OLLAMA_HOST="$(ollama_host_url)" ollama pull "$model" \
+            || die "Couldn't pull $model. Check the name at https://ollama.com/library — or, if it's a custom model made with 'ollama create', create it on this machine first — or pick another model in dbfree/.env."
+        ok "Pulled $model"
+    done
+    LLM_MISSING=()
 }
 
 # Wait for a container to report healthy, failing fast (instead of spinning

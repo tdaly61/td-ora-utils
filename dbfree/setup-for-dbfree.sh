@@ -4,9 +4,12 @@
 #
 # Usage:
 #   ./setup-for-dbfree.sh      Preflight checks (Docker up + enough memory,
-#                              compose, disk, ports, credentials), Instant
-#                              Client install, registry login, image pulls,
-#                              host dirs, APEX/ORDS download+extract
+#                              compose, disk, ports, credentials, Ollama),
+#                              Instant Client install, registry login, image
+#                              pulls, host dirs, APEX/ORDS download+extract,
+#                              pull the Ollama models dbfree/.env names
+#   ./setup-for-dbfree.sh -l   LLM only: check Ollama and pull missing models
+#   ./setup-for-dbfree.sh -n   Skip the Ollama checks and model pulls
 #   ./setup-for-dbfree.sh -h   Show this help
 #
 # Needs dbfree/.env (cp .env.sample .env). Next step: ./run-dbfree.sh
@@ -16,8 +19,12 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 # Parsed before sourcing lib.sh, which exits if .env is missing — -h should
 # work on a fresh checkout too.
-while getopts ":h" opt; do
+LLM_ONLY=0
+SKIP_LLM=0
+while getopts ":lnh" opt; do
     case $opt in
+        l) LLM_ONLY=1 ;;
+        n) SKIP_LLM=1 ;;
         h) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
         \?) echo "ERROR: Unknown option -$OPTARG (see -h)"; exit 1 ;;
     esac
@@ -153,6 +160,9 @@ preflight() {
     check_disk_space
     check_registry_credentials
     check_ports_free
+    if [ "$SKIP_LLM" -eq 0 ]; then
+        check_llm || PREFLIGHT_FAILURES=$((PREFLIGHT_FAILURES + $?))
+    fi
 
     if [ "$PREFLIGHT_FAILURES" -gt 0 ]; then
         echo ""
@@ -332,8 +342,22 @@ download_ords() {
 # ══════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════
+# Ollama runs on the host, outside Docker. Missing models are pulled here
+# rather than failing the preflight, like the Docker images are.
+setup_llm() {
+    hdr "LLM (Ollama)"
+    check_llm || die "Fix the Ollama problem(s) above, then re-run (./setup-for-dbfree.sh -l redoes just this part)."
+    pull_llm_models
+    ok "Ollama has every model dbfree/.env names"
+}
+
 main() {
     hdr "dbfree/setup-for-dbfree.sh"
+
+    if [ "$LLM_ONLY" -eq 1 ]; then
+        setup_llm
+        exit 0
+    fi
 
     preflight
     "$SCRIPT_DIR/install-instant-client.sh"
@@ -345,6 +369,7 @@ main() {
     prepare_host_dirs
     download_apex
     download_ords
+    [ "$SKIP_LLM" -eq 1 ] || setup_llm
 
     echo ""
     ok "Setup complete. Next: ./run-dbfree.sh"

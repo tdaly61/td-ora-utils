@@ -101,6 +101,9 @@ if [ "$CLEAN" -eq 1 ]; then
             ok "Wiped $d"
         fi
     done
+    if [ "$PLATFORM" = "darwin" ] && docker volume inspect "$(db_data_volume)" &>/dev/null; then
+        docker volume rm "$(db_data_volume)" >/dev/null && ok "Removed Docker volume $(db_data_volume)"
+    fi
 
     if [ "$REMOVE_IMAGES" -eq 1 ]; then
         DOCKER_IMAGE="$(select_docker_image)"
@@ -118,6 +121,7 @@ fi
 # Arch-aware, exported so docker-compose.yml's ${DOCKER_IMAGE:-...} picks
 # this up instead of its own (arm64-only) fallback default.
 export DOCKER_IMAGE="$(select_docker_image)"
+export DB_DATA_SOURCE="$(db_data_source)" DB_DATA_VOLUME="$(db_data_volume)"
 ORACLE_PWD="$(ini_val ORACLE_PWD)"
 ORACLE_PDB="$(ini_val ORACLE_PDB)"; ORACLE_PDB="${ORACLE_PDB:-FREEPDB1}"
 CONTAINER_NAME="$(ini_val CONTAINER_NAME)"; CONTAINER_NAME="${CONTAINER_NAME:-caseweave-dbfree-db}"
@@ -320,6 +324,15 @@ echo "$GRANTS_OUT"
 echo "$GRANTS_OUT" | grep -qiE "SP2-|ORA-|PLS-" && die "Failed to grant UTL_HTTP/DBMS_VECTOR_CHAIN to ADMIN — see sqlplus output above."
 ok "UTL_HTTP/DBMS_VECTOR_CHAIN granted to ADMIN"
 
+hdr "Checking the LLM (Ollama)"
+# Not fatal: the DB and APEX work without it; only the AI features don't.
+LLM_OK=1
+if ! check_llm || [ "${#LLM_MISSING[@]}" -gt 0 ]; then
+    LLM_OK=0
+    warn "The stack will come up, but APEX AI features and any app's LLM workers won't work until the above is fixed."
+    echo "     Then run ./setup-for-dbfree.sh -l and re-run ./run-dbfree.sh (both are safe to repeat)."
+fi
+
 hdr "Network/AI setup"
 NET_SQL="$(mktemp)"; mv "$NET_SQL" "$NET_SQL.sql"; NET_SQL="$NET_SQL.sql"
 sed -e "s|__OLLAMA_BASE_URL__|$OLLAMA_BASE_URL|g" \
@@ -334,5 +347,6 @@ ok "Stack is up."
 echo "  APEX      : http://localhost:$APEX_PORT/ords/apex"
 echo "  ORDS      : http://localhost:$APEX_PORT/ords/"
 echo "  SQL*Net   : $EZCONNECT (ADMIN / <DEFAULT_PASSWORD from dbfree/.env>)"
+[ "$LLM_OK" -eq 1 ] || warn "LLM      : not ready — see \"Checking the LLM\" above"
 echo ""
 echo "  Verify with: ./test/smoke-dbfree.sh"

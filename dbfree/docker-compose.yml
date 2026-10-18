@@ -28,7 +28,10 @@ services:
       - "${DB_HOST_PORT:-15216}:1521"
       - "${EM_EXPRESS_HOST_PORT:-5500}:5500"
     volumes:
-      - ${DB_DATA_DIR:-./oradata}:/opt/oracle/oradata
+      # DB_DATA_SOURCE is exported by run-dbfree.sh (lib.sh db_data_source):
+      # the DB_DATA_DIR bind mount on Linux, the named volume "oradata"
+      # below on macOS (virtiofs bind mounts break DBCA's PDB create).
+      - ${DB_DATA_SOURCE:-./oradata}:/opt/oracle/oradata
       # Read-only access to the extracted APEX distribution so apexins.sql /
       # apex_rest_config.sql can be run via `docker exec` (needs the real
       # $ORACLE_HOME on the DB container, e.g. for apex_rest_config.sql's
@@ -72,3 +75,7 @@ services:
     depends_on:
       oracle-db:
         condition: service_healthy
+
+volumes:
+  oradata:
+    name: ${DB_DATA_VOLUME:-dbfree-oradata}

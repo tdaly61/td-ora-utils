@@ -34,7 +34,8 @@ defaults collide with something already running.
 
 ```bash
 ./setup-for-dbfree.sh   # preflight checks, Instant Client install, docker login,
-                         # pull images, host dirs, download+extract APEX/ORDS
+                         # pull images, host dirs, download+extract APEX/ORDS,
+                         # pull the Ollama models .env names
 ./run-dbfree.sh          # compose up, install APEX + ORDS + compat ADMIN user,
                           # network/AI setup
 ./test/smoke-dbfree.sh   # verify: connectivity, PGA/session baseline, ORDS, APEX
@@ -48,6 +49,31 @@ finds in one pass rather than failing on the first one. It also installs the
 Oracle Instant Client (to `~/oraclient/<INSTANT_CLIENT>`) if not already
 present, so this script alone is enough to go from a brand-new machine to a
 running stack.
+
+### LLM (Ollama)
+
+Ollama runs on the host, not in Docker. The preflight checks it is installed,
+running, and reachable **from inside a container** (the DB calls it at
+`OLLAMA_BASE_URL`), and prints the fix for each failure. Setup then pulls every
+model `.env` names: `OLLAMA_MODEL`, each `type=local` `LLM_<ID>` entry, and
+`WORKER_TEXT_MODEL`/`WORKER_VISION_MODEL` (each may have a `_MAC` variant). On a
+Mac it also warns if the largest model won't fit in the RAM left after Docker.
+
+```bash
+./setup-for-dbfree.sh -l   # LLM only: re-check Ollama and pull missing models
+./setup-for-dbfree.sh -n   # skip the LLM checks (e.g. using a remote/cloud LLM)
+```
+
+| Problem | Fix |
+|---|---|
+| Not installed | macOS: `brew install ollama` (or the app from ollama.com/download); Linux: `curl -fsSL https://ollama.com/install.sh \| sh` |
+| Not answering | macOS: `open -a Ollama`; Linux: `sudo systemctl start ollama` |
+| Containers can't reach it | It's listening on localhost only. Linux: `sudo systemctl edit ollama`, add `[Service]` / `Environment="OLLAMA_HOST=0.0.0.0"`, restart; then see `ALLOW_FIREWALL_AUTOFIX` |
+| Model won't pull | Check the name at ollama.com/library; a custom (`ollama create`) model must be created on this machine |
+| Model too big | Pick smaller ones in `.env`, e.g. `WORKER_TEXT_MODEL_MAC=llama3.2:3b` |
+
+`run-dbfree.sh` repeats the check but only warns: the DB and APEX work without
+the LLM, only the AI features don't.
 
 `DB_HOST_PORT`/`APEX_PORT` default to **15216**/**8092** (not 1521/8080) so
 they don't collide with other services on the same host — and because a host port held by a long-running prior container can
